@@ -1,0 +1,4150 @@
+"""The ReAct-style agent loop: routing, tools, memory, verification.
+
+Split out of the original single-file deploy.py; behaviour is unchanged.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+import time
+from dataclasses import replace as dataclass_replace
+from pathlib import Path
+from typing import Any, AsyncGenerator
+
+from .core import *  # noqa: F401,F403
+from .obslog import *  # noqa: F401,F403
+from .config import *  # noqa: F401,F403
+from .database import *  # noqa: F401,F403
+from .tools import *  # noqa: F401,F403
+from .llm import *  # noqa: F401,F403
+from .model_client import *  # noqa: F401,F403
+from .textutil import *  # noqa: F401,F403
+from .codecheck import check_code, findings_note
+from .taskstate import *  # noqa: F401,F403
+
+
+# Tokens held back for conversation history when sizing the retrieval block.
+# Without a floor, retrieval can spend everything trim_to_context was going to
+# give the last exchange, and a follow-up loses the turn it refers to.
+RAG_HISTORY_FLOOR = 256
+
+
+# Handed back with a draft when a turn tries to finish before agent_min_steps.
+# Deliberately explicit about repeating a correct draft: told only to "improve"
+# it, a 3B model rewrites a right answer into a different one to show willing.
+REVISE_DRAFT = (
+    "That was a draft, not your answer. Read it again against what was actually "
+    "asked: is anything wrong, missing, or stated more confidently than you can "
+    "support? Fix those, then reply with the complete improved answer in plain "
+    "text. Do not describe your changes and do not mention this review. If the "
+    "draft was already correct and complete, repeat it unchanged."
+)
+
+
+# Handed to the model when a tool-free turn switches into agent mode. It has just
+# said it could not do the job; this tells it that the thing it said it lacked is
+# now in front of it, and that the shape of the reply has changed (a tool call,
+# not prose). Explicit about not apologising: told only "you have tools now", a
+# 3B model spends the step writing "I'm sorry for the confusion" and nothing else.
+ESCALATION_DIRECTIVE = (
+    "You do have that capability. The tools listed in your instructions are "
+    "available to you right now. Use them: reply with exactly one tool call as a "
+    "JSON object, answer the original question from what it returns, and do not "
+    "apologise or mention this message."
+)
+
+# Which tools make each missing capability available. Keyed by what
+# missing_capability() reports, so the two stay in step: a turn is only switched
+# into agent mode when at least one of these is actually registered, since
+# telling the model to use a tool it does not have just wastes the step.
+ESCALATION_TOOLS = {
+    "lookup": ("web_search", "fetch_url", "search_docs"),
+    "files": ("read_file", "list_files", "search_files", "run_shell", "run_tests",
+              "run_python", "execute_code"),
+}
+
+
+class Agent:
+    """A ReAct-style loop over the local model.
+
+    The protocol is plain JSON in the message body rather than the OpenAI tools
+    field, because mlx_lm.server support for native tool calling varies by
+    version and small local models emit malformed tool_calls more often than
+    they emit malformed JSON text.
+    """
+
+    def __init__(self, config: Config, registry: ToolRegistry, client: ModelClient):
+        self.config = config
+        self.registry = registry
+        self.client = client
+        # Open partial-output file handles, keyed by conversation. Reused across a
+        # turn's many appends so we do not pay an open()/close() per write. An LRU
+        # cap keeps the fd count bounded on a long-running server.
+        self._partials: dict[str, dict] = {}
+        self._partials_dir = DATA_DIR / "partials"
+        # Every in-flight subagent holds its own KV cache in the same unified
+        # memory as the weights, so this is a memory limit as much as a
+        # concurrency one. Created lazily: an asyncio.Semaphore binds to the
+        # loop that first awaits it, and this process starts a fresh loop per
+        # test app.
+        self._subagent_sem: asyncio.Semaphore | None = None
+        self._subagent_loop: Any = None
+
+    async def forced_prose_answer(self, history: list[dict], user_message: str,
+                                  reserve: int, temperature: float | None,
+                                  task: "TaskState | None" = None,
+                                  stats: "GenerationStats | None" = None) -> str:
+        """One last tool-free pass, on the prose prompt.
+
+        Used when a step produced nothing usable -- an empty reply, or a tool
+        call the model never filled in. The alternative was returning "" and
+        rendering a blank assistant turn.
+        """
+        # The forced pass is a last resort, which is exactly when the active
+        # task matters most: without the brief this lane answered from the bare
+        # follow-up ("add more checks") and had no idea what it was adding to.
+        brief = self.task_brief(task, reserve)
+        base, _ = self.build_base(history, user_message, reserve, tools=False,
+                                  extra_context=brief,
+                                  active_code_task=bool(brief and task
+                                                        and task.is_code_task()))
+        nudge = [{"role": "user", "content":
+                  "Answer the question above directly, in plain text. Do not output "
+                  "JSON and do not call any tool."}]
+        messages, _ = self.assemble(base, nudge, reserve)
+        self.trace_prompt("forced-prose", messages, reply_budget=reserve,
+                          task=(task.summary() if task is not None else ""))
+        text = strip_reasoning(
+            await self.resilient_complete(messages, reserve, temperature, stats)).strip()
+        return "" if is_degenerate_tool_call(text) else text
+
+    # A tool name the model wrote that is really the tool's TARGET. Small models
+    # do this constantly: {"tool": "https://github.com/libusb/libusb"} instead of
+    # {"tool": "fetch_url", "args": {"url": "..."}}.
+    _URLISH = re.compile(r"(?i)^(?:https?://|www\.)\S+$")
+    # Wrappers some models put around a real name: functions.web_search,
+    # `read_file`, "web_search()", tools/list_files.
+    _NAME_NOISE = re.compile(r"(?i)^[`'\"\s]*(?:functions?|tools?)?[./]?([a-z_][a-z0-9_]*)"
+                             r"\s*(?:\(\s*\))?[`'\"\s]*$")
+
+    def repair_tool_call(self, name: str, args: dict, known: set[str]) -> tuple[str, dict] | None:
+        """Map an invalid tool name onto the tool the model obviously meant.
+
+        parse_tool_call lets an EXPLICIT {"tool": ...} through even when the name
+        is not registered, so that a JSON reply which is clearly a call attempt
+        is not mistaken for prose. That is right for classification and wrong for
+        dispatch: handing the name to the registry spends a step, logs a failed
+        tool call, and feeds "Unknown tool: <name>. Available: <19 names>" back
+        into a 4096-token context as a TOOL RESULT -- which then risks being
+        harvested as a training trace, teaching the model that URLs are tool
+        names. Repair what is unambiguous, reject the rest without dispatching.
+
+        Returns the corrected (name, args), or None when there is no honest
+        repair.
+        """
+        if name in known:
+            return name, args
+        # A URL in the name slot means fetch_url with that URL. Nothing else.
+        if self._URLISH.match(name) and "fetch_url" in known:
+            merged = dict(args)
+            merged.setdefault("url", name)
+            return "fetch_url", merged
+        # Strip a namespace or call syntax off an otherwise real name.
+        match = self._NAME_NOISE.match(name)
+        if match and match.group(1) in known:
+            return match.group(1), args
+        return None
+
+    # --- The closed learning loop ----------------------------------------- #
+    # Ratings arrive minutes after a turn, from a different request, which is
+    # why this is a method taking plain strings rather than something wired into
+    # run(): the caller (the feedback endpoint) reconstructs the turn and calls
+    # in. Everything here is best-effort and must never raise into a request.
+
+    SKILL_AUTHOR_PROMPT = (
+        "You are writing a short reusable SKILL document for yourself, so that "
+        "next time a task like this one takes fewer steps and fewer mistakes.\n\n"
+        "WHAT THE USER ASKED:\n{prompt}\n\n"
+        "THE ANSWER THAT WORKED:\n{answer}\n\n"
+        "Reply with ONLY a JSON object and nothing else:\n"
+        '{{"name": "kebab-case-name", "description": "one line saying when to use '
+        'this", "body": "the procedure as numbered markdown steps, under 150 words"}}\n\n'
+        "The body must be the GENERAL procedure for this KIND of task, not a copy "
+        "of this one answer, and not a summary of what you just said. If there is "
+        "no general procedure worth writing down, reply with exactly: NONE"
+    )
+
+    SKILL_LESSON_PROMPT = (
+        "A procedure you followed produced an answer the user had to correct.\n\n"
+        "PROCEDURE: {name} - {description}\n"
+        "WHAT THE USER ASKED:\n{prompt}\n\n"
+        "THE USER'S CORRECTION:\n{correction}\n\n"
+        "In ONE short sentence, state the lesson to add to that procedure so the "
+        "same mistake is not repeated. Reply with the sentence only: no preamble, "
+        "no JSON, no quotes."
+    )
+
+    async def learn_from_turn(
+        self,
+        user_prompt: str,
+        answer: str,
+        correction: str = "",
+        used: "list[str] | tuple[str, ...]" = (),
+    ) -> str | None:
+        """Turn one rated turn into procedural memory. Returns a short note.
+
+        Two cases, one model call at most:
+
+        - A skill was used and the user had to CORRECT the answer. The procedure
+          led the model astray, so distil the correction into a single lesson
+          and append it. Appending rather than rewriting is deliberate: asking a
+          3B model to regenerate a working document from memory is how a good
+          skill gets worse.
+        - No skill was used and the answer was rated good. There is a procedure
+          here that was worked out from scratch; write it down so the next
+          equivalent task starts from it. If something close already exists,
+          refine that instead of growing a near-duplicate library.
+        """
+        if not (self.config.skills_enabled and self.config.skills_autolearn):
+            return None
+        library = getattr(self.registry, "skills", None)
+        if library is None:
+            return None
+        prompt = (user_prompt or "").strip()
+        answer = (answer or "").strip()
+        # Nothing to learn from chit-chat, and nothing to learn from an answer
+        # too short to contain a procedure.
+        if not is_substantive(prompt) or len(answer) < 200:
+            return None
+        try:
+            if used and correction.strip():
+                return await self._teach_correction(
+                    library, list(used), prompt, correction.strip())
+            if not used:
+                return await self._author_skill(library, prompt, answer)
+        except Exception as exc:      # never break a rating on a learning failure
+            log(f"Skill learning failed: {exc}", logging.WARNING)
+        return None
+
+    async def _teach_correction(self, library, used: list[str],
+                                prompt: str, correction: str) -> str | None:
+        """Append the lesson from a correction to the skill that misled."""
+        skill = library.get(used[0])
+        if skill is None:
+            return None
+        lesson = await self.client.complete(
+            [{"role": "system", "content": self.config.system_prompt_with_identity},
+             {"role": "user", "content": self.SKILL_LESSON_PROMPT.format(
+                 name=skill.name, description=skill.description,
+                 prompt=prompt[:600], correction=correction[:800])}],
+            max_tokens=96, temperature=0.0,
+        )
+        lesson = strip_reasoning(lesson or "").strip().strip('"').split("\n")[0]
+        if not lesson or len(lesson) < 12:
+            return None
+        updated = library.refine(skill.name, lesson)
+        if updated is None:
+            return None
+        log(f"Skill {skill.name!r} refined to v{updated.version} from a correction.")
+        return f"refined skill {skill.name} (v{updated.version})"
+
+    async def _author_skill(self, library, prompt: str, answer: str) -> str | None:
+        """Write a new skill, or refine a close existing one."""
+        # A near-duplicate is worse than nothing: it splits the track record and
+        # doubles the catalogue cost for the same procedure.
+        nearby = library.search(prompt, limit=1)
+        if nearby:
+            existing = nearby[0]
+            overlap = len(set(re.findall(r"[a-z0-9]+", prompt.lower()))
+                          & set(re.findall(r"[a-z0-9]+", existing.description.lower())))
+            if overlap >= 3:
+                log(f"Not authoring a skill: {existing.name!r} already covers this.",
+                    logging.DEBUG)
+                return None
+        raw = await self.client.complete(
+            [{"role": "system", "content": self.config.system_prompt_with_identity},
+             {"role": "user", "content": self.SKILL_AUTHOR_PROMPT.format(
+                 prompt=prompt[:800], answer=answer[:2000])}],
+            max_tokens=self.config.skill_author_tokens, temperature=0.0,
+        )
+        text = strip_reasoning(raw or "").strip()
+        if not text or text.upper().startswith("NONE"):
+            return None
+        parsed = extract_json_object(text) or {}
+        name = str(parsed.get("name") or "").strip()
+        description = str(parsed.get("description") or "").strip()
+        body = str(parsed.get("body") or "").strip()
+        # A body shorter than this is a description, not a procedure, and would
+        # cost catalogue space forever while teaching the model nothing.
+        if not name or not description or len(body) < 80:
+            log(f"Discarded an unusable authored skill: {text[:120]!r}", logging.DEBUG)
+            return None
+        skill = library.save(name, description, body)
+        if skill is None:
+            return None
+        log(f"Authored skill {skill.name!r} (v{skill.version}) from a rated turn.")
+        return f"learned skill {skill.name} (v{skill.version})"
+
+    def record_skill_outcomes(self, used: "list[str] | tuple[str, ...]",
+                              ok: bool) -> list[str]:
+        """Credit or blame the procedures behind a rated answer, and retire the
+
+        ones with a real track record of doing harm. Synchronous and model-free,
+        so it can run on the request thread. Returns names retired.
+        """
+        library = getattr(self.registry, "skills", None)
+        if library is None or not self.config.skills_enabled:
+            return []
+        retired: list[str] = []
+        for name in used:
+            skill = library.record_outcome(name, ok)
+            if skill is None or ok:
+                continue
+            if library.should_retire(skill, self.config.skill_retire_min_rated,
+                                     self.config.skill_retire_loss_rate):
+                reason = (f"{skill.losses} of {skill.wins + skill.losses} rated uses "
+                          "went badly")
+                if library.retire(skill.name, reason):
+                    retired.append(skill.name)
+        return retired
+
+    @property
+    def subagents(self) -> "asyncio.Semaphore":
+        """Admission control for child agents, rebound per event loop."""
+        loop = asyncio.get_running_loop()
+        if self._subagent_sem is None or self._subagent_loop is not loop:
+            self._subagent_sem = asyncio.Semaphore(
+                max(1, self.config.subagent_max_concurrent))
+            self._subagent_loop = loop
+        return self._subagent_sem
+
+    async def run_subagent(self, task: str, capabilities: str = "",
+                           parent_conversation: str | None = None) -> str:
+        """Run one task in a fresh agent with its own context. Returns its answer.
+
+        The value on this hardware is CONTEXT ISOLATION, not parallelism: the
+        parent pays for the child's conclusion instead of for the twelve files
+        the child had to read to reach it. Which is also why the result is
+        capped -- a subagent that returns everything it saw has saved nothing.
+
+        The child cannot delegate again. Recursion is prevented by construction
+        (delegate_task is removed from its allowlist) rather than by a depth
+        counter, because a depth counter still pays for the generation that
+        discovers it has run out of depth.
+        """
+        allowed = [name for name in tools_for_capabilities(
+            [part.strip() for part in (capabilities or "").split(",") if part.strip()])
+            if name != "delegate_task"]
+        child_config = dataclass_replace(
+            self.config,
+            agent_tools=",".join(allowed),
+            agent_max_steps=min(self.config.agent_max_steps,
+                                self.config.subagent_max_steps),
+            # The parent reviews what comes back, so a self-review inside every
+            # child would multiply the cost of delegating for nothing.
+            agent_min_steps=1,
+            # A child that hands work to yet another child, or writes skills of
+            # its own from an unrated turn, is not what was asked for.
+            delegation_enabled=False,
+            skills_autolearn=False,
+            # Its own history is empty by construction, and re-running the
+            # parent's routing on a task the parent already scoped is a wasted
+            # generation on a 3B model.
+            knowledge_triage=False,
+            incremental_reasoning=False,
+            # The child shares the parent's conversation id (so its tool calls
+            # are attributed there) but it is doing a scoped sub-task, not the
+            # user's task. Letting it load and then overwrite the parent's task
+            # state would replace the artifact under construction with the
+            # helper's fragment.
+            task_state_enabled=False,
+        )
+        child_registry = ToolRegistry(child_config, self.registry.db)
+        child = Agent(child_config, child_registry, self.client)
+        answer = ""
+        async for event in child.run(task, [], conversation_id=parent_conversation,
+                                     max_tokens=self.config.max_tokens):
+            if event.get("type") == "final":
+                answer = event.get("answer") or ""
+        # Unwrapped before it reaches the parent: a helper's "Final answer:"
+        # label becomes part of the parent's prompt otherwise, which is how the
+        # parent learns to write one too.
+        return unwrap_answer(answer)[:self.config.subagent_result_chars]
+
+    # --- Active task state ------------------------------------------------ #
+    # The task is a first-class object (taskstate.TaskState), not something the
+    # model is expected to remember from a transcript that gets trimmed. Loaded
+    # at the top of a turn, put in front of the model as a block that trimming
+    # cannot reach, and saved at the end with whatever artifact the turn
+    # produced.
+
+    def load_task(self, conversation_id: str | None,
+                  history: list[dict] | None) -> TaskState:
+        """The active task: the persisted record merged with the visible history."""
+        if not self.config.task_state_enabled:
+            return TaskState()
+        stored = None
+        db = getattr(self.registry, "db", None)
+        if db is not None and conversation_id:
+            try:
+                stored = db.load_task_state(conversation_id, get_acting_user())
+            except Exception as exc:
+                log(f"task state could not be read: {exc}", logging.DEBUG)
+        return load_task_state(stored, history)
+
+    def save_task(self, conversation_id: str | None, task: TaskState) -> None:
+        """Persist the task. Best-effort: never fail a request over bookkeeping."""
+        if not self.config.task_state_enabled or not conversation_id:
+            return
+        db = getattr(self.registry, "db", None)
+        if db is None or not task.is_active():
+            return
+        try:
+            db.save_task_state(conversation_id, task.to_dict(), get_acting_user())
+        except Exception as exc:
+            log(f"task state could not be saved: {exc}", logging.DEBUG)
+
+    def clear_task(self, conversation_id: str | None) -> None:
+        """Forget the stored task for this conversation. Best-effort."""
+        db = getattr(self.registry, "db", None)
+        if db is None or not conversation_id:
+            return
+        try:
+            db.clear_task_state(conversation_id)
+        except Exception as exc:
+            log(f"task state could not be cleared: {exc}", logging.DEBUG)
+
+    def reply_reserve(self, message: str, requested: int,
+                      task: "TaskState | None" = None) -> int:
+        """The reply budget this turn deserves, widened for code.
+
+        A program does not fit in the default 512-token budget: it gets cut off
+        mid-function. Factored out of run() because the continuation path needs
+        the budget of the ORIGINAL request, not of the word "continue".
+
+        The active task is what makes this work across turns. "add more checks
+        and error handling" names no language and no code object, so
+        is_code_request says no and the turn got the 512-token chat budget --
+        for a request to re-emit a whole shell script. When the task says we are
+        writing code, a follow-up on it is a code turn, and a turn that has to
+        reproduce an existing artifact gets at least what that artifact costs.
+        """
+        # A question about the work is not a request to re-emit it. This has to
+        # match turn_mode() exactly: when they disagreed, a question mid-task
+        # got the 512-token chat budget AND a brief demanding the complete file,
+        # so it was cut off mid-function every time and never answered.
+        if self.explaining(message, task):
+            return requested
+        code = is_code_request(message)
+        if not code and task is not None and task.is_code_task():
+            code = bool(is_modification_request(message)
+                        or is_continue_request(message)
+                        or parse_correction(message))
+        # A document turn's visible REPLY is one sentence ("I made the PDF"),
+        # but the whole document is generated before that, inside the
+        # create_document call's content argument. On the 512-token chat budget
+        # that JSON is cut off mid-string, the call never parses, and the turn
+        # produces nothing at all -- so it needs the same room a program does.
+        document = bool(document_request(message))
+        if not document and task is not None and task.is_document_task():
+            # Same reasoning as the code branch above: a follow-up edit names no
+            # format, and the whole revised document still has to fit inside the
+            # create_document call this turn makes.
+            document = bool(is_modification_request(message)
+                            or is_continue_request(message)
+                            or parse_correction(message))
+        if not code and not document:
+            return requested
+        wanted = max(requested, self.config.code_max_tokens)
+        if task is not None and task.artifact:
+            wanted = max(wanted, estimate_tokens(task.artifact)
+                         + self.config.artifact_reply_headroom)
+        ceiling = max(self.config.min_max_tokens,
+                      self.config.context_size - CONTEXT_SAFETY_MARGIN - 768)
+        return max(1, min(wanted, ceiling))
+
+    @staticmethod
+    def explaining(message: str, task: "TaskState | None") -> bool:
+        """True when this turn answers a question about the artifact.
+
+        Only meaningful mid-task: with no artifact there is nothing to explain,
+        and the ordinary lanes already handle a bare question.
+        """
+        if task is None or not task.is_code_task() or not task.artifact:
+            return False
+        if is_continue_request(message) or parse_correction(message):
+            return False
+        return is_explanation_request(message)
+
+    def turn_mode(self, message: str, task: "TaskState | None", reserve: int) -> str:
+        """What this turn is for: "explain", "patch" or "build".
+
+        The one place the decision is made, so the reply budget, the brief and
+        the rules cannot disagree about it.
+
+        "patch" is chosen either because the artifact is long enough that
+        re-emitting it is the dominant cost of the turn, or -- and this is the
+        safety net -- because the reply budget physically cannot hold the file.
+        Asking for a complete file that does not fit is a guaranteed truncation,
+        and doing it anyway is what corrupted the artifact twice in one session.
+        """
+        if task is None or not task.is_code_task():
+            return "build"
+        if self.explaining(message, task):
+            return "explain"
+        if not task.artifact:
+            return "build"
+        threshold = self.config.artifact_patch_chars
+        if threshold and len(task.artifact) > threshold:
+            return "patch"
+        if estimate_tokens(task.artifact) > max(0, reserve - 64):
+            return "patch"
+        return "build"
+
+    def escalation_tools(self, need: str) -> list[str]:
+        """Registered tools that would give the model the capability it says it lacks.
+
+        Empty when nothing can help, which is the signal not to switch lanes: a
+        build with no search tool telling the model "you can search after all"
+        would spend a step to get the same refusal back, and then have taught it
+        to claim a capability it does not have.
+        """
+        return [name for name in ESCALATION_TOOLS.get(need, ())
+                if self.registry.get(name) is not None]
+
+    def artifact_chars_for(self, reserve: int) -> int:
+        """Characters of the artifact allowed into the prompt for this budget.
+
+        prompt + reply + margin has to fit the context window, so the artifact
+        block is sized against what is actually left rather than a fixed number:
+        on a 4096-token window a 1536-token reply leaves the artifact about
+        1150 tokens, and the rest goes to the system prompt, the brief and
+        recent conversation. Past that the brief truncates the middle and says
+        so, which is honest; letting it overflow is not.
+        """
+        room = max(0, self.config.context_size - reserve - CONTEXT_SAFETY_MARGIN)
+        return int(min(self.config.task_artifact_chars, (room // 2) * CHARS_PER_TOKEN))
+
+    def task_brief(self, task: "TaskState | None", reserve: int,
+                   mode: str = "build") -> str:
+        """The ACTIVE TASK block for this turn, or "" when there is no task."""
+        if not self.config.task_state_enabled or task is None or not task.is_active():
+            return ""
+        allowed = self.artifact_chars_for(reserve)
+        if task.artifact and len(task.artifact) > allowed:
+            log(f"active artifact is {len(task.artifact)} chars but only {allowed} "
+                f"fit alongside a {reserve}-token reply in a "
+                f"{self.config.context_size}-token context; the middle is omitted "
+                "and the model is told to patch rather than rewrite.", logging.INFO)
+        verify = bool(self.config.allow_shell and self.registry.get("run_shell"))
+        return task.brief(artifact_chars=allowed, verify_hint=verify, mode=mode)
+
+    def checked_answer(self, answer: str, task: "TaskState | None") -> str:
+        """Append a short list of real problems found in the code in `answer`.
+
+        Advisory: it never rewrites and never blocks. The point is that a
+        problem the pipeline can see mechanically should not reach the user
+        unmentioned -- `Set-WmiObject` is not a cmdlet, a function that shadows
+        `Start-Service` and calls it recurses forever, and both went out ten
+        times in a row because nothing ever parsed the output.
+        """
+        if not self.config.code_check_enabled or not answer:
+            return answer
+        default_language = task.language if task is not None else ""
+        blocks = extract_code_blocks(strip_truncation_note(answer))
+        if not blocks:
+            return answer
+        deep = bool(self.config.code_check_deep and self.config.allow_shell)
+        findings: list = []
+        try:
+            for info, code in blocks:
+                language = canonical_language(info) or default_language
+                if not language or len(code.strip()) < 40:
+                    continue
+                findings.extend(check_code(code, language, deep=deep))
+                if len(findings) >= 4:
+                    break
+        except Exception as exc:
+            log(f"code check skipped: {exc}", logging.DEBUG)
+            return answer
+        if not findings:
+            return answer
+        log(f"code check found {len(findings)} problem(s) in the reply: "
+            + "; ".join(f.message[:80] for f in findings), logging.INFO)
+        return append_below_answer(answer, findings_note(findings[:4]))
+
+    def trace_prompt(self, where: str, messages: list[dict], **fields: Any) -> None:
+        """Log the prompt that is actually about to be sent, behind debug_prompts.
+
+        The logs already showed token counts and trimming decisions, which says
+        nothing about what the model semantically received -- the whole reason
+        the drift was invisible. Content goes through content_for_log, so it
+        honours log_chat_content and is redacted; with content logging disabled
+        this still records the shape (lanes, budgets, task, artifact version).
+        """
+        if not self.config.debug_prompts:
+            return
+        # content_for_log with no override, so the operator's log_chat_content
+        # decides: "disabled" logs nothing of the text, "metadata" logs its
+        # length and fingerprint, "full" logs it redacted and truncated. Turning
+        # debug_prompts on must not silently start writing conversation text.
+        body = content_for_log(
+            "\n\n".join(f"[{m.get('role')}]\n{m.get('content', '')}"
+                        for m in messages))
+        log_event(get_logger("prompt"), logging.DEBUG, "prompt.assembled",
+                  where=where, messages=len(messages),
+                  prompt_tokens=messages_tokens(messages), prompt=body, **fields)
+
+    DRIFT_DIRECTIVE = (
+        "Your previous attempt at this ignored the active task: {problem}. That "
+        "output is discarded. Do it again for the task described above: same "
+        "language, same artifact, no new files, no unrelated classes or "
+        "frameworks. Reply with the artifact only."
+    )
+
+    async def redirect_drift(self, task: "TaskState | None", answer: str,
+                             user_message: str, history: list[dict], reserve: int,
+                             temperature: float | None,
+                             stats: "GenerationStats | None" = None) -> tuple[str, str]:
+        """Catch an answer that contradicts the active task. Returns (answer, note).
+
+        Narrow by design (see taskstate.detect_drift): it fires on a strong
+        contradiction only -- every code block in the reply is a language the
+        task is not. On a hit, one corrective regeneration with the task brief
+        and an explicit "that was wrong, here is the task" directive. If that
+        drifts too, the turn asks rather than silently handing back unrelated
+        output, because two drifts in a row usually means the request itself was
+        ambiguous.
+        """
+        if not self.config.drift_check_enabled or task is None or not answer:
+            return answer, ""
+        # A question about the work is answered in prose and may legitimately
+        # quote a snippet in another language. Running the drift check on it is
+        # how an explanation turn got regenerated as a code dump.
+        if self.explaining(user_message, task):
+            return answer, ""
+        problem = detect_drift(task, answer)
+        if not problem:
+            return answer, ""
+        log(f"task drift: {problem}; regenerating with the task brief.", logging.WARNING)
+        brief = self.task_brief(task, reserve)
+        directive = self.DRIFT_DIRECTIVE.format(problem=problem)
+        base, _ = self.build_base(history, user_message, reserve, tools=False,
+                                  extra_context=f"{brief}\n\n{directive}",
+                                  active_code_task=True)
+        messages, _ = self.assemble(base, [], reserve)
+        self.trace_prompt("drift-retry", messages, task=task.summary(),
+                          reply_budget=reserve, problem=problem)
+        retry = strip_reasoning(
+            await self.resilient_complete(messages, reserve, temperature, stats)).strip()
+        if retry and not detect_drift(task, retry):
+            return retry, (f"that reply drifted ({problem}); regenerated it as "
+                           f"{task.language}")
+        # Still wrong after a corrective pass. Name the language it keeps
+        # producing, so accepting the switch is one short sentence rather than a
+        # re-explanation of the whole task.
+        elsewhere = drifted_languages(task, retry or answer)
+        # Still wrong after a corrective pass. Ask, and ask ONLY -- appending the
+        # drifted output under the question was the worst of both: it did not
+        # block, it doubled the cost of an already-wasted turn, and because the
+        # whole thing was stored as the answer, the next "continue" resumed the
+        # question text along with the code and replayed the preamble verbatim.
+        # The text is not lost: it is on the turn's own record via the events.
+        question = (
+            f"Before I go further: {problem}. The task I have recorded is "
+            f"{task.language} — {task.artifact_name or 'the current artifact'}"
+            + (f" on {task.platform}" if task.platform else "")
+            + (f". Say \"port it to {'/'.join(elsewhere)}\" and I will retarget the "
+               f"task, keeping the objective and every requirement; say \"stay on "
+               f"{task.language}\" and I will try again."
+               if elsewhere else
+               ". Do you want me to keep working on that, or switch?")
+        )
+        return question, f"could not stay on task ({problem}); asking you instead"
+
+    @staticmethod
+    def continuation_target(history: list[dict] | None,
+                            task: "TaskState | None" = None) -> tuple[str, str] | None:
+        """(original request, partial answer) when the last answer was cut off.
+
+        The truncation note the UI appended is the durable evidence in the
+        transcript that an answer stopped at the token budget rather than at its
+        natural end. The task state is the second source, and the one that
+        survives trimming: it records the artifact and whether it was complete,
+        so a "continue" whose partial answer has already been evicted from the
+        visible history still resumes the right thing instead of being answered
+        as a new question.
+        """
+        turns = list(history or [])
+        for index in range(len(turns) - 1, -1, -1):
+            turn = turns[index]
+            if turn.get("role") != "assistant":
+                continue
+            content = str(turn.get("content") or "")
+            if not was_truncated(content):
+                return None          # newest answer finished; nothing to resume
+            partial = strip_truncation_note(content)
+            if not partial.strip():
+                return None
+            # Walk back past any earlier "continue" turns: the request that
+            # matters is the one that started the answer, and a second
+            # continuation would otherwise resume with "continue" as its prompt
+            # and lose the task entirely.
+            request = ""
+            for earlier in range(index - 1, -1, -1):
+                if turns[earlier].get("role") != "user":
+                    continue
+                candidate = str(turns[earlier].get("content") or "").strip()
+                if not candidate or is_continue_request(candidate):
+                    continue
+                request = candidate
+                break
+            # The recorded objective is a better anchor than a bare "add more
+            # checks now", which is what the walk-back finds after a few
+            # modification turns and which says nothing about the task.
+            if task is not None and task.objective and (
+                    not request or len(request) < 24):
+                request = f"{task.objective}\n\nMost recent request: {request}" \
+                    if request else task.objective
+            return request, partial
+        # Nothing in the visible history, but the state remembers something cut
+        # off: resume that. resumable(), not `artifact`, because a partial is
+        # now parked BESIDE the last complete version rather than on top of it
+        # -- overwriting the whole file with a truncated one is what let a bad
+        # turn destroy work the user could no longer get back.
+        pending = task.resumable() if task is not None else ""
+        if pending:
+            return task.objective, pending
+        return None
+
+    # How much of a trailing incomplete line is worth discarding to give the
+    # model a clean boundary to resume from. Bounded so trimming can never throw
+    # away a whole paragraph of prose.
+    MAX_DISCARDED_FRAGMENT = 160
+
+    @classmethod
+    def clean_boundary(cls, partial: str) -> str:
+        """Trim a trailing half-written line so the continuation starts cleanly.
+
+        The budget cuts mid-token: "r = libusb_get_device". Asked to resume from
+        there, the model does not finish the identifier -- it starts the
+        statement again on a new line, leaving the fragment stranded above. Ending
+        the partial at the last complete line instead costs a few tokens to
+        regenerate and removes the whole class of seam artefact.
+        """
+        index = partial.rfind("\n")
+        if index <= 0:
+            return partial
+        fragment = partial[index + 1:]
+        if not fragment.strip():
+            return partial          # already ends on a line break
+        if len(fragment) > cls.MAX_DISCARDED_FRAGMENT:
+            return partial          # too much to throw away; resume mid-line
+        # A line that already closes a statement or block is a fine boundary.
+        if fragment.rstrip().endswith((";", "{", "}", ":", ",", ")", "*/", ">", ".")):
+            return partial
+        return partial[:index]
+
+    @staticmethod
+    def stitch_continuation(partial: str, extra: str) -> str:
+        """Join a partial answer to its continuation without duplicating the seam.
+
+        Even told not to, a small model usually re-emits the last line or two,
+        and when it was cut off inside a fenced code block it either re-opens the
+        fence or immediately CLOSES it -- which strands the rest of the program
+        outside the block and leaves the answer with an odd number of fences.
+        All of that is cheap to detect here and impossible to fix by asking more
+        politely.
+        """
+        extra = extra or ""
+        # Inside an unclosed fence, a fence at the very START of the continuation
+        # is wrong either way: an opening one duplicates the block, a closing one
+        # ends it mid-statement. The block can only legitimately close at the end.
+        if partial.count("```") % 2 == 1:
+            extra = re.sub(r"^\s*```[A-Za-z0-9+#.-]*[ \t]*\n?", "", extra, count=1)
+        # The model restarted from the top instead of resuming. Told not to, a
+        # small model still does it, and concatenating then hands back the whole
+        # answer twice -- which the artifact checker now rejects as a duplicated
+        # block, so the turn produces nothing at all. Detect it here, where the
+        # right answer is obvious: the restart IS the answer, complete on its
+        # own, so keep it and drop the partial.
+        head = partial.lstrip()[:200]
+        if len(head) >= 60 and extra.lstrip().startswith(head):
+            return extra.lstrip()
+        # The longest suffix of the partial that the continuation repeats.
+        window = partial[-400:]
+        for size in range(len(window), 15, -1):
+            if extra.startswith(window[-size:]):
+                extra = extra[size:]
+                break
+        if not extra.strip():
+            return partial
+        # No separator: a continuation resumes mid-line by design.
+        return partial + extra
+
+    CONTINUE_INSTRUCTION = (
+        "Continue your previous answer from exactly where it stops. It ended with:\n\n"
+        "<<<{tail}>>>\n\n"
+        "Resume immediately after that, mid-line if necessary. Do NOT repeat any of "
+        "it, do NOT start over, do NOT re-introduce the topic and do NOT add a "
+        "preamble. If it is code, stay inside the same code block and finish the "
+        "program."
+    )
+
+    def continuation_contract(self, task: "TaskState | None", request: str,
+                              partial: str) -> str:
+        """What the model is resuming, stated explicitly.
+
+        Built from the task state where there is one, and from the partial text
+        itself where there is not (a conversation that predates the state, or a
+        prose answer): the language of the code it was writing is recoverable
+        from the code, and saying it beats hoping.
+        """
+        language = ""
+        kind = "prose"
+        name = ""
+        platform = ""
+        if task is not None and task.is_active():
+            language, name, platform = task.language, task.artifact_name, task.platform
+            kind = "code" if task.is_code_task() else "prose"
+        if not language:
+            blocks = extract_code_blocks(partial)
+            if blocks:
+                info, code = blocks[-1]
+                language = canonical_language(info) or code_language(code)
+                kind = "code" if language else kind
+            elif is_code_request(request):
+                language = detect_language(request)
+                kind = "code" if language else kind
+        if kind != "code" and not language:
+            return ""
+        lines = ["YOU ARE RESUMING ONE UNFINISHED ANSWER, NOT STARTING A NEW ONE."]
+        if language:
+            lines.append(f"It is {language}" + (f" for {platform}" if platform else "")
+                         + (f", the file {name}" if name else "") + ".")
+        lines.append("Continue that exact artifact. Do not change topic, language or "
+                     "file, do not restart it, and do not describe a different "
+                     "design or architecture.")
+        if partial.count("```") % 2 == 1:
+            lines.append("The code block is still open: stay inside it and close it "
+                         "only when the artifact is finished.")
+        return "\n".join(lines)
+
+    async def continue_answer(
+        self,
+        resume: tuple[str, str],
+        history: list[dict],
+        requested: int,
+        temperature: float | None,
+        cancel: "asyncio.Event | None" = None,
+        conversation_id: str | None = None,
+        task: "TaskState | None" = None,
+    ):
+        """Resume a truncated answer instead of answering "continue" as a question.
+
+        Skips routing entirely: the lane was already decided on the original
+        request, and re-routing a bare "continue" is what sent it through the
+        answer lane as a brand new prompt. The reply budget comes from the
+        original request too, so a continued program gets the code budget rather
+        than the 512-token chat default.
+        """
+        started = time.time()
+        request, partial = resume
+        reserve = self.reply_reserve(request, requested, task)
+        yield {"type": "phase", "label": "continuing the previous answer"}
+        detail_budget = reserve
+
+        partial = self.clean_boundary(partial)
+        tail = partial[-600:]
+        system = build_plain_system_prompt(
+            self.config.system_prompt_with_identity,
+            reasoning=self.config.reasoning_visible)
+        messages = [{"role": "system", "content": system}]
+        if request:
+            messages.append({"role": "user", "content": request})
+        # The task contract, stated rather than inferred. "continuation lane:
+        # resuming a 648-token partial answer" was true and still produced a
+        # different topic, because the only thing the model had to work out what
+        # it was resuming was the partial text itself: no language, no artifact,
+        # no objective. This is the fix -- the contract is explicit, so the model
+        # never has to rediscover the task from its own truncated output.
+        contract = self.continuation_contract(task, request, partial)
+        if contract:
+            messages.append({"role": "user", "content": contract})
+        # The partial goes in as the assistant turn it actually was, so the model
+        # sees its own voice rather than a quoted transcript. Trimmed from the
+        # FRONT if it is long: continuation needs the end, not the beginning.
+        head_room = max(400, (self.config.context_size - reserve
+                              - CONTEXT_SAFETY_MARGIN - estimate_tokens(system)
+                              - estimate_tokens(request) - estimate_tokens(contract)
+                              - 400)) * 4
+        messages.append({"role": "assistant", "content": partial[-head_room:]})
+        messages.append({"role": "user",
+                         "content": self.CONTINUE_INSTRUCTION.format(tail=tail)})
+        detail_budget = self.client.reply_budget(messages, reserve, quiet=True)
+        if self.config.show_internals:
+            yield {"type": "detail", "message":
+                   f"continuation lane: resuming a {estimate_tokens(partial)}-token "
+                   f"partial answer, reply budget {detail_budget}"
+                   + (f" (asked for {reserve})" if detail_budget != reserve else "")
+                   + f", {'code' if reserve != requested else 'chat'} budget"
+                   + (f"; task {task.summary()}" if task is not None
+                      and task.is_active() else "")}
+        self.trace_prompt("continuation", messages, continuation=True,
+                          reply_budget=detail_budget, requested_budget=reserve,
+                          generation_id=(task.generation_id if task else ""),
+                          artifact_version=(task.artifact_version if task else 0),
+                          task=(task.summary() if task is not None else ""))
+
+        stats = GenerationStats()
+        extra = ""
+        stream = self.client.stream(messages, reserve, temperature, stats, kind="code")
+        try:
+            async for token in stream:
+                if cancel is not None and cancel.is_set():
+                    yield {"type": "cancelled", "step": 1, "partial": extra, "trace": []}
+                    return
+                extra += token
+                yield {"type": "token", "token": token, "step": 1}
+        except Exception as exc:
+            log(f"continuation stream failed ({exc}); falling back to non-streaming.",
+                logging.WARNING)
+            extra = await self.resilient_complete(messages, reserve, temperature)
+        finally:
+            await stream.aclose()
+
+        reasoned = strip_reasoning(extra)
+        unwrapped = unwrap_answer(reasoned)
+        if unwrapped != reasoned.strip():
+            # The continuation opened with a label or a tag, and unwrap_answer
+            # removed it. Welding "Final answer:" into the middle of a partial
+            # program is worse than losing the seam whitespace with it.
+            extra = unwrapped
+        else:
+            # rstrip only: LEADING whitespace is part of the seam. A
+            # continuation that resumes on a new line, or after a space, carries
+            # that in its first token, and stripping it welded "part one" onto
+            # "and part two".
+            extra = reasoned.rstrip()
+        yield {"type": "usage", "step": 1, **stats.as_event()}
+        if not extra:
+            yield {"type": "notice", "info": True,
+                   "message": "the model had nothing more to add"}
+            answer = partial
+        else:
+            answer = self.stitch_continuation(partial, extra)
+        # Mark it again when the continuation was itself cut off, so a further
+        # "continue" still has the evidence it needs. This composes.
+        if getattr(stats, "finish_reason", "") == "length":
+            answer = answer.rstrip() + truncation_note(
+                self.client.reply_budget(messages, reserve, quiet=True))
+        answer = self.checked_answer(answer, task)
+        self.partial_add(conversation_id, extra)
+        if task is not None:
+            # The stitched artifact is the new current one, and whether it is
+            # still truncated is what a further "continue" depends on.
+            task.note_answer(answer)
+            task.artifact_complete = getattr(stats, "finish_reason", "") != "length"
+            self.save_task(conversation_id, task)
+        yield {
+            "type": "final",
+            "answer": answer,
+            "steps": 1,
+            "trace": [],
+            "tools_used": [],
+            "elapsed_ms": round((time.time() - started) * 1000),
+            "prompt_tokens": stats.prompt_tokens,
+            "completion_tokens": stats.completion_tokens,
+            "truncated": getattr(stats, "finish_reason", "") == "length",
+            "changed_files": [],
+            "diff": "",
+            "continued": True,
+        }
+
+    async def route(self, message: str, history: list[dict] | None = None,
+                    task: "TaskState | None" = None,
+                    stats: "GenerationStats | None" = None) -> dict:
+        """Ask the model how to handle a message, as one structured decision.
+
+        The router menu is generated from the registry: every tool that declares
+        route_hint becomes a selectable action. Adding a routable tool therefore
+        needs no change here and no new regex lane, which is what keeps routing
+        maintainable as the toolset grows over the years.
+
+        Returns {"action": "answer"} or {"action": "<tool name>", ...tool args}.
+        The model reads the message (with a little history so follow-ups resolve)
+        and picks. On any parse failure it biases to a web search when one exists,
+        so a genuine lookup is never silently answered from stale weights.
+
+        `task` is what stops a follow-up about the work from becoming a web
+        search. "how about the c port" was routed to web_search with the query
+        "c port", which returned a water-softener portal and a Wikipedia page on
+        USB-C: the router saw four words with the conversation stripped out, and
+        four words about an artifact look exactly like four words about the
+        world. `stats` folds the router's own call into the turn's totals, which
+        it was never doing.
+        """
+        routable = self.registry.routable()
+        if not routable:
+            # Nothing to route to; the model answers everything itself.
+            return {"action": "answer"}
+        # A message that points at the artifact is about the artifact. No search
+        # engine knows what "it", "that" or "the c port" refers to here, and the
+        # model does, because the brief is in front of it.
+        if (task is not None and task.is_active() and task.artifact
+                and refers_to_active_task(message)):
+            log("routing: the message refers to the active task, so it is "
+                "answered from the task rather than looked up.", logging.DEBUG)
+            return {"action": "answer"}
+
+        # The menu: an answer option plus one line per routable tool, taken
+        # straight from each tool's route_hint.
+        # When a real codebase is attached, "answer" must NOT claim to cover code:
+        # a request to fix the user's own files cannot be satisfied from weights.
+        has_project = bool(self.config.project_dir)
+        if has_project:
+            answer_option = ('{"action":"answer"} — the DEFAULT for general questions '
+                             "you can answer from your own knowledge: facts, "
+                             "explanations, definitions, writing, math, reasoning, and "
+                             "code written from scratch that does NOT touch the user's "
+                             "project. If the user refers to THEIR code, this project, "
+                             "a file, a bug, or says 'fix this', do NOT answer — use a "
+                             "file tool to look at the real files first.")
+        else:
+            answer_option = ('{"action":"answer"} — the DEFAULT. Use it whenever you '
+                             "can answer from your own knowledge: general facts, "
+                             "explanations, definitions, writing, math, reasoning, and "
+                             "all code. Most questions are answer.")
+        options = [answer_option] + [t.route_hint for t in routable]
+        system = (
+            "You are a router. Read the user's latest message and reply with "
+            "exactly ONE JSON object and nothing else. Prefer answering from your "
+            "own knowledge; only choose a lookup tool when the question truly "
+            "needs current, real-time, or external facts you cannot be confident "
+            "about (today's events, prices, scores, the latest version of "
+            "something, or a specific named entity you do not know). If it is "
+            "general knowledge you already know, choose answer. Options:\n"
+            + "\n".join(f"- {opt}" for opt in options)
+            + "\nFill the fields from the user's own words."
+            # One extra field, no extra call. The router is already being paid
+            # for on this turn, it already has the question in front of it, and
+            # it had never once been asked the question that actually matters
+            # for a small model: not "does this need a lookup" but "do you know
+            # this". Those are different questions and the second is the one
+            # only the model can answer -- no regex can tell whether a
+            # particular product name is inside these weights. Everything the
+            # gap detection needed was one field away from free.
+            + " Also report whether you already know the answer with confidence:"
+            ' add "known":true when you do, and "known":false when the question'
+            " names a specific product, person, version, event or number you are"
+            " not sure you have actually seen. Saying known when you have not"
+            " seen it is the mistake this field exists to catch."
+            + " Reply with only the JSON object."
+        )
+
+        # A few recent turns so "look it up" / "and tomorrow?" resolve in context.
+        context: list[dict] = [{"role": "system", "content": system}]
+        for turn in (history or [])[-4:]:
+            role = turn.get("role")
+            if role in ("user", "assistant") and turn.get("content"):
+                context.append({"role": role, "content": str(turn["content"])[:500]})
+        context.append({"role": "user", "content": message[:1000]})
+
+        # If the reply is unusable, answer from own knowledge rather than
+        # defaulting to a search. Prefer the model's knowledge unless it clearly
+        # asked for a tool.
+        fallback = {"action": "answer"}
+
+        try:
+            text, got = await self.client.complete_with_stats(
+                context, max_tokens=64, temperature=0.0
+            )
+            # The router is a real model call. Not accounting for it is exactly
+            # the omission the turn footer exists to prevent.
+            if stats is not None and got is not None:
+                stats.prompt_tokens += got.prompt_tokens
+                stats.completion_tokens += got.completion_tokens
+                stats.total_ms += got.total_ms
+        except Exception as exc:
+            log(f"Router call failed ({exc}); falling back.", logging.WARNING)
+            return fallback
+
+        decision = extract_json_object(text) or {}
+        action = str(decision.get("action", "")).lower().strip()
+
+        if action == "answer":
+            # Carry the confidence report through. Absent or malformed reads as
+            # "known", because the ONLY safe default for a field a model may
+            # simply not have filled in is the one that changes nothing: a
+            # missing field must never be read as "it does not know this" and
+            # spend a search on every turn the router happened to be terse.
+            #
+            # said_no rather than `is not False`: that only ever recognised a
+            # real JSON boolean, and a 3B asked for one writes "false", "no" or
+            # 0 about as often as it writes false. Every one of those read as
+            # "yes, I know this", so a router correctly reporting a gap was
+            # heard as reporting none -- the signal did nothing while looking
+            # exactly like it worked.
+            return {"action": "answer", "known": not said_no(decision.get("known"))}
+
+        # A tool action: it must name a routable tool, and after alias-mapping its
+        # required arguments must be present. Anything missing falls back safely.
+        tool = self.registry.get(action)
+        if tool is not None and tool.routable:
+            args = {k: v for k, v in decision.items() if k not in ("action", "known")}
+            args = self.registry.normalise_args(tool, args)
+            # str(args[r]) satisfied the presence test for ANY value, so
+            # {"action":"web_search","query":{"a":"b"}} -- which a small model
+            # emits often enough -- passed the gate untouched, and the tool
+            # then died on `query.strip()` with an AttributeError that came
+            # back as the tool result. A structured value is not a query; the
+            # scalars are stringified and everything else falls back, which is
+            # what "anything missing falls back safely" was meant to mean.
+            if all(isinstance(args.get(r), (str, int, float))
+                   and not isinstance(args.get(r), bool)
+                   and str(args[r]).strip() for r in tool.required):
+                # Trim over-long string args defensively, and normalise a
+                # required scalar to the string every tool here expects.
+                args = {k: (v[:200] if isinstance(v, str)
+                            else str(v)[:200] if k in tool.required else v)
+                        for k, v in args.items()}
+                return {"action": action, **args}
+
+        return fallback
+
+    def with_retrieved_context(self, user_message: str, max_chars: int | None = None,
+                               active_code_task: bool = False) -> str:
+        """Prepend the most relevant knowledge-base passages to the question.
+
+        This is the RAG step: when documents have been indexed, the best-matching
+        passages are injected so the model answers from the user's own material
+        (with source paths) instead of guessing. Silent no-op when the knowledge
+        base is empty, so behaviour is unchanged until documents are added.
+
+        `max_chars` caps the block to what is actually left of the context
+        window (see build_base). Sizing it against the whole window instead is
+        how a 4KB block of unrelated reference material pushed prompt + reply
+        past n_ctx on a six-word question.
+        """
+        db = getattr(self.registry, "db", None)
+        if not self.config.rag_enabled or db is None:
+            return user_message
+        if not getattr(db, "fts_enabled", False):
+            return user_message
+        if max_chars is not None and max_chars < 400:
+            # Not enough window left for a passage worth reading.
+            return user_message
+        # Subject words only: intent verbs ("write", "program") match nearly
+        # every indexed document and are not evidence of anything.
+        tokens = rag_query_tokens(user_message)
+        if not tokens:
+            return user_message
+        # "write a basic c++ crud program" is answered from the model's own
+        # knowledge. Retrieval belongs on a code request only when the user is
+        # pointing at their own files, where the real code is the answer.
+        if is_code_request(user_message) and not refers_to_project(user_message):
+            return user_message
+        # Mid-task, a follow-up like "add more checks and error handling" is
+        # about the artifact in the task state and nothing else. Retrieval on it
+        # is actively harmful: the FTS query ORs every term, so "checks",
+        # "handling" and "validator" matched indexed Python documents, and those
+        # passages are where skill_validator.py and seo_health_scorer.py came
+        # from in a conversation that was writing a Bash script.
+        if active_code_task and not refers_to_project(user_message):
+            return user_message
+        # A remark about the previous answer ("doesnt have a main function") is
+        # answered from the conversation, never from the knowledge base.
+        if is_followup_remark(user_message):
+            return user_message
+        try:
+            scope = [p.strip() for p in (self.config.rag_scope or "").split(",") if p.strip()]
+            # Scope retrieval to the acting user's own + shared documents so one
+            # user's imported history never surfaces in another's answers.
+            hits = db.search_documents(user_message, limit=self.config.rag_passages,
+                                       only=scope or None, user_id=get_acting_user())
+        except Exception as exc:
+            log(f"knowledge-base lookup skipped: {exc}", logging.DEBUG)
+            return user_message
+        # Keep only passages that genuinely overlap the question. The FTS query
+        # ORs every term, so one common word ("message", "first") is enough to
+        # match a totally unrelated document -- which is how "its not reconsider
+        # the first message in this convo" pulled in someone else's transcript and
+        # the model answered by inventing a conversation. Requiring real overlap
+        # makes retrieval fire only when it has something to contribute.
+        need = 2 if len(tokens) >= 2 else 1
+        hits = [h for h in hits
+                if sum(1 for t in tokens
+                       if t in (str(h.get("chunk", "")) + " "
+                                + str(h.get("path", ""))).lower()) >= need]
+        if not hits:
+            return user_message
+        budget = max(400, int(self.config.context_size * 0.25) * 4)
+        if max_chars is not None:
+            budget = min(budget, max_chars)
+        blocks, used = [], 0
+        for h in hits:
+            piece = f"[{h['path']}]\n{h['chunk']}"
+            if used + len(piece) > budget:
+                break
+            blocks.append(piece)
+            used += len(piece)
+        if not blocks:
+            return user_message
+        return ("Reference material from the user's indexed documents. It may be "
+                "irrelevant: ignore it entirely unless it directly helps, and never "
+                "treat it as part of this conversation.\n\n"
+                + "\n\n".join(blocks)
+                + "\n\nUsing those passages only where they apply (cite the [path] "
+                  "when you do), answer:\n" + user_message)
+
+    # What a document turn is allowed to call. Everything else in the registry
+    # is ~1600 tokens of a 4096-token window describing tools it will not touch,
+    # and that is budget the document itself has to fit in.
+    DOCUMENT_TOOLS = ("create_document", "final_answer")
+    DOCUMENT_LOOKUP_TOOLS = ("web_search", "fetch_url", "read_file", "search_docs")
+
+    def document_tool_subset(self, research: bool) -> list[str]:
+        """The tools a document turn may use, narrowed to what is registered."""
+        names = list(self.DOCUMENT_TOOLS)
+        if research:
+            names += list(self.DOCUMENT_LOOKUP_TOOLS)
+        return [n for n in names if self.registry.get(n) is not None]
+
+    def build_base(
+        self,
+        history: list[dict],
+        user_message: str,
+        reserve: int,
+        tools: bool = True,
+        extra_context: str = "",
+        active_code_task: bool = False,
+        tool_subset: "list[str] | None" = None,
+    ) -> tuple[list[dict], int]:
+        """Assemble [system, trimmed history, user]. This prefix is never cut later.
+
+        `tools` picks the lane. The tool-calling prompt is the protocol plus
+        every tool spec (~1500 tokens of a 4096-token window); the prose lane
+        drops both, and with them the instruction to "reply with a single JSON
+        object", once routing has decided the turn calls nothing.
+        """
+        system = {
+            "role": "system",
+            "content": (build_agent_system_prompt(
+                            self.config.system_prompt_with_identity, self.registry,
+                            reasoning=self.config.reasoning_visible,
+                            only=tool_subset)
+                        if tools else
+                        build_plain_system_prompt(
+                            self.config.system_prompt_with_identity,
+                            reasoning=self.config.reasoning_visible,
+                            registry=self.registry)),
+        }
+        # Size retrieval against what is left after the parts that cannot be
+        # dropped, minus a floor for history, so the fixed prefix can never on
+        # its own push the request past the context window.
+        budget = max(256, self.config.context_size - reserve - CONTEXT_SAFETY_MARGIN)
+        room = budget - messages_tokens([system]) - estimate_tokens(user_message)
+        room -= estimate_tokens(extra_context)
+        user = {"role": "user",
+                "content": self.with_retrieved_context(
+                    user_message, max(0, room - RAG_HISTORY_FLOOR) * 4,
+                    active_code_task=active_code_task)}
+        # Per-turn context -- an autoloaded procedure, the content behind an
+        # @reference -- rides on the USER message, never the system prompt. It is
+        # specific to this turn, so putting it in the system prompt would change
+        # the cached prefix whenever the topic changed and cost a full
+        # re-prefill; the tail of the prompt is free to vary.
+        if extra_context:
+            user["content"] = f"{extra_context}\n\n{user['content']}"
+        floor = messages_tokens([system, user])
+        if floor > budget:
+            # Neither part is trimmable here, and trim_to_context deliberately
+            # never cuts them. Say so: the reply budget gets clamped downstream
+            # (ModelClient.payload) and this is the only place the cause shows.
+            log(f"prompt floor is {floor} tokens against a {budget}-token budget "
+                f"(context {self.config.context_size}, reply reserve {reserve}); "
+                "history is fully evicted and the reply budget will be clamped.",
+                logging.WARNING)
+        return trim_to_context(
+            system,
+            # The truncation marker is UI copy addressed to the user ("raise Max
+            # tokens in Settings"), not conversation. Feeding it back invites the
+            # model to imitate it, and it is noise in every prefill from here on.
+            [{"role": m["role"],
+              "content": (strip_truncation_note(m["content"])
+                          if m["role"] == "assistant" else m["content"])}
+             for m in history],
+            user,
+            self.config.context_size,
+            reserve,
+        )
+
+    SUMMARY_MARKER = "EARLIER STEPS (condensed):"
+
+    def compact(self, base: list[dict], scratch: list[dict], reserve: int) -> int:
+        """Shrink an overlong trace in place. Returns how many entries collapsed.
+
+        Mutating scratch rather than recomputing a view each step is the whole
+        point. A prefix cache matches on the token prefix, so what it needs is
+        for step k+1's prompt to *start with* step k's prompt. Appending to a
+        stable list gives exactly that. Recomputing a summary every step does
+        not: the summary text changes as more is folded into it, which moves
+        every token after it and invalidates the cache on every single step.
+
+        So the collapse happens once, when the budget is actually exceeded, and
+        the run then extends cleanly again until the next one. Long runs of
+        cache hits punctuated by rare misses, instead of a miss every step.
+        """
+        budget = max(256, self.config.context_size - reserve - CONTEXT_SAFETY_MARGIN)
+        fixed = messages_tokens(base)
+        if fixed + messages_tokens(scratch) <= budget:
+            return 0
+
+        collapsed = 0
+        carried: list[str] = []
+        # Reclaim to 60% of budget so the next few steps fit without another
+        # collapse. Collapsing to exactly the limit would re-trigger next step.
+        target = int(budget * 0.6)
+        while scratch and fixed + messages_tokens(scratch) > target:
+            oldest = scratch.pop(0)
+            collapsed += 1
+            line = self.condense_turn(oldest)
+            if not line:
+                continue
+            if line is True:
+                # A previous summary: fold its lines in rather than nesting.
+                content = (oldest.get("content") or "").strip()
+                carried = [row[2:] for row in content.splitlines()[1:]] + carried
+            else:
+                carried.append(line)
+
+        if carried:
+            scratch.insert(0, {
+                "role": "user",
+                "content": self.SUMMARY_MARKER + "\n"
+                + "\n".join(f"- {line}" for line in self.fit_summary(carried, budget)),
+            })
+        return collapsed
+
+    # Share of the step budget the condensed summary may occupy. The summary
+    # has to be big enough to carry facts and small enough that inserting it
+    # does not immediately re-trigger a collapse -- which would also destroy the
+    # prefix-extension property the whole compaction scheme exists to protect.
+    SUMMARY_BUDGET_SHARE = 0.15
+    SUMMARY_MAX_LINES = 12
+
+    def fit_summary(self, carried: list[str], budget: int) -> list[str]:
+        """The newest carried lines, each trimmed to an equal share of the cap.
+
+        Fixed per-line limits do not work across context sizes: 500 characters
+        a line is a reasonable digest in a 32k window and is most of a 4k one.
+        """
+        lines = carried[-self.SUMMARY_MAX_LINES:]
+        if not lines:
+            return []
+        allowed = int(max(240, budget * self.SUMMARY_BUDGET_SHARE) * CHARS_PER_TOKEN)
+        per_line = max(60, allowed // len(lines))
+        return [line[:per_line] for line in lines]
+
+    # How much of a collapsed tool result is kept. A tool result is the only
+    # thing in the trace that carries FACTS, so it gets real room; the model's
+    # own notes get a fraction of it.
+    CONDENSED_RESULT_CHARS = 1200
+    CONDENSED_NOTE_CHARS = 160
+
+    def condense_turn(self, turn: dict) -> "str | bool":
+        """One line standing in for a collapsed trace entry.
+
+        "" to drop it, True when it is a previous summary the caller should fold
+        in, otherwise the text to carry.
+
+        The bug this replaces: a tool result is stored as a user turn whose
+        FIRST LINE is the header "TOOL RESULT [web_search]:", and the collapse
+        carried exactly that first line. So on any run long enough to compact,
+        every fact the tools had gathered was replaced by a list of identical
+        headers, and the model was left to answer from a summary that said
+        nothing while the dedup guard stopped it fetching any of it again.
+        running_summary in this same class had always done it properly; the two
+        simply never agreed.
+        """
+        content = (turn.get("content") or "").strip()
+        if not content:
+            return ""
+        if content.startswith(self.SUMMARY_MARKER):
+            return True
+        if content.startswith(("TOOL RESULT", "PAGE TEXT")):
+            # Drop the trailing directive: it is an instruction to the model for
+            # a step that has already happened, not a finding.
+            body = content.split("\n\n")[0] if "\n\n" in content else content
+            return " ".join(body.split())[:self.CONDENSED_RESULT_CHARS]
+        if turn.get("role") == "assistant":
+            return "note: " + " ".join(content.split())[:self.CONDENSED_NOTE_CHARS]
+        return " ".join(content.split())[:self.CONDENSED_NOTE_CHARS]
+
+    def assemble(self, base: list[dict], scratch: list[dict], reserve: int) -> tuple[list[dict], int]:
+        """base + the trace. base is fixed and can never be evicted.
+
+        With stable_prefix off this drops the oldest entries from a copy every
+        step, which is correct but cache-hostile. With it on, compact() has
+        already made the list fit, so this is a concatenation and the prompt
+        strictly extends between collapses.
+        """
+        if self.config.stable_prefix:
+            collapsed = self.compact(base, scratch, reserve)
+            return [*base, *scratch], collapsed
+
+        budget = max(256, self.config.context_size - reserve - CONTEXT_SAFETY_MARGIN)
+        fixed = messages_tokens(base)
+        kept = list(scratch)
+        dropped = 0
+        while kept and fixed + messages_tokens(kept) > budget:
+            kept.pop(0)
+            dropped += 1
+        return [*base, *kept], dropped
+
+    def _tool_budget(self, reserve: int) -> int:
+        """Characters of a single tool result allowed into the context.
+
+        A result added at step k is re-prefilled at every step after it, so the
+        real cost is this number times the steps remaining. The share of context
+        is deliberately smaller than it looks reasonable to allow.
+        """
+        room = max(512, (self.config.context_size - reserve) // 6) * CHARS_PER_TOKEN
+        return int(min(self.config.tool_result_chars, room))
+
+    async def compress_tool_result(self, name: str, result: str, budget: int) -> tuple[str, bool]:
+        """Shrink an oversized tool result, preferring a summary over a hard cut.
+
+        Truncation keeps the navigation chrome at the top of a page and throws
+        away the part that answers the question. One cheap summarisation call
+        pays for itself the moment two more steps follow.
+        """
+        if len(result) <= budget:
+            return result, False
+        if not self.config.summarise_tool_results or len(result) <= self.config.summarise_over_chars:
+            return result[:budget] + "\n[truncated]", False
+        prompt = [
+            {"role": "system", "content":
+                "You compress tool output. Reply with only the facts the caller asked for, "
+                "in at most 8 short lines. Keep numbers, names, dates and URLs exactly. "
+                "Do not add commentary, and do not invent anything."},
+            {"role": "user", "content":
+                f"Tool: {name}\nCompress this output:\n\n{result[:12000]}"},
+        ]
+        summary = await self.resilient_complete(
+            prompt, max_tokens=min(400, budget // CHARS_PER_TOKEN), temperature=0.0
+        )
+        summary = strip_reasoning(summary).strip()
+        if not summary:
+            return result[:budget] + "\n[truncated]", False
+        return f"[condensed from {len(result)} chars]\n{summary[:budget]}", True
+
+    async def resilient_complete(self, messages: list[dict], max_tokens: int,
+                                 temperature: float | None,
+                                 stats: "GenerationStats | None" = None) -> str:
+        """A non-streaming completion that never raises.
+
+        On failure (a server OOM kill and watchdog restart present as a dropped
+        connection here), it waits briefly for the server to come back and
+        retries with a smaller token budget. If every attempt fails it returns an
+        empty string, so callers degrade instead of erroring. Used for the router,
+        the tool-result summariser, and the forced final answer.
+        """
+        tokens = max_tokens
+        for attempt in range(self.config.resilient_retries + 1):
+            try:
+                text, got = await self.client.complete_with_stats(messages, tokens, temperature)
+                if stats is not None and got is not None:
+                    # So the caller can fold this call into the turn's totals:
+                    # a lane that skips accounting makes the token footer under
+                    # the answer understate what the turn actually cost.
+                    stats.prompt_tokens += got.prompt_tokens
+                    stats.completion_tokens += got.completion_tokens
+                    stats.total_ms += got.total_ms
+                    stats.ttft_ms = stats.ttft_ms or got.ttft_ms
+                    stats.finish_reason = got.finish_reason or stats.finish_reason
+                return text
+            except Exception as exc:
+                if attempt >= self.config.resilient_retries:
+                    log(f"resilient_complete gave up after {attempt + 1} tries: {exc}",
+                        logging.WARNING)
+                    return ""
+                # Wait for the (possibly restarting) server to be ready, then
+                # retry with roughly half the tokens (floored), which also halves
+                # the KV cache the reply needs.
+                await self.client.wait_until_ready(timeout=self.config.ready_wait_timeout)
+                tokens = max(self.config.min_max_tokens, tokens // 2)
+
+    # Soft ceiling on a partial file. Past this we stop growing it (the reader is
+    # tail-biased anyway), so a runaway task cannot fill the disk.
+    PARTIAL_MAX_BYTES = 4_000_000
+    # Most open partial handles to keep at once before closing the least-recent.
+    PARTIAL_MAX_OPEN = 8
+
+    def _partial_key(self, conversation_id: str | None) -> str:
+        return "".join(c for c in (conversation_id or "scratch")
+                       if c.isalnum() or c in "-_")[:60] or "scratch"
+
+    def _partial_path(self, conversation_id: str | None) -> Path:
+        """Path to the partial file. Does not touch the filesystem."""
+        return self._partials_dir / f"{self._partial_key(conversation_id)}.md"
+
+    def _close_partial(self, key: str) -> None:
+        entry = self._partials.pop(key, None)
+        if entry:
+            try:
+                entry["fh"].close()
+            except Exception:
+                pass      # partial already closed or the file went away
+
+    def partial_begin(self, conversation_id: str | None, question: str) -> Path:
+        """Open (truncate) the partial-output file for this turn and keep the
+        handle open for the whole turn.
+
+        Every finding, conclusion and chunk note is appended to this one open
+        handle as it is produced, so if RAM runs out before the model can
+        synthesise, the work is already on disk and can be handed back. Keeping
+        the handle open avoids an open()/close() per append; a flush() after each
+        write pushes the data to the OS page cache, which survives an OOM-kill of
+        this process without the cost of an fsync.
+        """
+        key = self._partial_key(conversation_id)
+        self._close_partial(key)  # a new turn for this conversation starts fresh
+        try:
+            self._partials_dir.mkdir(parents=True, exist_ok=True)  # once per turn
+            fh = self._partial_path(conversation_id).open(
+                "w", encoding="utf-8", buffering=1 << 16)
+            fh.write(f"# Working notes\n\nRequest: {question[:500]}\n\n")
+            fh.flush()
+            self._partials[key] = {"fh": fh, "bytes": 0, "capped": False}
+            # Bound open handles on a long-running server: close the oldest.
+            while len(self._partials) > self.PARTIAL_MAX_OPEN:
+                oldest = next(iter(self._partials))
+                self._close_partial(oldest)
+        except Exception as exc:
+            log(f"could not open partial file: {exc}", logging.WARNING)
+        return self._partial_path(conversation_id)
+
+    def partial_add(self, conversation_id: str | None, text: str) -> None:
+        """Append one piece of progress to the already-open partial file.
+
+        One buffered write plus a cheap flush, no reopen. Stops growing the file
+        past PARTIAL_MAX_BYTES so a runaway task cannot fill the disk; the reader
+        keeps the head and tail regardless.
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        key = self._partial_key(conversation_id)
+        entry = self._partials.get(key)
+        try:
+            if entry is None:
+                # Defensive: add without begin. Open in append mode once.
+                self._partials_dir.mkdir(parents=True, exist_ok=True)
+                fh = self._partial_path(conversation_id).open(
+                    "a", encoding="utf-8", buffering=1 << 16)
+                entry = {"fh": fh, "bytes": fh.tell(), "capped": False}
+                self._partials[key] = entry
+            if entry["capped"]:
+                return
+            chunk = text + "\n\n"
+            entry["fh"].write(chunk)
+            entry["fh"].flush()  # to OS cache: cheap, survives an OOM-kill
+            entry["bytes"] += len(chunk.encode("utf-8", "ignore"))
+            if entry["bytes"] >= self.PARTIAL_MAX_BYTES:
+                entry["fh"].write("\n\n[partial truncated: size cap reached]\n")
+                entry["fh"].flush()
+                entry["capped"] = True
+        except Exception as exc:
+            log(f"could not append partial: {exc}", logging.DEBUG)
+
+    def partial_read(self, conversation_id: str | None, max_chars: int = 8000) -> str:
+        """Read back the accumulated partial work, tail-biased and bounded.
+
+        Flushes the open handle first so our own read sees buffered writes, and
+        seeks to read only the head and tail of a large file instead of loading
+        the whole thing into memory.
+        """
+        key = self._partial_key(conversation_id)
+        entry = self._partials.get(key)
+        path = self._partial_path(conversation_id)
+        try:
+            if entry is not None:
+                entry["fh"].flush()
+            size = path.stat().st_size
+            if size <= max_chars:
+                data = path.read_text(encoding="utf-8", errors="replace").strip()
+            else:
+                # Read a head slice and a tail slice, skip the middle.
+                head_n = 600
+                tail_n = max_chars - head_n
+                with path.open("rb") as fh:
+                    head = fh.read(head_n)
+                    fh.seek(-tail_n, 2)
+                    tail = fh.read()
+                data = (head.decode("utf-8", "replace").strip()
+                        + "\n\n[...]\n\n"
+                        + tail.decode("utf-8", "replace").strip())
+            return data
+        except Exception:
+            return ""
+
+    def salvage(self, conversation_id: str | None, note: str) -> str:
+        """Build a useful answer from saved work when synthesis cannot run."""
+        saved = self.partial_read(conversation_id)
+        if saved:
+            return (note + "\n\nHere is what I gathered before running low on "
+                    "memory (also saved to disk):\n\n" + saved)
+        return note
+
+    async def auto_continue(self, final: dict, request: str, history: list[dict],
+                            conversation_id: str | None, max_tokens: int | None,
+                            temperature: float | None,
+                            cancel: "asyncio.Event | None" = None):
+        """Carry an answer that stopped at the reply limit through to its end.
+
+        The reply budget is a property of the context window, not of the
+        request: a program that needs 2000 tokens on a 4096-token context is
+        going to be cut off however it is phrased. Leaving it there and printing
+        "ask me to continue" made finishing the work the user's job, one "go on"
+        at a time -- and every one of those round trips re-prefills the whole
+        prompt, so the manual route is also the expensive one.
+
+        This reuses the continuation lane exactly as a typed "continue" does; it
+        only stops waiting to be asked. Bounded by auto_continue_max, and a pass
+        that adds nothing ends the loop, so a model with nothing left to say
+        cannot spin through the budget discovering that repeatedly.
+
+        Yields UI events, then exactly one {"__final__": <the completed final>}.
+        """
+        answer = str(final.get("answer") or "")
+        passes_allowed = self.config.auto_continue_max if self.config.auto_continue else 0
+        if passes_allowed <= 0 or not was_truncated(answer):
+            yield {"__final__": final}
+            return
+
+        task = self.load_task(conversation_id, history)
+        # A turn that was ITSELF a "continue" hands "continue" down as the
+        # request, which says nothing about the work. The recorded objective is
+        # the anchor, exactly as continuation_target uses it for the manual case.
+        if is_continue_request(request) and task.objective:
+            request = task.objective
+        prompt_tokens = int(final.get("prompt_tokens") or 0)
+        completion_tokens = int(final.get("completion_tokens") or 0)
+        elapsed_ms = float(final.get("elapsed_ms") or 0.0)
+        passes = 0
+        last_addition = ""
+
+        while passes < passes_allowed and was_truncated(answer):
+            if cancel is not None and cancel.is_set():
+                break
+            partial = strip_truncation_note(answer)
+            if not partial.strip():
+                break
+            passes += 1
+            yield {"type": "notice", "info": True,
+                   "message": (f"the reply hit the token limit; continuing "
+                               f"automatically ({passes}/{passes_allowed})")}
+            log(f"auto-continue pass {passes}: resuming a "
+                f"{estimate_tokens(partial)}-token partial answer.", logging.INFO)
+            resumed = None
+            async for event in self.continue_answer(
+                    (request, partial), history, max_tokens, temperature, cancel,
+                    conversation_id, task):
+                if event.get("type") == "final":
+                    resumed = event
+                elif event.get("type") == "cancelled":
+                    yield event
+                    return
+                else:
+                    yield event
+            if resumed is None:
+                break
+            prompt_tokens += int(resumed.get("prompt_tokens") or 0)
+            completion_tokens += int(resumed.get("completion_tokens") or 0)
+            elapsed_ms += float(resumed.get("elapsed_ms") or 0.0)
+            grown = str(resumed.get("answer") or "")
+            body = strip_truncation_note(grown)
+            addition = body[len(partial):].strip()
+            if len(body) <= len(partial) or not addition:
+                # The pass produced nothing new. continue_answer already says so
+                # when the model returns empty; this also catches a pass that
+                # only re-emitted the boundary.
+                answer = grown or answer
+                break
+            if addition == last_addition:
+                # Two passes in a row added the same text: the model is looping,
+                # not writing. stitch_continuation catches a restart and a
+                # duplicated seam, but not a short phrase repeated forever, and
+                # spending the remaining passes on it only makes the answer
+                # longer and worse.
+                log("auto-continue: the continuation repeated itself; stopping.",
+                    logging.WARNING)
+                answer = grown
+                break
+            last_addition = addition
+            answer = grown
+
+        completed = dict(final)
+        completed["answer"] = answer
+        completed["prompt_tokens"] = prompt_tokens
+        completed["completion_tokens"] = completion_tokens
+        completed["elapsed_ms"] = round(elapsed_ms)
+        completed["truncated"] = was_truncated(answer)
+        completed["continued"] = passes
+        if passes and was_truncated(answer):
+            # Honest about where it stopped: the note under the answer still
+            # says "ask me to continue", and now that is the actual next step.
+            yield {"type": "notice", "info": True,
+                   "message": (f"still unfinished after {passes} automatic "
+                               "continuation"
+                               + ("s" if passes != 1 else "")
+                               + "; say \"continue\" for more, or raise Max tokens")}
+        yield {"__final__": completed}
+
+    async def run_iterating(self, message, history, conversation_id, max_tokens, temperature):
+        """Run the agent, then verify any code it changed and, if the checks fail,
+        let it see the errors and try again — up to auto_iterate_rounds times.
+
+        Verification is layered so it works with or without the sandbox:
+        - Always (no execution needed): syntax-check changed Python files.
+        - When execution is enabled and a test command exists: run the tests.
+        A failure at either layer sends the agent back with the exact errors.
+        Only the final round's answer is surfaced as the turn's answer.
+        """
+        rounds = self.config.auto_iterate_rounds
+        verify = rounds > 0
+        current = message
+        # Snapshot once, before any round: everything changed during this whole
+        # turn (across rounds) is what we verify. Capturing per-round would miss a
+        # file the fix re-edits, since it is already in changed_files by then.
+        turn_start_changed = set(self.registry.changed_files)
+        # Documents produced in ANY round of this turn. run() resets the
+        # registry's per-turn list on entry, so without this a turn whose first
+        # round wrote a .pdf and whose second round fixed a test would hand back
+        # a final event offering no download at all.
+        produced: list[str] = []
+        for round_i in range(rounds + 1):
+            last_final = None
+            async for ev in self.run(current, history, conversation_id, max_tokens,
+                                     temperature, internal=round_i > 0):
+                if ev.get("type") == "final":
+                    # Finish it before anything treats it as the round's answer:
+                    # the verification below reads changed files, and the task
+                    # state records the artifact, and both should see the whole
+                    # thing rather than the half that fitted in one reply.
+                    async for sub in self.auto_continue(
+                            ev, message, history, conversation_id, max_tokens,
+                            temperature):
+                        if "__final__" in sub:
+                            ev = sub["__final__"]
+                        else:
+                            yield sub
+                    for name in ev.get("documents") or []:
+                        if name not in produced:
+                            produced.append(name)
+                    ev["documents"] = list(produced)
+                    last_final = ev
+                    if not verify:
+                        yield ev
+                else:
+                    yield ev
+            if not verify:
+                return
+
+            new_files = sorted(self.registry.changed_files - turn_start_changed)
+            if not new_files:
+                if last_final:
+                    yield last_final
+                return
+
+            problems = []
+            # Layer 1: syntax check (always, safe without execution).
+            syntax_errors = self.registry.syntax_check(new_files)
+            if syntax_errors:
+                problems.append("Syntax errors:\n" + syntax_errors)
+
+            # Layer 2: tests, only if the sandbox is available.
+            test_cmd = self.registry._detect_test_command()
+            if self.config.allow_shell and test_cmd:
+                yield {"type": "notice", "info": True,
+                       "message": f"verifying in the sandbox (round {round_i + 1}/{rounds + 1}): {test_cmd}"}
+                result = await asyncio.to_thread(self.registry._run_tests, "")
+                if self.config.show_internals:
+                    yield {"type": "detail", "message": "test output:\n" + result[:1000]}
+                if "[exit code 0]" not in result:
+                    problems.append("Test failures:\n" + result[:1500])
+            elif test_cmd and not self.config.allow_shell:
+                yield {"type": "notice", "info": True,
+                       "message": "tests found but execution is off; ran a syntax "
+                                  "check only. Start with --allow-shell to auto-run tests."}
+
+            if not problems:
+                # Say what was actually checked. "verified (syntax)" was printed
+                # after a pass that looked at .py files only, so a turn that
+                # rewrote shell or Go was reported as verified having had
+                # nothing examined at all.
+                parsed, shallow = self.registry.checked_languages(new_files)
+                if parsed or shallow:
+                    parts = []
+                    if parsed:
+                        parts.append("parsed: " + ", ".join(parsed))
+                    if shallow:
+                        # Not the same claim as "it parses". Say which one.
+                        parts.append("structure only: " + ", ".join(shallow))
+                    if self.config.allow_shell and test_cmd:
+                        parts.append("tests")
+                    message = "changes verified \u2713 (" + "; ".join(parts) + ")"
+                else:
+                    message = ("no syntax checker for "
+                               + ", ".join(sorted({Path(f).suffix or "?"
+                                                   for f in new_files})[:4])
+                               + "; the changes were NOT verified")
+                    if self.config.allow_shell and test_cmd:
+                        message = "tests passed \u2713 (no syntax checker for these files)"
+                yield {"type": "notice", "info": True, "message": message}
+                if last_final:
+                    yield last_final
+                return
+
+            if round_i >= rounds:
+                yield {"type": "notice", "info": True,
+                       "message": "checks still failing after the last round; returning the "
+                                  "latest attempt (review the diff before using it)"}
+                if last_final:
+                    yield last_final
+                return
+
+            yield {"type": "notice", "info": True,
+                   "message": "verification failed; fixing and re-checking"}
+            current = ("Your edits did not pass verification. Fix the code so it passes. "
+                       "Problems found:\n\n" + "\n\n".join(problems)[:2500])
+
+    def running_summary(self, scratch: list[dict]) -> str:
+        """A compact plain-text digest of the work so far.
+
+        Used to keep memory flat on a big task: instead of carrying the whole
+        transcript into every step (which grows the prompt and the KV cache until
+        an 8GB machine OOMs), the transcript is periodically collapsed to this
+        summary so each step's working set stays bounded. Slower, but it does not
+        stop.
+        """
+        lines: list[str] = []
+        for turn in scratch:
+            content = str(turn.get("content", "")).strip()
+            if not content:
+                continue
+            role = turn.get("role")
+            # Keep tool results (they carry the facts) and the model's own notes,
+            # trimmed hard; drop the boilerplate directives.
+            if content.startswith("TOOL RESULT") or content.startswith("PAGE TEXT"):
+                lines.append(" ".join(content[:600].split()))
+            elif role == "assistant":
+                lines.append("note: " + " ".join(content[:300].split()))
+        return "\n".join(lines[-12:])
+
+    def is_reasoning_question(self, message: str) -> bool:
+        """The configured version of the module-level gate.
+
+        Both callers go through here so the thresholds mean one thing: what the
+        depth gate decomposes is also what the cluster router sends to the more
+        capable node. Splitting them would let a machine tuned for depth keep
+        routing the deep questions to the small box.
+        """
+        return is_reasoning_question(message,
+                                     signals=self.config.reasoning_signals,
+                                     min_chars=self.config.reasoning_min_chars)
+
+    def question_shape(self, message: str) -> "QuestionShape":
+        """The configured classification. Computed once per turn, read by all.
+
+        Same contract as is_reasoning_question above and for the same reason:
+        the depth gate, the cluster routing hint and the per-kind directive
+        have to be looking at one verdict. Three callers each running their own
+        classification is how the routing hint and the depth gate came to
+        disagree about the same message in the first place.
+        """
+        return classify_question(message,
+                                 signals=self.config.reasoning_signals,
+                                 min_chars=self.config.reasoning_min_chars)
+
+    # One line per kind, appended to the prompt on a "short" turn: the turns
+    # that have real work in them but not enough to be worth a plan, a call per
+    # step and a synthesis. It costs a handful of tokens and it is the cheapest
+    # quality win available here, because the characteristic 3B failure on
+    # these is not getting the answer wrong, it is answering a different and
+    # easier question -- describing what a thing is when asked why it is that
+    # way, listing both options when asked which to pick. Naming the shape of
+    # the expected answer is enough to stop most of that.
+    #
+    # Deliberately no entry for the direct kinds. A haiku does not need advice
+    # on how to be a haiku, and a line of instruction in front of a short
+    # factual question is a line the answer has to compete with.
+    ANSWER_HINTS = {
+        "causal": ("Explain the mechanism -- what leads to what -- not just "
+                   "the outcome."),
+        "comparative": ("Name the axes you are comparing on first, then go "
+                        "through them one at a time, then give the verdict."),
+        "analytical": ("Work through the evidence before stating a "
+                       "conclusion, and say what would change it."),
+        "procedural": ("Give the steps in order, numbered, with the exact "
+                       "commands or actions. State any prerequisite first."),
+        "decision": ("Pick one and say so plainly. Give the reason, then the "
+                     "condition under which the other becomes the right call."),
+        "definition": ("Define it in one sentence, then give one concrete "
+                       "example."),
+    }
+
+    # Lines a small model puts around a list when it was asked not to. Every one
+    # of these used to become a step, and a step costs a full generation: a plan
+    # that opened "Here are the steps:" and closed "Let me know if you want more
+    # detail." spent two of the six on nothing, and because the truncation below
+    # keeps the FRONT of the list, the one it dropped to make room was the last
+    # -- which in an ordered plan is the one that reaches the conclusion.
+    PLAN_NOISE = re.compile(
+        r"(?i)^\s*(?:"
+        r"here(?:'?s| is| are)\b|"
+        r"sure[,.!]|okay[,.!]|ok[,.!]|certainly[,.!]|of course[,.!]|"
+        r"(?:the\s+)?(?:following|below)\b.*?:\s*$|"
+        r"(?:steps?|plan|breakdown|sub-?questions?)\s*:?\s*$|"
+        r"let me know\b|hope (?:this|that) helps\b|"
+        r"(?:i\s+)?(?:will|'ll|can)\s+(?:now\s+)?(?:break|split|decompose)\b|"
+        r"#{1,6}\s|"
+        r"```"
+        r")")
+
+    def plan_lines(self, text: str, question: str) -> list[str]:
+        """Turn a planning reply into clean steps. Pure, so it can be tested.
+
+        Split out of plan_steps because everything that went wrong with planning
+        went wrong here rather than in the model call: the parser accepted any
+        line over three characters, so preambles, sign-offs, markdown headings
+        and restatements of the question all became steps, and each one cost a
+        generation and a slot in a budget of six.
+        """
+        question_words = _subject_words(question)
+        steps: list[str] = []
+        seen: set[str] = set()
+        for line in unwrap_answer(strip_reasoning(text)).splitlines():
+            line = line.strip()
+            if not line or self.PLAN_NOISE.match(line):
+                continue
+            # Accept "1. x", "1) x", "- x", or a bare line.
+            m = re.match(r"^(?:\d+[.)]|[-*])\s*(.+)$", line)
+            step = (m.group(1) if m else line).strip(" .:-*")
+            if len(step) <= 3:
+                continue
+            # A step that is just the question again is not a step. Measured on
+            # a 3B: asked to decompose, it frequently emits the question as
+            # step 1, which then spends a generation reproducing the one-shot
+            # answer the decomposition exists to avoid.
+            words = _subject_words(step)
+            if words and question_words and words <= question_words and len(step) > 20:
+                continue
+            key = " ".join(step.lower().split())
+            if key in seen:
+                continue
+            seen.add(key)
+            steps.append(step[:200])
+        return steps
+
+    async def plan_steps(self, question: str,
+                         stats: "GenerationStats | None" = None) -> list[str]:
+        """Break a hard question into a short ordered list of sub-questions.
+
+        One small model call. Returns 2..reasoning_max_steps concise steps. On any
+        failure it returns a single step (answer the question directly), so the
+        caller degrades to a normal answer rather than erroring.
+
+        `stats` is not optional in practice. This call was made without it, so
+        the planning generation -- one per decomposed turn, every decomposed
+        turn -- never reached the turn footer, and the footer under the answer
+        is the only place a user on this hardware can see what depth costs
+        them. The parameter is kept optional only because the signature is
+        public.
+        """
+        prompt = [
+            {"role": "system", "content":
+                "Break the user's question into a short ordered list of sub-questions "
+                "to work through, each on its own line, numbered. Between 2 and "
+                f"{self.config.reasoning_max_steps} steps. Each step is one concrete "
+                "thing to figure out, and each must be answerable from reasoning "
+                "alone. The last step must be the one that reaches the answer. "
+                "No preamble, no commentary, just the numbered list."},
+            {"role": "user", "content": question[:1000]},
+        ]
+        text = await self.resilient_complete(prompt, max_tokens=256, temperature=0.0,
+                                             stats=stats)
+        steps = self.plan_lines(text, question)[:self.config.reasoning_max_steps]
+        return steps or [question[:200]]
+
+    # One copy of the per-step instruction. It used to exist twice -- here and
+    # inlined in the streaming path in run() -- and the two had already drifted:
+    # the inline copy had lost "Do not restate the whole problem", which is the
+    # sentence that stops a 3B spending its whole budget re-describing the
+    # question before it answers the step.
+    REASON_STEP_SYSTEM = (
+        "You are working through a hard question one step at a time. Use the "
+        "findings so far, address only the current step, and reply with a short "
+        "concrete conclusion in at most 4 sentences. Do not restate the whole "
+        "problem. If the step cannot be settled from what you know -- it needs a "
+        "current fact, a page, or a file -- say exactly NEED LOOKUP: followed by "
+        "what is missing, and nothing else."
+    )
+
+    def carry_notes(self, notes: list[str]) -> str:
+        """The conclusions a step is allowed to see, as one block.
+
+        A flat notes[-6:] window was wrong in the one case the window exists
+        for. Past six steps it drops the EARLIEST conclusions, and in a
+        derivation those are the premises -- so the long chains that most need
+        their own earlier work were the ones that lost it, and step 8 would
+        contradict step 1 without ever having seen it. Keep the opening
+        conclusions and the recent ones, and say plainly that the middle was
+        left out rather than letting the gap look like it was never there.
+        """
+        if len(notes) <= 6:
+            return "\n".join(notes) if notes else "(nothing yet)"
+        head, tail = notes[:2], notes[-4:]
+        return "\n".join(head + [f"... ({len(notes) - 6} earlier steps omitted)"] + tail)
+
+    async def reason_step(self, question: str, notes: list[str], step: str,
+                          stats: "GenerationStats | None" = None) -> str:
+        """Answer one sub-question given only the compact notes so far.
+
+        The working set is [question, a few prior conclusions, this step], which
+        is small and constant regardless of how many steps have run. Returns a
+        short conclusion to carry forward.
+
+        `stats` for the same reason as plan_steps: this is the streaming path's
+        fallback, and a fallback that bills nothing makes the turns that had to
+        retry look cheaper than the ones that did not.
+        """
+        prompt = self.reason_messages(question, notes, step)
+        text = await self.resilient_complete(
+            prompt, max_tokens=self.config.reasoning_tokens, temperature=0.0,
+            stats=stats)
+        return strip_reasoning(text).strip()
+
+    def reason_messages(self, question: str, notes: list[str],
+                        step: str) -> list[dict]:
+        """The prompt for one reasoning step. One builder, both call sites."""
+        return [
+            {"role": "system", "content": self.REASON_STEP_SYSTEM},
+            {"role": "user", "content":
+                f"Question: {question[:600]}\n\nFindings so far:\n"
+                f"{self.carry_notes(notes)}\n\n"
+                f"Current step: {step}\n\nYour conclusion for this step:"},
+        ]
+
+    async def run(
+        self,
+        user_message: str,
+        history: list[dict],
+        conversation_id: str | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        cancel: asyncio.Event | None = None,
+        internal: bool = False,
+    ) -> AsyncGenerator[dict, None]:
+        """Yield events: context, step, token, tool_call, tool_result, final, error, cancelled.
+
+        `internal` marks a message this process wrote rather than the user (the
+        auto-iterate fix request). Such a message must not be folded into the
+        task state: it is not a requirement, not a correction, and not "the
+        latest user request".
+        """
+        started = time.time()
+        reserve = max_tokens or self.config.max_tokens
+        known = set(self.registry.names())
+
+        # A leading /command (/search, /no-search, /kb, /agent) is an explicit routing
+        # override. Honour it, and strip it from the message so neither the base
+        # prompt nor the search query keeps the command text. A bare command with
+        # no request behind it is ignored.
+        forced_lane: str | None = None
+        _override = routing_override(user_message)
+        if _override:
+            lane, cleaned = _override
+            if cleaned:
+                forced_lane, user_message = lane, cleaned
+
+        # A bare "continue" asks to RESUME the previous answer, not to answer a
+        # new question. Without this it went through routing as a fresh prompt:
+        # the model restarted the program from the top and, with the previous
+        # partial and the UI's cut-off note sitting in context, drifted into
+        # unrelated functions. Requires BOTH a continue-shaped message and a
+        # previous answer that actually hit the token budget, so an ordinary
+        # message opening with "continue" is never hijacked.
+        # The active task, rebuilt from the persisted record plus whatever of the
+        # conversation is still visible. Everything downstream -- the reply
+        # budget, the prompt, retrieval, the drift check, the continuation lane
+        # -- reads this rather than trying to infer the task from the transcript.
+        task = self.load_task(conversation_id, history)
+        # should_reset, not starts_new_task: mid-task, "write a helper function
+        # that parses the output" is the next piece of the same job, and
+        # throwing the artifact away there is the same failure in reverse.
+        # What format, if any, this message asks to be produced. Computed before
+        # the reset decision because it is part of it: mid-document, "create a
+        # deck about kubernetes" is a NEW document, and should_reset cannot tell
+        # -- a document task has no language to change and always has an
+        # artifact, which is exactly the case it answers "keep going" to.
+        doc_request = (document_request(user_message)
+                       if self.registry.get("create_document") else None)
+        reset = bool(self.config.task_state_enabled and task.should_reset(user_message))
+        if (not reset and self.config.task_state_enabled and task.is_document_task()
+                and doc_request and task.artifact
+                and not refers_to_active_task(user_message)
+                and not is_explanation_request(user_message)
+                and starts_new_document(user_message, task.objective)):
+            # Both halves are required, and the bias is deliberately toward
+            # keeping: dropping the source the user has been building up is the
+            # worse mistake, the same call should_reset makes for code. So this
+            # needs a message that neither points back at the current document
+            # nor shares a subject with it.
+            log(f"a different document was requested ({doc_request}); the previous "
+                f"one ({task.document_path or 'unnamed'}) is not carried over.",
+                logging.INFO)
+            reset = True
+        if (not reset and self.config.task_state_enabled and task.is_document_task()
+                and not doc_request and is_code_request(user_message)
+                and starts_new_task(user_message)):
+            # A code request after a document. should_reset says keep -- a
+            # document task has no language to conflict and always has an
+            # artifact, which is the case it answers "keep going" to -- so
+            # "write a python script to parse it" would be briefed with the
+            # invoice's Markdown and the rule "call create_document again".
+            log("a code task was requested; the active document is not carried over.",
+                logging.INFO)
+            reset = True
+        if reset:
+            log(f"new task requested; dropping the previous one ({task.summary()}).",
+                logging.INFO)
+            task = TaskState()
+            # Drop the stored row too. save_task only writes an ACTIVE task, so
+            # without this an abandoned task ("forget that, what time is it")
+            # would still be sitting in the database on the next turn.
+            self.clear_task(conversation_id)
+        # note_request records requirements, corrections and the "latest user
+        # request" line in the brief, all of which are meant to be the USER's
+        # words. run_iterating re-enters run() with a machine-written fix
+        # request ("Your edits did not pass verification. Problems found: ...")
+        # and 200 chars of compiler output were being filed as a permanent
+        # requirement that every later turn was then briefed to satisfy.
+        correction = (task.note_request(user_message)
+                      if self.config.task_state_enabled and not internal else None)
+        if correction:
+            log(f"user correction applied to the task state: {task.summary()}",
+                logging.INFO)
+        log_event(get_logger("agent"), logging.DEBUG, "turn.start",
+                  conversation_id=conversation_id, task=task.summary(),
+                  new_task=reset, correction=bool(correction),
+                  continuation=is_continue_request(user_message),
+                  message=content_for_log(user_message))
+
+        if is_continue_request(user_message):
+            resume = self.continuation_target(history, task)
+            if resume is not None:
+                self.partial_begin(conversation_id, user_message)
+                async for event in self.continue_answer(
+                        resume, history, reserve, temperature, cancel, conversation_id,
+                        task):
+                    yield event
+                return
+            log("continue requested but the previous answer was not truncated; "
+                "handling it as an ordinary message.", logging.DEBUG)
+
+        # Expand @file, @folder, @url and @diff before anything reads the
+        # message. Done here rather than as a tool because a reference is not a
+        # decision the model should have to make: the user already said which
+        # file they meant, and on a 3B model "read the file I named" is exactly
+        # the kind of obvious step it fails to take.
+        reference_context = ""
+        if self.config.reference_expansion:
+            try:
+                reference_context, ref_notes = await self.registry.expand_references(
+                    user_message)
+            except Exception as exc:
+                ref_notes = []
+                log(f"Reference expansion failed: {exc}", logging.WARNING)
+            if ref_notes:
+                yield {"type": "notice", "info": True,
+                       "message": "; ".join(ref_notes)}
+
+        # Open an undo point for this turn. Created eagerly but written to
+        # lazily: the id is just a string until a tool actually writes a file,
+        # so a turn that changes nothing leaves nothing on disk.
+        if self.config.checkpoints_enabled:
+            self.registry.checkpoint_id = self.registry.checkpoints.new_id(
+                conversation_id)
+            # Prune here rather than after a capture: this runs once per turn
+            # instead of once per file, and it is the only place that knows a
+            # new checkpoint is about to become the newest one. Without it the
+            # store grows for the life of the install.
+            try:
+                self.registry.checkpoints.prune(reserve=1)
+            except Exception as exc:
+                log(f"Could not prune checkpoints: {exc}", logging.DEBUG)
+        else:
+            self.registry.checkpoint_id = None
+
+        # Which procedures this turn loads. Reset HERE, before the autoload
+        # below can record one: resetting further down (where the other per-turn
+        # counters live) wiped the autoload's own entry, so the final event
+        # reported no skills for a turn that had just used one.
+        self.registry.skills_used = []
+        # Documents produced this turn. Reset here for the same reason as
+        # skills_used: the final event reports them as download links, and a
+        # list carried over from the previous turn would offer the user a file
+        # this answer had nothing to do with.
+        self.registry.documents_written = []
+
+        # Load the procedure for this task WITHOUT waiting for the model to ask.
+        # Measured on this hardware: given "format a candidate CV to our house
+        # template" with a matching skill one load_skill call away, the 3B model
+        # answered with seven generic bullet points and never called it. Same
+        # reasoning as the deterministic read_url / web_search shortcuts below.
+        skill_context = ""
+        # Not mid-task. A procedure is matched by word overlap with the message,
+        # and "add more checks and error handling" overlaps a validator or
+        # scoring skill far better than it overlaps the shell script actually
+        # under construction: autoloading one there hands the model a different
+        # task to follow. While a task is active with an artifact, the artifact
+        # is the procedure.
+        mid_task = bool(task.is_active() and task.artifact and not reset)
+        if (self.config.skills_enabled and self.config.skill_autoload
+                and "load_skill" in known and not mid_task):
+            library = getattr(self.registry, "skills", None)
+            try:
+                matched = library.best_match(
+                    user_message, self.config.skill_autoload_overlap) if library else None
+            except Exception as exc:
+                matched, _ = None, log(
+                    f"Skill matching failed: {exc}", logging.WARNING)
+            if matched is not None:
+                # Through registry.call, not the library directly, so the use is
+                # counted and persisted to tool_calls exactly like a model-issued
+                # load -- which is what a rating arriving later is attributed with.
+                body, error = await asyncio.to_thread(
+                    self.registry.call, "load_skill", {"name": matched.name},
+                    conversation_id)
+                if not error:
+                    skill_context = (
+                        f"You have a written procedure for this. Follow it.\n\n{body}"
+                    )
+                    yield {"type": "notice", "info": True,
+                           "message": f"using your skill: {matched.name}"}
+                    ev0 = ({"type": "detail", "message":
+                            f"autoloaded skill {matched.name} "
+                            f"({estimate_tokens(body)} tokens) on a "
+                            f"{self.config.skill_autoload_overlap}-word match"}
+                           if self.config.show_internals else None)
+                    if ev0:
+                        yield ev0
+
+        # Is the user asking for a FILE rather than an answer? Decided
+        # deterministically and before routing, for the same reason the code and
+        # read-URL shortcuts are: "write me a PDF of the Q3 numbers" looks to the
+        # router like an ordinary request, the router answers "answer", the
+        # prompt is rebuilt with no tools at all -- and the model then writes a
+        # perfectly good report into the chat while the file the user actually
+        # asked for is never created.
+        doc_format = doc_request
+        # A follow-up edit names no format at all. "now make it in the style of
+        # texcel.be" carries no word this or any other detector could key on --
+        # what makes it a document turn is that a document is what we are
+        # working on. Without this the turn went to the router, the router quite
+        # reasonably said "answer", the prompt was rebuilt with no tools, and the
+        # user's edit produced prose instead of the new file they asked for.
+        editing_document = False
+        if (self.config.task_state_enabled and task.is_document_task()
+                and task.artifact and self.registry.get("create_document")
+                # "what does it say?" points at the document just as plainly as
+                # "make it blue" does, and rewriting the file to answer a
+                # question about it would be a change nobody asked for.
+                and not is_explanation_request(user_message)):
+            if doc_format:
+                # A document is in hand and a format was named: either the same
+                # one again or a conversion ("now make it a word document").
+                # Either way the source is what gets re-rendered, not rewritten
+                # from the model's memory of the transcript.
+                editing_document = True
+            elif (not is_code_request(user_message)
+                  and (is_modification_request(user_message)
+                       or parse_correction(user_message)
+                       or refers_to_active_task(user_message))):
+                # is_code_request excluded belt-and-braces: the reset above
+                # already catches a fresh code request, and this stops a
+                # narrower one ("add a loop to it") from being answered by
+                # re-rendering the document instead.
+                doc_format = task.document_format
+                editing_document = True
+        document_directive = ""
+        document_research = False
+        if doc_format:
+            # "look up as much as you can find about them, then draft the
+            # document" is half the request. Sending the model straight to
+            # create_document produces a confident page of invented facts, which
+            # is worse than no document -- so the lookup tools come back and the
+            # directive spells out the order.
+            document_research = (document_needs_research(user_message)
+                                 and bool(self.registry.get("web_search")
+                                          or self.registry.get("fetch_url"))
+                                 and forced_lane not in ("answer", "kb")
+                                 and await has_internet())
+        if doc_format:
+            # Register the task NOW, not after the tool call: a turn whose tool
+            # call fails still leaves the next turn knowing what was being made.
+            # It also re-suffixes the path on a format change, which the
+            # directive and the brief below both quote.
+            if self.config.task_state_enabled:
+                task.start_document(user_message, doc_format)
+            name = describe_document(doc_format)
+            if editing_document:
+                # The rules block in the task brief already spells out the path
+                # and "keep what was not asked to change"; repeating it here
+                # would put two sets of instructions in front of a 3B model.
+                target = task.document_path or f"the {name}"
+                document_directive = (
+                    f"This is an edit to the existing {name} ({target}). Apply the "
+                    "user's request to the document source shown above and call "
+                    f"create_document again with path \"{target}\" and the complete "
+                    "revised Markdown. Do not answer in prose instead."
+                )
+                yield {"type": "notice", "info": True,
+                       "message": f"updating {target}"}
+            else:
+                target = task.document_path or f"document{doc_format}"
+                document_directive = (
+                    f"The user is asking you to PRODUCE A FILE: a {name}. Call the "
+                    f"create_document tool with path \"{target}\" and the whole "
+                    "document in its content argument, written as Markdown "
+                    "(# headings, **bold**, - bullets, | tables |). Do not write the "
+                    "document into your reply and do not use write_file. After the "
+                    "tool succeeds, answer with one or two sentences saying what you "
+                    "made; the user gets a download link automatically."
+                )
+                if document_research:
+                    document_directive = (
+                        "Work in two steps and do NOT skip the first.\n"
+                        "STEP 1 — RESEARCH: the user asked you to look this up. Call "
+                        "web_search now (or fetch_url for a page they named) and read "
+                        "what comes back. Do not call create_document yet.\n"
+                        f"STEP 2 — WRITE: once you have the findings, call "
+                        f"create_document with path \"{target}\" and the whole "
+                        f"{name} in its content argument as Markdown (# headings, "
+                        "**bold**, - bullets, | tables |). Base it on what you found "
+                        "and say plainly where the sources were thin rather than "
+                        "filling the gaps in. Then answer in one or two sentences."
+                    )
+                yield {"type": "notice", "info": True,
+                       "message": (f"looking things up first, then writing a {name}"
+                                   if document_research else
+                                   f"writing a {name} for you")}
+
+        # What kind of question this is, read once. The depth gate below, the
+        # cluster routing hint and the per-kind directive all consult this one
+        # verdict; classifying separately in three places is how the routing
+        # hint and the depth gate came to disagree about the same message.
+        shape = self.question_shape(user_message)
+
+        # Steer heavy reasoning/code generation toward the more capable
+        # (Studio) node while light chat stays on the primary (Mini). Purely a
+        # routing hint: it never changes what the model is asked to do.
+        if shape.deep and not task.is_code_task():
+            gen_kind = "reasoning"
+        elif is_code_request(user_message) or (task.is_code_task() and mid_task):
+            gen_kind = "code"
+        else:
+            gen_kind = "chat"
+
+        # A program does not fit in the default 512-token reply budget; it gets cut
+        # off mid-function. Give code more room, capped so the prompt still fits.
+        # The task is what makes this hold on a follow-up: "add more checks"
+        # looks like chat and is really a request to re-emit a whole script.
+        requested_reserve = reserve
+        reserve = self.reply_reserve(user_message, reserve, task)
+        # What the turn is for, decided once. The brief, the rules and the
+        # budget all read this, so they cannot contradict each other the way
+        # they did when a question got a chat budget and a "reply with the
+        # complete updated file" instruction in the same prompt.
+        mode = self.turn_mode(user_message, task, reserve)
+
+        # The task brief goes LAST in the per-turn context, immediately before
+        # the user's own words, and rides on the user turn rather than the
+        # system prompt. trim_to_context never drops the user turn, so this is
+        # the one place the active task and the current artifact cannot be
+        # trimmed away -- which is the whole point.
+        # One id per generation attempt, so a later "continue" (and the logs)
+        # can tell which generation the partial artifact came from.
+        generation_id = task.begin_generation()
+        brief = self.task_brief(task, reserve, mode)
+        # A "short" turn is one with real work in it but not enough to be
+        # worth a plan, a call per step and a synthesis. It gets one line
+        # naming the shape of the answer instead, which costs a handful of
+        # tokens. The failure it addresses is not the model getting these
+        # wrong, it is the model answering a different and easier question --
+        # describing what a thing IS when asked why it is that way, listing
+        # both options when asked which to pick. A deep turn gets the plan
+        # instead, and a direct turn gets nothing: a line of instruction in
+        # front of a short factual question is a line the answer competes with.
+        # Never alongside a task brief. The brief already states what this
+        # reply must look like -- "answer the question directly, in prose", or
+        # "reply with the complete updated file in ONE block" -- and a second
+        # instruction saying "give the steps in order, numbered" is the same
+        # contradiction in one prompt that the turn mode exists to prevent.
+        # The brief wins: it knows what is being built, the hint only knows
+        # how the sentence was phrased.
+        kind_hint = (self.ANSWER_HINTS.get(shape.kind, "")
+                     if shape.depth == "short" and not doc_format and not brief
+                     else "")
+        extra_context = "\n\n".join(
+            part for part in (skill_context, reference_context, brief,
+                              document_directive, kind_hint) if part)
+        # A document turn can only ever call create_document (plus a lookup tool
+        # when it is researching), so the other twenty-one specs are ~1600
+        # tokens of a 4096-token window describing tools it will not touch --
+        # budget the document itself has to fit into.
+        tool_subset = (self.document_tool_subset(document_research)
+                       if doc_format else None)
+        base, dropped = self.build_base(history, user_message, reserve,
+                                        extra_context=extra_context,
+                                        active_code_task=bool(brief and task.is_code_task()),
+                                        tool_subset=tool_subset)
+        # Reported ONCE per turn, not once per prompt build. This used to fire
+        # here and again after the lane was picked, and the internals line
+        # restated both, so a single turn said "trimmed N old messages" three
+        # times with two different values. The number that matters is the one
+        # that applies to the prompt actually sent, so it is held until the lane
+        # has settled and emitted just before generation starts.
+        history_total = len([t for t in (history or [])
+                             if t.get("role") in ("user", "assistant") and t.get("content")])
+        pending_context = {"type": "context", "dropped": dropped,
+                           "kept": max(0, history_total - dropped),
+                           "total": history_total,
+                           "tokens": messages_tokens(base)} if dropped else None
+        if brief:
+            # Only once there is something to continue: on the turn that STARTS
+            # the task there is no artifact and "continuing" would be a lie.
+            if task.artifact_version:
+                yield {"type": "notice", "info": True,
+                       "message": (f"continuing the active task: "
+                                   f"{describe_document(task.document_format)
+                                      if task.is_document_task()
+                                      else (task.language or 'code')}"
+                                   + (f" — {task.artifact_name}"
+                                      if task.artifact_name else "")
+                                   + f" (v{task.artifact_version})")}
+            # detail() is defined further down, after the lane bookkeeping, so
+            # this one is emitted directly.
+            if self.config.show_internals:
+                yield {"type": "detail", "message":
+                       f"active task: {task.summary()}; brief "
+                       f"{estimate_tokens(brief)} tokens, {mode} turn, reply budget "
+                       f"{reserve}"
+                       + (f" (your Max tokens is {requested_reserve}; widened to "
+                          f"{reserve} because this turn has to produce code)"
+                          if reserve > requested_reserve else
+                          f" (asked for {requested_reserve})")
+                       + (", user correction applied" if correction else "")}
+
+        # Answer-lane state. Defined here, not inside the routing branch below:
+        # the main loop reads answer_routed/LOOKUP_TOOLS on every turn, so a
+        # message that never reaches routing (triage off, or not substantive)
+        # used to raise NameError there the moment the model called a tool.
+        LOOKUP_TOOLS = {"web_search", "fetch_url"}
+        answer_routed = False
+        answered_retry = False
+        lookup_used = False
+        # The router's own report that it does not believe it knows the answer.
+        # Defined with the rest of the answer-lane state for the same reason
+        # they are: the step loop reads it on every turn, including the ones
+        # that never reach routing at all.
+        router_unsure = False
+        prose_lane = False
+        # Whether this turn has already switched into agent mode. Once only: the
+        # switch costs a prompt rebuild and a step, and a model that refuses
+        # twice is not going to be talked into it a third time.
+        escalated = False
+        scratch: list[dict] = []
+        seen_calls: list[str] = []
+        trace: list[dict] = []
+        nudges = 0
+        # The last answer good enough to show, kept while it is being revised so
+        # a revision that comes back empty falls back to it instead of costing a
+        # forced regeneration of work already done.
+        draft = ""
+        # Bounded: a model that keeps inventing tool names gets corrected
+        # twice, then answered in prose rather than looping.
+        bad_names = 0
+        # Tool calls that ran out of reply budget mid-JSON this turn.
+        cut_calls = 0
+        # Subagents spawned this turn. Capped so a parent cannot delegate in a
+        # loop, which on a 3B model is a real failure mode rather than a
+        # theoretical one.
+        delegated = 0
+        # What the reply budget actually works out to once the prompt is known.
+        # Updated every step; note_if_cut quotes this rather than the request.
+        effective_reserve = reserve
+        prompt_tokens_total = 0
+        yield {"type": "phase", "label": "preparing"}
+        # Open the on-disk partial file so any work produced this turn is saved
+        # as it goes and can be handed back if RAM runs out before synthesis.
+        self.partial_begin(conversation_id, user_message)
+        completion_tokens_total = 0
+        # Snapshot of files changed before this turn, so the final event can show
+        # a diff of exactly what this turn changed for you to review before push.
+        changed_before = set(self.registry.changed_files)
+
+        def detail(message: str) -> dict | None:
+            """A verbose under-the-hood line, only emitted when show_internals is on."""
+            return {"type": "detail", "message": message} if self.config.show_internals else None
+
+        def note_if_cut(answer: str, stats_obj) -> str:
+            """Append a visible notice when the model hit the reply budget.
+
+            finish_reason=="length" means the text stops mid-thought. Silently
+            showing it as a finished answer is how a C++ program arrived with no
+            main() -- it had simply been truncated.
+            """
+            if getattr(stats_obj, "finish_reason", "") != "length" or not answer:
+                return answer
+            # The EFFECTIVE budget, not the requested one. prompt + reply has to
+            # fit the context, so a 2797-token prompt in a 4096-token window
+            # leaves about 1100 whatever "Max tokens" says. Quoting the request
+            # sent people to Settings to raise a number that was not the limit.
+            return answer.rstrip() + truncation_note(
+                effective_reserve, requested_reserve, self.config.context_size)
+
+        def account(stats_obj) -> None:
+            """Fold one model call's cost into the turn totals.
+
+            Every lane has to come through here or the footer under the answer
+            lies: the tool loop was the only caller, so a deep-reasoning turn
+            spent a dozen calls on planning, extraction and synthesis and then
+            reported zero tokens for the turn.
+            """
+            nonlocal prompt_tokens_total, completion_tokens_total
+            prompt_tokens_total += stats_obj.prompt_tokens
+            completion_tokens_total += stats_obj.completion_tokens
+
+        async def switch_to_agent(answer: str, step: int):
+            """Turn a tool-free turn into an agent turn, mid-flight.
+
+            The router picks the lane from one 64-token call before the model has
+            seen how hard the question is, and its decision used to be final for
+            the whole turn: on "answer" the prompt is rebuilt WITHOUT the tool
+            protocol and without the tool list, so there is no way back. What
+            came out the other end was "I don't have access to real-time data"
+            with a working web_search one step away, and the user's only recourse
+            was to ask again.
+
+            The trigger is the model's own report that it lacked a capability,
+            which is evidence the router never had -- it arrives after the
+            attempt, not before it. Refusing to fire is the default: it needs a
+            lane that actually withholds something, a registered tool that
+            supplies it, a step left to spend, and no explicit /answer or /kb
+            from the user, who has already made this call themselves.
+
+            Yields UI events, then exactly one {"__switched__": bool}.
+            """
+            nonlocal base, dropped, prose_lane, answer_routed, escalated
+            if escalated or not self.config.agent_escalation:
+                yield {"__switched__": False}
+                return
+            # Nothing is being withheld in the tool lane, so there is nothing to
+            # give back: a refusal there is the model declining work it could
+            # already do, and another step would only get the same reply.
+            if not (prose_lane or answer_routed):
+                yield {"__switched__": False}
+                return
+            # The user typed /answer or /kb. That is the same decision this
+            # function makes, made by the person whose turn it is; overriding it
+            # would make the override meaningless.
+            if forced_lane in ("answer", "kb"):
+                yield {"__switched__": False}
+                return
+            if step >= self.config.agent_max_steps:
+                yield {"__switched__": False}
+                return
+            # Why the turn is being switched, for the one log line below. It is
+            # written AFTER the guards that can still refuse -- announcing a
+            # lookup and then not doing it (no tool registered, or the box is
+            # offline) is worse than saying nothing, and the log is the only
+            # place this decision is visible after the fact.
+            need, why = missing_capability(answer), "reported a missing capability"
+            if not need and self.config.hedge_escalation and is_hedged_answer(answer):
+                # The hedge, which is the failure missing_capability was never
+                # looking for. A refusal says it CANNOT answer, and is short
+                # because there was nothing to say. A hedge answers anyway --
+                # "I don't have specific information about that product, but
+                # it's likely..." -- and what follows the "but" is a guess
+                # that reads exactly like a fact. This is what the user means
+                # by the model lacking it in its own weights, and it is the
+                # single most common way a 3B gets something wrong here: not
+                # by declining, but by filling the gap in.
+                #
+                # One per turn, like every other escalation, and only on a
+                # lane that was actually withholding the tools -- the checks
+                # above have already established both.
+                need, why = "lookup", "hedged about external facts"
+            if not need:
+                yield {"__switched__": False}
+                return
+            available = self.escalation_tools(need)
+            if not available:
+                yield {"__switched__": False}
+                return
+            if need == "lookup" and not await has_internet():
+                # The refusal was accurate. Say so rather than promising a
+                # lookup that cannot happen.
+                yield {"__switched__": False}
+                return
+
+            escalated = True
+            answer_routed = False
+            log(f"step {step}: the reply {why} ({need}); "
+                f"switching the turn into agent mode with {', '.join(available)}.",
+                logging.INFO)
+            if prose_lane:
+                before = messages_tokens(base)
+                base, dropped = self.build_base(
+                    history, user_message, reserve, tools=True,
+                    extra_context=extra_context,
+                    active_code_task=bool(brief and task.is_code_task()))
+                prose_lane = False
+                ev = detail(f"switched to agent mode: tool prompt restored "
+                            f"({before} -> {messages_tokens(base)} prompt tokens, "
+                            f"{history_total - dropped} of {history_total} history "
+                            "messages kept)")
+                if ev:
+                    yield ev
+            yield {"type": "notice", "info": True,
+                   "message": ("switching to agent mode: that needs "
+                               + ("a lookup" if need == "lookup" else "your files")
+                               + f", so I'm using {available[0]}")}
+            # The refusal itself is NEVER put in the trace. Feeding a model its
+            # own rejected output is what teaches it to produce the same thing
+            # again -- the same reasoning as the empty-reply nudge below. A
+            # placeholder keeps the turn structure without the example.
+            scratch.append({"role": "assistant", "content": "(no answer yet)"})
+            scratch.append({"role": "user", "content": ESCALATION_DIRECTIVE})
+            yield {"__switched__": True}
+
+        def done(answer: str, step: int, truncated: bool = False) -> dict:
+            new_files = sorted(self.registry.changed_files - changed_before)
+            diff = self.registry.git_diff(new_files) if new_files else ""
+            # The turn's own output is the newest version of the artifact. Doing
+            # this HERE, at the single point every lane exits through, is what
+            # makes the artifact state independent of which lane produced it --
+            # and what lets the next turn survive losing this message to
+            # trimming. `answer` already carries the truncation note when the
+            # reply hit the budget, so note_answer records completeness too.
+            if self.config.task_state_enabled:
+                task.note_answer(answer)
+                if truncated:
+                    task.artifact_complete = False
+                self.save_task(conversation_id, task)
+                # record_artifact may have refused the reply: a cut-off or
+                # spliced version is not allowed to overwrite a whole one. That
+                # is a decision the user has to see, or the next turn silently
+                # builds on a file they think changed and did not.
+                if task.rejected_reason:
+                    log(f"artifact replacement refused: {task.rejected_reason}",
+                        logging.WARNING)
+                    answer = append_below_answer(
+                        answer, "\n\n---\n*Kept the previous version of "
+                        f"{task.artifact_name or 'the file'}: "
+                        f"{task.rejected_reason}.*")
+            # Last gate before the text leaves: does the code in it actually
+            # parse? Nothing in this pipeline used to look, so ten consecutive
+            # versions of a module went out with a function shadowing a builtin
+            # and recursing into itself, and each turn built on the last.
+            answer = self.checked_answer(answer, task)
+            return {
+                "type": "final",
+                # Strip protocol scaffolding HERE, at the one point every lane
+                # passes through: the tool loop, the prose lane, the chunking
+                # and reasoning lanes, the forced pass and the salvage path all
+                # end up in this function. Cleaning at each generation site
+                # instead would mean fourteen places to keep in step.
+                "answer": unwrap_answer(answer),
+                "steps": step,
+                "trace": trace,
+                "tools_used": [entry["name"] for entry in trace],
+                "elapsed_ms": round((time.time() - started) * 1000),
+                "prompt_tokens": prompt_tokens_total,
+                "completion_tokens": completion_tokens_total,
+                "truncated": truncated,
+                "changed_files": new_files,
+                "diff": diff,
+                "skills_used": list(getattr(self.registry, "skills_used", [])),
+                # Deliverables, not edits: the UI renders one download link each.
+                "documents": list(getattr(self.registry, "documents_written", [])),
+                # Only when something was actually recorded: offering an undo
+                # for a turn that wrote nothing is noise.
+                "checkpoint": (self.registry.checkpoint_id
+                               if new_files and self.registry.checkpoint_id else None),
+            }
+
+        # Every quality gate an answer clears before the user sees it, in one
+        # place. Both exits from the step loop come through here: a plain-text
+        # reply, and a final_answer tool call. They used to differ, and the
+        # difference was invisible -- an answer delivered as final_answer
+        # skipped the drift check entirely, so the model could sidestep the gate
+        # by choosing the other syntax for the same reply. final_answer is
+        # always registered and is the loop's documented exit, so that was not a
+        # rare path.
+        #
+        # Yields UI events as it goes, then exactly one verdict: __revise__ to
+        # spend another step improving the draft, or __settled__ with the text
+        # to hand back.
+        async def settle(answer: str, cost, step: int):
+            nonlocal draft
+            if step < self.config.agent_min_steps and not internal:
+                # Thinking harder, on purpose. The model answers as soon as it
+                # can rather than as soon as it should, so below the minimum the
+                # first pass is a draft and goes back for another look.
+                # `internal` runs are the auto-iterate fix round, itself already
+                # a revision.
+                draft = answer
+                yield {"type": "phase", "label": "reviewing the draft"}
+                ev = detail(f"draft at step {step}: {len(answer)} chars; revising "
+                            f"to reach the {self.config.agent_min_steps}-step minimum")
+                if ev:
+                    yield ev
+                # The prose answer, not the raw buffer: appending the JSON of a
+                # final_answer call would teach the model to reply in JSON again.
+                scratch.append({"role": "assistant", "content": answer})
+                scratch.append({"role": "user", "content": REVISE_DRAFT})
+                yield {"__revise__": True}
+                return
+            # Does this answer still belong to the task? A strong contradiction
+            # (every code block in a language the task is not) gets one
+            # corrective regeneration rather than being returned.
+            drift_stats = GenerationStats()
+            fixed, drift_note = await self.redirect_drift(
+                task, answer, user_message, history, reserve, temperature, drift_stats)
+            if drift_note:
+                yield {"type": "notice", "info": True, "message": drift_note}
+                # The regeneration is a real model call: account for it, or the
+                # token footer under the answer understates the turn, and report
+                # the cut-off state of the text the user actually gets rather
+                # than of the discarded one.
+                account(drift_stats)
+                yield {"type": "usage", "step": step, **drift_stats.as_event()}
+                answer, cost = fixed, drift_stats
+            yield {"__settled__": note_if_cut(answer, cost)}
+
+        # A tiny helper that runs a tool and seeds its result into the loop so
+        # the model answers *from* the result instead of dumping it raw. Used by
+        # both the deterministic shortcuts and the router below. Yields UI events
+        # as it goes; returns True if the result was seeded (model should now
+        # synthesise), False if the tool failed.
+        async def run_and_seed(name: str, args: dict, note: str, directive: str) -> bool:
+            yield {"type": "tool_call", "name": name, "args": args, "step": 0}
+            result, error = await asyncio.to_thread(
+                self.registry.call, name, args, conversation_id
+            )
+            yield {"type": "tool_result", "name": name, "result": result,
+                   "error": error, "step": 0}
+            if error:
+                # A failed tool is not fatal: record it and let the model proceed.
+                scratch.append({"role": "assistant", "content": f"I tried {name} and it failed."})
+                scratch.append({"role": "user", "content": f"TOOL RESULT [{name}]:\n{result}"})
+                yield {"__seeded__": False}
+                return
+            trace.append({"name": name, "args": args, "result": result[:1000], "error": None})
+            # Record the call so the loop's dedup guard catches an immediate repeat.
+            seen_calls.append(
+                f"{name}:" + json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
+            )
+            budget = self._tool_budget(reserve)
+            seeded, _ = await self.compress_tool_result(name, result, budget)
+            # The assistant turn is prose, never a JSON tool call: a greedy small
+            # model that sees its own previous turn was a tool call tends to emit
+            # the same call again instead of answering.
+            scratch.append({"role": "assistant", "content": note})
+            scratch.append({"role": "user",
+                            "content": f"TOOL RESULT [{name}]:\n{seeded}\n\n{directive}"})
+
+            # Retrieval pipeline: for a web search, automatically fetch the top
+            # result page(s) and give the model their full text. This is what
+            # lets one generic search answer domain-specific questions whose
+            # answer is on the page but not in the snippet (a price, a score, a
+            # forecast, a version), so the app never needs a per-domain tool.
+            if name == "web_search" and self.config.auto_fetch_results > 0 \
+                    and self.registry.get("fetch_url") is not None:
+                # Step-by-step multi-source read. Rather than dumping whole pages
+                # into the prompt (which OOMs on 8GB with two sources), fetch each
+                # of the top results, extract just the findings relevant to the
+                # question in its own bounded, streamed pass, and accumulate short
+                # notes. Then seed the notes plus a directive to compare the
+                # sources and answer. Memory stays flat (one page at a time), the
+                # work is visible as steps, and the model compares before it
+                # answers.
+                # Pull extra candidates so that skipping aggregator/thin pages
+                # still leaves enough good sources to reach auto_fetch_results.
+                # Rerank by relevance to the question first, so the fetch budget
+                # is spent on the results most likely to carry the answer rather
+                # than blindly on the engine's top-N.
+                want = self.config.auto_fetch_results
+                candidates = rank_result_urls(result, user_message, want + 4)
+                source_notes: list[str] = []
+                retrieval_started = time.time()
+                good = 0
+                idx = 0
+                for url in candidates:
+                    if good >= want:
+                        break
+                    # Skip listing/aggregator/JS-shell URLs before spending a
+                    # fetch on them; their HTML is navigation, not article text.
+                    if is_low_value_url(url):
+                        yield {"type": "notice", "info": True,
+                               "message": f"skipping a listing/aggregator page: {url[:60]}"}
+                        continue
+                    signature = "fetch_url:" + json.dumps({"url": url}, sort_keys=True,
+                                                          ensure_ascii=False, default=str)
+                    if signature in seen_calls:
+                        continue
+                    yield {"type": "tool_call", "name": "fetch_url",
+                           "args": {"url": url}, "step": 0, "auto": True}
+                    page, page_err = await asyncio.to_thread(
+                        self.registry.call, "fetch_url", {"url": url}, conversation_id
+                    )
+                    yield {"type": "tool_result", "name": "fetch_url", "result": page,
+                           "error": page_err, "step": 0, "auto": True}
+                    seen_calls.append(signature)
+                    if page_err:
+                        continue  # a dead link is not fatal; the snippets remain
+                    # If the fetched page is mostly markup/nav with little prose,
+                    # treat it as a failed fetch: do not extract from it and do
+                    # not let it into the synthesis prompt (empty extractions plus
+                    # a junk-filled context are exactly what stalls on 8GB).
+                    if is_thin_page(page):
+                        yield {"type": "notice", "info": True,
+                               "message": f"source had little readable text, skipping: {url[:60]}"}
+                        continue
+                    trace.append({"name": "fetch_url", "args": {"url": url},
+                                  "result": page[:1000], "error": None})
+                    good += 1
+                    idx = good
+                    page_budget = min(budget, self.config.auto_fetch_char_cap)
+                    page_text, _ = await self.compress_tool_result(
+                        "fetch_url", page[:self.config.auto_fetch_char_cap * 4], page_budget)
+                    ev = detail(f"source {idx}: fetched {len(page)} chars, reading "
+                                f"{len(page_text)} into a {self.config.reasoning_tokens}-token pass")
+                    if ev:
+                        yield ev
+                    # Extraction is best-effort and fast-fail: stream with a
+                    # per-source time cap, and on a stall keep whatever streamed
+                    # and MOVE ON. It must never fall into a retry-with-wait
+                    # (that compounding is what turned a stall into minutes).
+                    yield {"type": "reason_step", "step": idx, "total": want,
+                           "label": f"reading source {idx}: {url[:70]}"}
+                    extract_messages = [
+                        {"role": "system", "content":
+                            "Read this one source and note only what is relevant to "
+                            "answering the question, concisely. If the source does not "
+                            "address it, say so in a few words."},
+                        {"role": "user", "content":
+                            f"Question: {user_message[:500]}\n\nSource {idx} "
+                            f"({url}):\n{page_text}\n\nRelevant findings from this source:"},
+                    ]
+                    finding = ""
+                    estats = GenerationStats()
+                    estream = self.client.stream(extract_messages, self.config.reasoning_tokens, 0.0, estats, kind="reasoning")
+                    started_src = time.time()
+                    try:
+                        async for tok in estream:
+                            if cancel is not None and cancel.is_set():
+                                break
+                            finding += tok
+                            yield {"type": "reason_token", "step": idx, "token": tok}
+                            if time.time() - started_src > self.config.reasoning_step_timeout:
+                                yield {"type": "notice", "info": True,
+                                       "message": f"source {idx} slow; keeping partial and moving on"}
+                                break
+                    except Exception as exc:
+                        # Best-effort: no retry. Whatever streamed is kept.
+                        yield {"type": "notice", "info": True,
+                               "message": f"source {idx} could not be read ({self.client.classify_error(exc)}); skipping"}
+                    finally:
+                        await estream.aclose()
+                    account(estats)
+                    finding = strip_reasoning(finding).strip()
+                    took = time.time() - started_src
+                    yield {"type": "reason_done", "step": idx, "conclusion": finding[:200]}
+                    ev = detail(f"source {idx}: extracted {len(finding)} chars in {took:.1f}s")
+                    if ev:
+                        yield ev
+                    if finding:
+                        source_notes.append(f"[{idx}] {url}: {finding[:400]}")
+                        self.partial_add(conversation_id, f"## Source {idx}: {url}\n{finding}")
+                    # Total retrieval budget: if we have spent too long across all
+                    # sources, stop fetching more and work with what we have.
+                    if time.time() - retrieval_started > self.config.retrieval_deadline:
+                        yield {"type": "notice", "info": True,
+                               "message": "retrieval time budget reached; answering with what I have"}
+                        break
+
+                if source_notes:
+                    joined = "\n".join(source_notes)
+                    scratch.append({"role": "assistant",
+                                    "content": f"I read {len(source_notes)} source(s) and noted the key points."})
+                    scratch.append({"role": "user",
+                                    "content": f"SOURCES:\n{joined}\n\nCompare these sources, "
+                                               "note any agreement or conflict, then answer the "
+                                               "original question. Cite the source URLs."})
+                else:
+                    # No source yielded usable findings. Do NOT synthesise over the
+                    # empty notes plus big pages (that is what stalled). Answer
+                    # briefly from the search snippets already seeded, or say so.
+                    yield {"type": "notice", "info": True,
+                           "message": "no usable content extracted from the pages; "
+                                      "answering from the search snippets instead"}
+                    scratch.append({"role": "user",
+                                    "content": "The linked pages could not be read. Answer the "
+                                               "question briefly from the search snippets above. "
+                                               "If they do not contain the answer, say you could "
+                                               "not find it rather than guessing."})
+            yield {"__seeded__": True}
+
+        # Step 0: oversized prompt. If the user's input alone is too large to
+        # prefill in one pass on this machine, process it in parts: extract
+        # findings from each chunk into bounded notes, then synthesise. Each pass
+        # sees one chunk plus short notes, so memory stays flat regardless of how
+        # big the input is. Done before routing, because a prompt this large
+        # cannot survive a single generation to be routed normally.
+        est_tokens = len(user_message) // CHARS_PER_TOKEN
+        trigger_tokens = int(self.config.context_size * self.config.chunk_trigger_ratio)
+        if (self.config.chunk_large_prompts and est_tokens > trigger_tokens
+                and len(user_message) > 2000):
+            chunk_tokens = max(256, int(self.config.context_size * self.config.chunk_size_ratio))
+            chunk_chars = chunk_tokens * CHARS_PER_TOKEN
+            parts = chunk_text(user_message, chunk_chars, overlap=chunk_chars // 10)
+            # The instruction usually sits at the very start or end of a big
+            # paste; keep both ends visible to every pass and the synthesis.
+            hint = user_message[:400]
+            if len(user_message) > 900:
+                hint = user_message[:400] + " [...] " + user_message[-300:]
+            yield {"type": "phase", "label": f"input is large; reading it in {len(parts)} parts"}
+            yield {"type": "notice",
+                   "message": f"prompt is ~{est_tokens} tokens; processing in "
+                              f"{len(parts)} parts to fit memory", "info": True}
+            notes: list[str] = []
+            for i, part in enumerate(parts, 1):
+                if cancel is not None and cancel.is_set():
+                    yield {"type": "cancelled", "step": i, "trace": trace}
+                    return
+                yield {"type": "reason_step", "step": i, "total": len(parts),
+                       "label": f"reading part {i}/{len(parts)}"}
+                notes_text = "\n".join(notes[-6:]) if notes else "(nothing yet)"
+                map_messages = [
+                    {"role": "system", "content":
+                        "You are reading one part of a long input to help answer the "
+                        "user's request. Note only what is relevant to the request "
+                        "from this part, concisely. If nothing here is relevant, say so."},
+                    {"role": "user", "content":
+                        f"Request: {hint}\n\nNotes so far:\n{notes_text}\n\n"
+                        f"Part {i} of {len(parts)}:\n{part}\n\nRelevant notes from this part:"},
+                ]
+                finding = ""
+                mstats = GenerationStats()
+                mstream = self.client.stream(map_messages, self.config.reasoning_tokens, 0.0, mstats, kind="reasoning")
+                started_part = time.time()
+                try:
+                    async for tok in mstream:
+                        if cancel is not None and cancel.is_set():
+                            break
+                        finding += tok
+                        yield {"type": "reason_token", "step": i, "token": tok}
+                        if time.time() - started_part > self.config.reasoning_step_timeout:
+                            break
+                except Exception:
+                    if not strip_reasoning(finding).strip():
+                        finding = await self.resilient_complete(map_messages, self.config.reasoning_tokens, 0.0)
+                finally:
+                    await mstream.aclose()
+                account(mstats)
+                finding = strip_reasoning(finding).strip()
+                yield {"type": "reason_done", "step": i, "conclusion": finding[:200]}
+                if finding:
+                    notes.append(f"part {i}: {finding[:400]}")
+                    self.partial_add(conversation_id, f"## Part {i}\n{finding}")
+
+            # Reduce: answer the request from the gathered notes, streamed.
+            yield {"type": "phase", "label": "writing the answer"}
+            joined = "\n".join(notes) or "(no relevant content found)"
+            reduce_messages = [
+                {"role": "system", "content": self.config.system_prompt_with_identity},
+                {"role": "user", "content":
+                    f"Request: {hint}\n\nNotes gathered from the full input, in order:\n"
+                    f"{joined}\n\nNow give the complete answer to the request in plain text."},
+            ]
+            answer_buf = ""
+            rstats = GenerationStats()
+            rstream = self.client.stream(reduce_messages, reserve, temperature, rstats, kind="reasoning")
+            try:
+                async for tok in rstream:
+                    if cancel is not None and cancel.is_set():
+                        break
+                    answer_buf += tok
+                    yield {"type": "token", "token": tok, "step": len(parts)}
+            except Exception:
+                answer_buf = await self.resilient_complete(reduce_messages, reserve, temperature)
+            finally:
+                await rstream.aclose()
+            account(rstats)
+            answer = strip_reasoning(answer_buf).strip() or ("Notes from the input:\n" + joined)
+            yield done(answer, len(parts))
+            return
+
+        # Step 1: deterministic shortcuts. A bare URL or a pure arithmetic
+        # expression needs no model call at all. calculator and fetch_url produce
+        # the answer itself (a number, a page), so we can return it directly.
+        shortcut = quick_tool(user_message) if self.config.fast_path else None
+        if shortcut and self.registry.get(shortcut[0]) is not None:
+            name, args = shortcut
+            yield {"type": "tool_call", "name": name, "args": args, "step": 0, "fast_path": True}
+            result, error = await asyncio.to_thread(
+                self.registry.call, name, args, conversation_id
+            )
+            yield {"type": "tool_result", "name": name, "result": result,
+                   "error": error, "step": 0, "fast_path": True}
+            if not error:
+                trace.append({"name": name, "args": args, "result": result[:1000], "error": None})
+                yield done(result.strip(), 0)
+                return
+            # A failed shortcut falls through to normal model handling.
+            scratch.append({"role": "assistant", "content": f"I tried {name} and it failed."})
+            scratch.append({"role": "user", "content": f"TOOL RESULT [{name}]:\n{result}"})
+
+        # Step 2: model routing. For any substantive message the shortcuts did
+        # not handle, ask the model how to handle it. This one structured call
+        # replaces all the intent regexes: it decides answer vs search vs
+        # weather, and extracts the query or the place and day from free text.
+        #
+        # "/agent" skips routing entirely. The router's job is to decide whether
+        # a turn needs tools, and the user has just said it does; asking anyway
+        # spends a call to be overruled, and a router that answers "answer"
+        # would build the tool-free prompt and lock the turn out of the tools
+        # that were the whole point of typing the command.
+        elif forced_lane == "agent":
+            yield {"type": "notice", "info": True,
+                   "message": "agent mode: tools are available for this turn"}
+        elif doc_format:
+            # Nothing to route: the turn has to end in a create_document call,
+            # and the router's only useful answer would be the one already made.
+            pass
+        elif self.config.knowledge_triage and is_substantive(user_message):
+            # Decide how to handle a substantive message, then execute the
+            # decision generically. The decision is either {"action":"answer"}
+            # or {"action":"<tool name>", ...tool args}.
+            #
+            # Code requests are handled without a router call: a self-contained
+            # one answers directly, and one that depends on current or external
+            # information (a recent API, "latest" anything, security-research
+            # topics like recon or CVEs) searches first and then writes the code.
+            # Everything else goes to the registry-driven router.
+            # If there is no internet, lookups cannot succeed, so answer from own
+            # knowledge and say so once. This also makes the router moot offline.
+            online = await has_internet()
+            for_code = False
+            has_search = self.registry.get("web_search") is not None
+            # "summarise/read <url>" is handled deterministically: fetch the page
+            # and let the model answer from it. The model router used to misjudge
+            # this and answer from its own knowledge (then refuse, "I can't open
+            # links"). A bare URL is still handled by the quick-tool shortcut.
+            read_url = url_read_request(user_message) if online else None
+            # An explicit web-search command routes deterministically, the same
+            # reasoning as read_url: the model router used to second-guess
+            # these and answer from stale weights.
+            #
+            # explicit_search_request, not web_search_request: the strict
+            # matcher caught three of twenty phrasings people actually type.
+            # It returns None for "not an ask", a query string, or the EMPTY
+            # STRING for an ask that carries no query of its own -- "look it
+            # up", "sources?", "is that still true?". Those were the worst
+            # misses because they are the clearest instructions in the set,
+            # and the previous contract had no way to express them: no query
+            # meant no search, so the user typed "cite your sources" and got
+            # an answer with no sources and no acknowledgement.
+            ws_query = explicit_search_request(user_message) if online else None
+            if ws_query == "":
+                if task.is_active() and task.artifact:
+                    # Mid-task, "double-check that", "verify that" and "cite
+                    # your sources" mean the work on the screen, not the web.
+                    # This is the same call route() makes a few lines into
+                    # itself, and for the same stated reason -- no search
+                    # engine knows what "that" refers to here and the model
+                    # does, because the brief is in front of it -- but this
+                    # branch runs BEFORE route() and so sailed straight past
+                    # it. Measured: mid-code-task, "can you double-check that"
+                    # sent "write a python function that doubles a number" to
+                    # DuckDuckGo, which is exactly the code-prompt-as-search-
+                    # query failure the code branch further down exists to
+                    # prevent.
+                    #
+                    # The test is the ACTIVE TASK, not refers_to_active_task:
+                    # "cite your sources" contains no pronoun and no definite
+                    # reference, so the reference test misses it, and it was
+                    # the one that searched. What makes a bare ask unsafe here
+                    # is not how it is worded, it is that the previous user
+                    # message mid-task is a task instruction rather than a
+                    # subject anyone would want searched.
+                    ws_query = None
+                else:
+                    # The subject is whatever was just being discussed. With no
+                    # previous turn there is nothing to point at, and searching
+                    # for the ask itself ("cite your sources") returns nothing
+                    # useful while looking like the request was honoured -- so
+                    # treat it as not-an-explicit-search and let the router
+                    # handle it, which at least lets the model ask what to find
+                    # sources FOR.
+                    #
+                    # search_subject, not prior[:200]. The active-task guard
+                    # above catches the case where a task record exists, and
+                    # that is the only case it catches: with no task -- triage
+                    # on, task state off, or simply a conversation that never
+                    # opened one -- the previous turn went to DuckDuckGo
+                    # verbatim, unchecked by any of the guards this module
+                    # applies to the message the user actually typed. A turn
+                    # that pasted a config and a follow-up of "can you
+                    # double-check that?" put the paste, credentials included,
+                    # into the query string. The guards belong on the text
+                    # being sent, not on the turn it arrived on.
+                    ws_query = search_subject(_last_user_turn(history))
+            if not online:
+                yield {"type": "notice", "info": True,
+                       "message": "working offline — answering from my own knowledge"}
+                decision = {"action": "answer"}
+            elif forced_lane == "web_search" and has_search:
+                yield {"type": "notice", "info": True,
+                       "message": "searching the web (you asked me to)"}
+                # ws_query first: "/search look it up" means search for what we
+                # were discussing, not for the string "look it up". Using the
+                # message verbatim sent that phrase to the search engine.
+                decision = {"action": "web_search",
+                            "query": ws_query or user_message}
+            elif forced_lane in ("answer", "kb"):
+                yield {"type": "notice", "info": True,
+                       "message": ("using your knowledge base only" if forced_lane == "kb"
+                                   else "answering from my own knowledge (search off)")}
+                decision = {"action": "answer"}
+            elif read_url and self.registry.get("fetch_url") is not None:
+                yield {"type": "notice", "info": True,
+                       "message": "reading the linked page, then summarising it"}
+                decision = {"action": "fetch_url", "url": read_url, "__seed__": True}
+            elif ws_query and has_search and not is_code_request(user_message):
+                # not is_code_request: "look up how to write a python script
+                # that parses csv" is a lookup verb in front of a code
+                # request, and honouring it here sent the whole thing to a
+                # search engine -- the one outcome the code branch just below
+                # exists to prevent, reached by jumping the queue in front of
+                # it. A code request that genuinely needs current facts is
+                # still searched, by that branch, on CODE_NEEDS_LOOKUP.
+                yield {"type": "notice", "info": True,
+                       "message": "searching the web for that"}
+                decision = {"action": "web_search", "query": ws_query}
+            elif is_code_request(user_message):
+                # A code request is answered by WRITING the code from the model's
+                # own knowledge unless it genuinely needs current/external facts
+                # (CODE_NEEDS_LOOKUP: "latest", a specific API version, CVEs...).
+                # It must never be silently turned into a web search: "write a
+                # swift function that uses the drive api" is a coding task, not a
+                # research task.
+                needs_lookup = (CODE_NEEDS_LOOKUP.search(user_message)
+                                and self.registry.get("web_search") is not None)
+                if self.config.project_dir:
+                    # A project is attached, so "fix this bug / edit this file" is
+                    # about the user's real files: let the router pick a file tool.
+                    # But if the router reaches for a web lookup on a plain coding
+                    # request that does not need one, write the code instead.
+                    yield {"type": "phase", "label": "deciding how to handle this"}
+                    route_stats = GenerationStats()
+                    decision = await self.route(user_message, history, task, route_stats)
+                    account(route_stats)
+                    if decision.get("action") in ("web_search", "fetch_url") and not needs_lookup:
+                        decision = {"action": "answer"}
+                elif needs_lookup:
+                    decision = {"action": "web_search",
+                                "query": code_search_topic(user_message)}
+                    for_code = True
+                else:
+                    decision = {"action": "answer"}
+            else:
+                yield {"type": "phase", "label": "deciding how to handle this"}
+                route_stats = GenerationStats()
+                decision = await self.route(user_message, history, task, route_stats)
+                account(route_stats)
+
+            action = decision.get("action")
+            tool = None if action == "answer" else self.registry.get(action or "")
+            # When the router chose to answer from the model's own knowledge, do
+            # not honor a lookup tool the model tries to call on its own. The
+            # router already judged no external facts are needed; a self-issued
+            # web_search here is the "searches all the time" leak. Where nothing
+            # was seeded the prompt drops to the prose lane below and no tool is
+            # offered at all; otherwise only the network lookups are withheld.
+            answer_routed = (action == "answer" and not for_code)
+            # Only meaningful on an answer decision: a router that picked a
+            # tool has already said what it wants, and its confidence in its
+            # own knowledge is beside the point.
+            # Not on a code request. "Fix the bug in a.py where it crashes on
+            # empty input" is about the user's files, and a router that says
+            # it does not know the answer is saying something true and
+            # irrelevant -- it has not seen a.py, and neither has the web.
+            # Unqualified, this opened a lookup on turns the old gate always
+            # blocked, including ones about the user's own project.
+            router_unsure = bool(answer_routed
+                                 and said_no(decision.get("known"))
+                                 and not is_code_request(user_message))
+            if router_unsure:
+                log("router reports it is not confident it knows this; one "
+                    "self-issued lookup will be allowed.", logging.INFO)
+            log_event(get_logger("agent"), logging.DEBUG, "router.decision",
+                      conversation_id=conversation_id, action=decision.get("action"),
+                      online=online, task=task.summary(),
+                      history_messages=len(history), history_dropped=dropped)
+            ev = detail(f"router decision: {json.dumps(decision, ensure_ascii=False)[:200]}"
+                        + ("" if online else " (offline)"))
+            if ev:
+                yield ev
+            if action == "answer" and not scratch:
+                yield {"type": "notice", "info": True,
+                       "message": "decided to answer from my own knowledge"}
+
+            if tool is not None and tool.routable:
+                # Generic execution for any routable tool. Terminal tools (a
+                # calculator, a page fetch) return their result as the answer;
+                # non-terminal tools (search, weather) seed the result and let
+                # the model answer from it.
+                args = {k: v for k, v in decision.items() if k not in ("action", "__seed__")}
+                # __seed__ forces the seed-and-synthesise path even for a normally
+                # terminal tool (fetch_url), so "summarise <url>" returns a summary
+                # instead of dumping the raw page.
+                if tool.terminal and not decision.get("__seed__"):
+                    yield {"type": "tool_call", "name": action, "args": args, "step": 0}
+                    result, error = await asyncio.to_thread(
+                        self.registry.call, action, args, conversation_id
+                    )
+                    yield {"type": "tool_result", "name": action, "result": result,
+                           "error": error, "step": 0}
+                    if not error:
+                        trace.append({"name": action, "args": args,
+                                      "result": result[:1000], "error": None})
+                        if pending_context is not None:
+                            yield pending_context
+                            pending_context = None
+                        yield done(result.strip(), 0)
+                        return
+                    scratch.append({"role": "assistant", "content": f"I tried {action} and it failed."})
+                    scratch.append({"role": "user", "content": f"TOOL RESULT [{action}]:\n{result}"})
+                else:
+                    # Directive: the code path overrides it to ask for code; every
+                    # other tool uses its own seed_directive (or a sane default).
+                    if for_code:
+                        directive = ("Use these results as reference, then write the "
+                                     "code the user asked for. Prefer standard-library "
+                                     "approaches and note briefly if anything may be "
+                                     "version-dependent. If a page is needed call "
+                                     "fetch_url; do not repeat the search.")
+                        note = "I looked up current references before writing this."
+                    elif decision.get("__seed__") and action == "fetch_url":
+                        directive = ("Using the page above, do what the user asked: if they "
+                                     "asked for a summary, summarise it in a clear, "
+                                     "well-structured way (purpose, main sections, key "
+                                     "specifics); otherwise answer their question from it. "
+                                     "Cite the URL. Do not fetch it again.")
+                        note = "I read the linked page."
+                    else:
+                        directive = (tool.seed_directive
+                                     or "Answer my original question using this result.")
+                        note = f"I used {action} to get this."
+                    async for event in run_and_seed(action, args, note, directive):
+                        if "__seeded__" not in event:
+                            yield event
+            # action == "answer" (or an unavailable/unknown tool): nothing seeded,
+            # the loop below answers directly from the model's own knowledge.
+            # No tool is going to run, so rebuild the prompt without the tool
+            # protocol and the tool list: it is ~1500 tokens of a 4096-token
+            # window telling the model to reply with a single JSON object, which
+            # is exactly the reply a request for a C++ program came back with.
+            # Retrieval is re-sized against the bigger window as a side effect.
+            if answer_routed and not scratch:
+                before = messages_tokens(base)
+                base, dropped_prose = self.build_base(
+                    history, user_message, reserve, tools=False,
+                    extra_context=extra_context,
+                    active_code_task=bool(brief and task.is_code_task()))
+                prose_lane = True
+                # The prose lane drops ~1500 tokens of tool protocol and can
+                # therefore keep more history. It replaces the held report
+                # rather than adding a second one: two different trim counts for
+                # one turn is noise, and the honest number is the one describing
+                # the prompt that is actually sent.
+                dropped = dropped_prose
+                pending_context = {"type": "context", "dropped": dropped_prose,
+                                   "kept": max(0, history_total - dropped_prose),
+                                   "total": history_total,
+                                   "tokens": messages_tokens(base)} if dropped_prose else None
+                ev = detail(f"answer lane: prose prompt, no tools ({before} -> "
+                            f"{messages_tokens(base)} prompt tokens, "
+                            f"{history_total - dropped_prose} of {history_total} "
+                            f"history messages kept)")
+                if ev:
+                    yield ev
+
+            # The lane has settled, so the single trim report can go out now:
+            # every path from here either enters the step loop or returns, and
+            # both must still tell the user what was dropped.
+            if pending_context is not None:
+                yield pending_context
+                pending_context = None
+
+            # Incremental reasoning: if the question is a hard analytical one and
+            # nothing was seeded (a pure "answer" that isn't code), decompose it
+            # and work through it step by step from a bounded, growing set of
+            # conclusions, then stream the synthesis. This keeps the working set
+            # small on 8GB and lets a 3B reason in depth by taking its time.
+            # not task.is_code_task(): shape.kind != "code" is NOT the same
+            # guard, and swapping one for the other was a mistake. The kind
+            # describes this message; the task describes what is being built.
+            # Mid-build, "add error handling for empty input and missing
+            # files" is the next piece of a code task however it classifies,
+            # and decomposing it put two contradictory instructions in one
+            # prompt -- the brief saying "reply with the complete updated file
+            # in ONE python block" and the synthesis saying "give the final
+            # answer in plain text" -- which is exactly the contradiction the
+            # turn mode exists to prevent. Five extra generations to produce
+            # prose where a file was wanted.
+            if (not scratch and action == "answer"
+                    and self.config.incremental_reasoning
+                    and shape.kind != "code"
+                    and not task.is_code_task()
+                    and shape.deep):
+                yield {"type": "phase", "label": "planning the approach"}
+                # Say WHICH shape earned the expensive path. A user watching a
+                # turn take six generations deserves to know it was read as a
+                # word problem rather than a question, because that is what
+                # tells them whether to move the thresholds or to rephrase.
+                ev = detail(f"classified as {shape.kind} ({shape.depth}); cues: "
+                            + (", ".join(shape.cues) or "none"))
+                if ev:
+                    yield ev
+                # The planning call is a real generation and has to be folded
+                # into the turn like every other one: without this the footer
+                # under a decomposed answer under-reported the turn by a whole
+                # call, on every decomposed turn.
+                plan_stats = GenerationStats()
+                steps = await self.plan_steps(user_message, plan_stats)
+                account(plan_stats)
+                if len(steps) >= 2:
+                    plan_text = "; ".join(f"{i}) {st}" for i, st in enumerate(steps, 1))
+                    yield {"type": "notice", "info": True,
+                           "message": f"plan ({len(steps)} steps): {plan_text[:400]}"}
+                    notes: list[str] = []
+                    # Set by a step that reports it cannot be settled without a
+                    # tool; checked after the loop to escalate instead of
+                    # synthesising a confident answer out of "I don't know".
+                    reason_gap = ""
+                    # How much of each conclusion is carried forward. A flat 300
+                    # characters was most of a conclusion on 8GB and a fifth of
+                    # one on a 64GB box, where reasoning_tokens is 1024 and the
+                    # step is allowed to say something substantial -- so the
+                    # roomy machines were throwing away the work they had just
+                    # paid for. Scale it with the per-step budget that produced
+                    # the text, and keep the old floor so nothing shrinks.
+                    note_chars = max(300, self.config.reasoning_tokens)
+                    for i, sub in enumerate(steps, 1):
+                        if cancel is not None and cancel.is_set():
+                            yield {"type": "cancelled", "step": i, "trace": trace}
+                            return
+                        yield {"type": "phase", "label": f"reasoning step {i}/{len(steps)}"}
+                        # Stream each step live so thinking is never a frozen
+                        # label: the user sees tokens appear as the model works.
+                        yield {"type": "reason_step", "step": i, "total": len(steps), "label": sub[:120]}
+                        step_messages = self.reason_messages(user_message, notes, sub)
+                        conclusion = ""
+                        rstats = GenerationStats()
+                        rstream = self.client.stream(step_messages, self.config.reasoning_tokens, 0.0, rstats, kind="reasoning")
+                        started_step = time.time()
+                        try:
+                            async for tok in rstream:
+                                if cancel is not None and cancel.is_set():
+                                    break
+                                conclusion += tok
+                                yield {"type": "reason_token", "step": i, "token": tok}
+                                # Per-step wall-clock cap: keep what streamed and
+                                # move on rather than letting one step wedge.
+                                if time.time() - started_step > self.config.reasoning_step_timeout:
+                                    yield {"type": "notice", "message":
+                                           f"step {i} taking long; moving on with partial", "info": False}
+                                    break
+                        except Exception:
+                            # Streaming failed; fall back to a resilient
+                            # non-stream. Into the SAME rstats the stream was
+                            # using, which is accounted below: a fallback that
+                            # bills nothing makes a turn that had to retry look
+                            # cheaper than one that did not.
+                            if not strip_reasoning(conclusion).strip():
+                                conclusion = await self.reason_step(
+                                    user_message, notes, sub, rstats)
+                        finally:
+                            await rstream.aclose()
+                        account(rstats)
+                        conclusion = strip_reasoning(conclusion).strip()
+                        yield {"type": "reason_done", "step": i, "conclusion": conclusion[:200]}
+                        # A step that reported it cannot be settled from the
+                        # weights. This was the worst thing the chain did:
+                        # "I don't have access to real-time data" became a
+                        # FINDING, was carried into every later step as
+                        # established fact, and was then synthesised into a
+                        # confident answer built on it. Escalating was already
+                        # possible -- switch_to_agent exists and handles exactly
+                        # this -- but it is only reachable from the step loop,
+                        # which the reasoning lane returns before ever entering.
+                        # So on precisely the turns most likely to need the web,
+                        # the escalation path could not be reached at all.
+                        if missing_capability(conclusion) and not reason_gap:
+                            reason_gap = conclusion
+                            yield {"type": "notice", "info": True, "message":
+                                   f"step {i} needs something I do not have; "
+                                   "getting it rather than guessing"}
+                            break
+                        if conclusion:
+                            notes.append(f"{i}. {sub}: {conclusion[:note_chars]}")
+                            self.partial_add(conversation_id, f"## Step {i}: {sub}\n{conclusion}")
+                    # A step asked for something the weights do not hold. Hand
+                    # the turn its tools and drop into the ordinary step loop
+                    # with what has been worked out so far already in scratch,
+                    # so the chain is not thrown away -- the lookup completes it
+                    # rather than restarting it.
+                    switched = False
+                    if reason_gap:
+                        async for ev in switch_to_agent(reason_gap, 1):
+                            if "__switched__" in ev:
+                                switched = bool(ev["__switched__"])
+                            else:
+                                yield ev
+                    if switched:
+                        if notes:
+                            scratch.append({"role": "assistant", "content":
+                                            "Working notes so far:\n" + "\n".join(notes)})
+                        scratch.append({"role": "user", "content":
+                                        "Use a tool to get what is missing, then answer "
+                                        "the original question in full: "
+                                        + reason_gap[:300]})
+                    else:
+                        if reason_gap:
+                            # No tool, no network, or the user said /no-search.
+                            # The gap is real and unfillable, so it belongs in
+                            # the answer rather than being quietly dropped.
+                            notes.append(f"Unresolved: {reason_gap[:note_chars]}")
+                        # Synthesise the final answer from the conclusions,
+                        # streamed.
+                        yield {"type": "phase", "label": "writing the answer"}
+                        joined = "\n".join(notes)
+                        # Built on `base`, not from scratch. The old synthesis
+                        # replaced the whole prompt with [raw system prompt,
+                        # question + notes], which threw away the conversation
+                        # history, the retrieved passages, any autoloaded skill
+                        # and any @reference body -- everything build_base had
+                        # just assembled and sized. A decomposed follow-up
+                        # therefore answered as if it were the first turn, and
+                        # the one lane that had done the most work to
+                        # understand the question was the one that answered it
+                        # with the least context. base[-1] is the user message
+                        # WITH that context already folded in, so extending it
+                        # keeps all of it and keeps the prose-lane system
+                        # prompt too.
+                        synth = dict(base[-1])
+                        synth["content"] = (
+                            f"{synth.get('content', user_message)}\n\n"
+                            f"You worked through this and reached these conclusions:\n"
+                            f"{joined}\n\nNow give the complete final answer in plain "
+                            "text, drawing them together. Do not number the steps. "
+                            "Where two conclusions disagree, say which one you are "
+                            "going with and why, rather than averaging them.")
+                        final_messages = base[:-1] + [synth]
+                        answer_buf = ""
+                        fstats = GenerationStats()
+                        fstream = self.client.stream(final_messages, reserve, temperature, fstats, kind=gen_kind)
+                        try:
+                            async for tok in fstream:
+                                if cancel is not None and cancel.is_set():
+                                    break
+                                answer_buf += tok
+                                yield {"type": "token", "token": tok, "step": len(steps)}
+                        except Exception:
+                            # Fall back to a non-streaming resilient synthesis,
+                            # billed to the same stats object: see plan_steps.
+                            answer_buf = await self.resilient_complete(
+                                final_messages, reserve, temperature, fstats)
+                        finally:
+                            await fstream.aclose()
+                        account(fstats)
+                        answer = strip_reasoning(answer_buf).strip()
+                        if not answer:
+                            answer = "Here is what I worked out:\n" + joined
+                        yield done(answer, len(steps))
+                        return
+
+        if pending_context is not None:
+            yield pending_context
+            pending_context = None
+
+        for step in range(1, self.config.agent_max_steps + 1):
+            if cancel is not None and cancel.is_set():
+                yield {"type": "cancelled", "step": step, "trace": trace}
+                return
+
+            messages, condensed = self.assemble(base, scratch, reserve)
+            # quiet=True: payload() runs the same calculation for real and logs
+            # the clamp there; this call is only so the trace and the truncation
+            # note can quote the number that will actually apply.
+            effective_reserve = self.client.reply_budget(messages, reserve, quiet=True)
+            yield {"type": "step", "step": step, "max_steps": self.config.agent_max_steps,
+                   "prompt_tokens": messages_tokens(messages), "condensed": condensed,
+                   "reply_budget": effective_reserve, "requested_budget": reserve}
+            self.trace_prompt(f"step-{step}", messages, generation_id=generation_id,
+                              lane=("prose" if prose_lane else "tools"),
+                              task=task.summary(), artifact_version=task.artifact_version,
+                              reply_budget=effective_reserve, requested_budget=reserve,
+                              gen_kind=gen_kind, temperature=(temperature
+                                                              if temperature is not None
+                                                              else self.config.tool_temperature),
+                              condensed=condensed, history_dropped=dropped,
+                              continuation=False)
+            ev = detail(f"step {step}: prompt {messages_tokens(messages)} tokens, "
+                        f"reply budget {effective_reserve}"
+                        + (f" (asked for {reserve}, clamped to fit the "
+                           f"{self.config.context_size}-token context)"
+                           if effective_reserve != reserve else "")
+                        + f", {len(scratch)} scratch turns"
+                        + (f", condensed {condensed}" if condensed else ""))
+            if ev:
+                yield ev
+
+            buffer = ""
+            cancelled = False
+            stats = GenerationStats()
+            # Tool-selection steps want deterministic JSON. Only the answer the
+            # user reads should get the configured temperature, and we do not
+            # know which this is until it parses, so bias towards valid JSON and
+            # let the final-answer pass below use the warmer setting.
+            step_temperature = (
+                self.config.tool_temperature if temperature is None else temperature
+            )
+            # Generate this step, retrying with a smaller budget on failure rather
+            # than surfacing an error. A model-server OOM kill and watchdog restart
+            # look like a dropped stream from here, so a shrink-and-retry both
+            # rides out the restart and asks for a reply small enough to fit.
+            gen_reserve = reserve
+            ctx_reserve = reserve
+            step_failed = False
+            # Set by the retry loop when a readiness probe proves the backend
+            # cannot generate, so the failure message below need not re-probe.
+            backend_dead = False
+            for attempt in range(self.config.resilient_retries + 1):
+                buffer = ""
+                stats = GenerationStats()
+                # On a retry, re-assemble with a much larger reserve, which
+                # collapses the *prompt* budget and trims the trace hard. The
+                # failure on 8GB is prefill of an oversized prompt (a stall, no
+                # first token), so the input is the lever, not the reply length.
+                # Each attempt cuts the prompt to roughly half of the previous,
+                # so the three attempts are genuinely distinct rather than
+                # bouncing off the reply-token floor.
+                if attempt > 0:
+                    # Leave only ~attempt/(attempt+1) of the window as reserve,
+                    # i.e. cut the prompt to about 1/2, 1/3, 1/4 ... of the
+                    # context on successive attempts. Monotonic and distinct.
+                    ctx_reserve = min(self.config.context_size - self.config.min_max_tokens,
+                                      int(self.config.context_size * (attempt / (attempt + 1))))
+                    messages, _ = self.assemble(base, scratch, ctx_reserve)
+                stream = self.client.stream(messages, gen_reserve, step_temperature, stats, kind=gen_kind)
+                # Split the model's <think> reasoning from its answer as it
+                # streams, so the reasoning shows in its own visible thinking
+                # area instead of being hidden or dumped raw into the answer.
+                splitter = ThinkSplitter()
+                try:
+                    async for token in stream:
+                        if cancel is not None and cancel.is_set():
+                            cancelled = True
+                            break
+                        buffer += token
+                        for kind, piece in splitter.feed(token):
+                            if not piece:
+                                continue
+                            if kind == "think":
+                                yield {"type": "think_token", "token": piece, "step": step}
+                            else:
+                                yield {"type": "token", "token": piece, "step": step}
+                        visible = strip_reasoning(buffer).lstrip()
+                        if visible.startswith(("{", "```")) and parse_tool_call(buffer, known):
+                            break
+                    # Release the partial-tag tail the splitter is still
+                    # holding: nothing arrives after the last token, so an
+                    # answer ending in "a < b" would lose its last characters.
+                    for kind, piece in splitter.flush():
+                        yield {"type": "think_token" if kind == "think" else "token",
+                               "token": piece, "step": step}
+                    step_failed = False
+                    break
+                except Exception as exc:
+                    await stream.aclose()
+                    log(f"generation step {step} attempt {attempt + 1} failed: {exc}",
+                        logging.DEBUG)
+                    # If usable text already streamed, keep it rather than redoing
+                    # work; the loop below can act on a partial answer or call.
+                    if strip_reasoning(buffer).strip():
+                        step_failed = False
+                        break
+                    if attempt >= self.config.resilient_retries:
+                        step_failed = True
+                        break
+                    reason = self.client.classify_error(exc)
+                    # Ask whether the backend can generate AT ALL before deciding
+                    # to retry, and ACT on the answer. mlx_lm.server runs
+                    # generation on one thread; when that thread dies the process
+                    # keeps answering 200 on /v1/models while every completion
+                    # hangs. Shrinking the prompt cannot help that, and spending
+                    # the remaining attempts on it is minutes of dead air (three
+                    # attempts of a 60s stall plus a 40s probe each). The probe
+                    # also gives the manager's watchdog time to restart a backend
+                    # that is coming back, so a genuine OOM-and-restart still
+                    # rides out transparently.
+                    backend_dead = not await self.client.wait_until_ready(
+                        timeout=self.config.ready_wait_timeout)
+                    if backend_dead:
+                        log(f"generation step {step}: model server still cannot generate "
+                            f"after {self.config.ready_wait_timeout}s; abandoning the "
+                            "remaining retries rather than stalling on a dead backend.",
+                            logging.WARNING)
+                        step_failed = True
+                        break
+                    # It is generating again, so the prompt is the remaining
+                    # suspect. Shrink the reply a little too, but the prompt cut
+                    # above is the real lever; report that, since it is what
+                    # actually changes between attempts.
+                    gen_reserve = max(self.config.min_max_tokens, int(gen_reserve * 0.75))
+                    yield {"type": "notice", "step": step,
+                           "message": f"{reason}; the model server is answering again, "
+                                      f"cutting the prompt hard and retrying (attempt "
+                                      f"{attempt + 2}). Work so far is saved."}
+                    continue
+                finally:
+                    # Breaking out early leaves the HTTP response open until the
+                    # generator is collected, which on a local server means a
+                    # socket per abandoned step.
+                    await stream.aclose()
+
+            if step_failed:
+                # Every retry failed. Distinguish a genuine memory limit from a
+                # backend that is up but not generating (e.g. the mlx-lm
+                # generation thread crashed). When the retry loop already proved
+                # the latter, reuse that verdict instead of paying for another
+                # probe. An honest message points at the real fix.
+                can_generate = (False if backend_dead
+                                else await self.client.wait_until_ready(timeout=8.0))
+                if can_generate:
+                    note = ("I ran low on memory before I could finish this in one "
+                            "pass. Try a smaller or more specific request, or raise "
+                            "the RAM headroom.")
+                else:
+                    note = ("The model server is up but not generating — this is a "
+                            "backend error, not a memory limit. The watchdog should "
+                            "have restarted it; if this persists it has given up, so "
+                            "check logs/model_server.log and restart the model "
+                            "(Settings → Restart model).")
+                yield done(self.salvage(conversation_id, note), step, truncated=True)
+                return
+
+            account(stats)
+            yield {"type": "usage", "step": step, **stats.as_event()}
+
+            if cancelled:
+                yield {"type": "cancelled", "step": step, "partial": buffer.strip(), "trace": trace}
+                return
+
+            call = parse_tool_call(buffer, known)
+
+            # A tool call that ran out of reply budget partway through its JSON.
+            # parse_tool_call correctly refuses it -- and the branch below then
+            # handed two thousand characters of half-written document to the
+            # user as though it were the answer, which is what a "create a Word
+            # document" turn returned instead of a file. Say what happened and
+            # ask for one that fits.
+            if call is None and is_truncated_tool_call(buffer, known):
+                cut_calls += 1
+                log(f"step {step}: the tool call was cut off at the "
+                    f"{effective_reserve}-token reply limit after "
+                    f"{len(buffer)} characters.", logging.WARNING)
+                if cut_calls > 2 or step >= self.config.agent_max_steps:
+                    yield done(
+                        "I could not fit that document into this model's context "
+                        f"window ({self.config.context_size} tokens): the tool call "
+                        "carrying it was cut off each time I tried. Ask for a "
+                        "shorter document — fewer sections, or one section at a "
+                        "time — or raise CONTEXT_SIZE and ask again.",
+                        step, truncated=True)
+                    return
+                yield {"type": "notice", "info": True,
+                       "message": ("that tool call was cut off at the reply limit; "
+                                   "asking for a shorter document")}
+                # The cut-off text is never appended to the trace: putting a
+                # half-written call in front of the model is how it learns to
+                # write another one.
+                scratch.append({"role": "assistant",
+                                "content": "(the tool call was cut off)"})
+                scratch.append({"role": "user", "content":
+                                f"Your tool call was cut off after "
+                                f"{effective_reserve} tokens: the content argument "
+                                "was too long to finish. Call the SAME tool again "
+                                "with the same path and a SHORTER document — keep "
+                                "the structure, cut the prose to about half, and "
+                                "make sure the JSON closes."})
+                continue
+
+            # Canonicalise the tool name BEFORE any policy check runs on it.
+            # parse_tool_call honours an explicit {"tool": ...} key whatever the
+            # name, so a model that writes the TARGET in the name slot --
+            # {"tool": "https://github.com/libusb/libusb"} -- produced a call
+            # whose name was in no allow-list and no deny-list. It slipped past
+            # the answer-lane lookup gate directly below (which matches on
+            # LOOKUP_TOOLS) and then reached the registry, which replied with its
+            # entire catalogue: a spent step, a failed tool call in the DB, and
+            # 286 characters of "Available: ..." fed back into a 4096-token
+            # context as a TOOL RESULT. Repair or reject once, here, so every
+            # check downstream is looking at a real tool name.
+            if call is not None:
+                repaired = self.repair_tool_call(call[0], call[1], known)
+                if repaired is None:
+                    bad_names += 1
+                    log(f"step {step}: model asked for an unregistered tool "
+                        f"{call[0]!r}; correcting without dispatching it.",
+                        logging.WARNING)
+                    if bad_names > 2:
+                        forced = await self.forced_prose_answer(
+                            history, user_message, reserve, temperature, task)
+                        yield done(forced or "I could not produce an answer for that. "
+                                             "Try rephrasing it, or ask me to continue.",
+                                   step)
+                        return
+                    yield {"type": "notice", "step": step, "info": True,
+                           "message": f"{call[0]!r} is not one of my tools; asking again"}
+                    # The tool lane's system prompt already carries every tool
+                    # spec, so re-listing the catalogue here would only spend
+                    # context on something the model has already been told.
+                    scratch.append({"role": "assistant", "content": "(invalid tool name)"})
+                    scratch.append({"role": "user", "content":
+                                    f"{call[0]!r} is not a tool. Use one of the tool names "
+                                    "from your instructions, exactly as written, and put "
+                                    "the target in args. Or answer in plain text."})
+                    continue
+                if repaired != call:
+                    log(f"step {step}: repaired tool call {call[0]!r} -> "
+                        f"{repaired[0]!r}", logging.INFO)
+                    ev = detail(f"repaired tool name: {call[0]} -> {repaired[0]}")
+                    if ev:
+                        yield ev
+                call = repaired
+
+            # On an answer-routed turn, a self-issued network lookup is allowed
+            # ONCE, and only when the question genuinely needs facts the
+            # weights cannot hold. That lets the model fetch fresh facts when
+            # it truly needs them while still blocking the reflexive "search
+            # everything" behaviour for general knowledge.
+            # parse_tool_call honors an explicit "tool" key regardless of the
+            # allowed set, so the gate must be here, at execution.
+            #
+            # Two signals open it now where there was one. needs_fresh_facts
+            # replaces is_time_sensitive because the keyword list had no idea
+            # what year it was: it could not tell "who won the 2026 final"
+            # from "who won the 1998 final", and it fired on the current
+            # WORKING DIRECTORY. And router_unsure is the router saying, in
+            # the same 64-token reply it was already making, that it does not
+            # believe it knows this -- the one signal in the whole pipeline
+            # that can see inside the weights, and it cost nothing to ask for.
+            # The connectivity check belongs here and was missing. The gate
+            # only ever opened on is_time_sensitive, which is narrow enough
+            # that an offline turn rarely reached it; needs_fresh_facts is a
+            # good deal broader, so an offline turn now says "working offline
+            # -- answering from my own knowledge" and then, two events later,
+            # "the question needs current facts; allowing one lookup" and
+            # spends a network call that cannot succeed.
+            if (call is not None and answer_routed and call[0] in LOOKUP_TOOLS
+                    and (needs_fresh_facts(user_message, self.config.model_cutoff)
+                         or router_unsure)
+                    and not lookup_used
+                    and forced_lane not in ("answer", "kb")
+                    and await has_internet()):
+                lookup_used = True
+                yield {"type": "notice", "info": True,
+                       "message": ("I am not confident I know this; allowing one lookup"
+                                   if router_unsure else
+                                   "the question needs current facts; allowing one lookup")}
+                # fall through to normal tool execution below
+            elif call is not None and answer_routed and call[0] in LOOKUP_TOOLS:
+                if not answered_retry:
+                    answered_retry = True
+                    yield {"type": "notice", "info": True,
+                           "message": "answering from my own knowledge (no lookup needed)"}
+                    scratch.append({"role": "user", "content":
+                        "Answer the question directly from your own knowledge. "
+                        "Do NOT call any tool and do NOT output JSON; just give the answer."})
+                    continue
+                # It insisted again: force a plain, tool-free answer on a prompt
+                # that never mentions tools in the first place.
+                direct = await self.forced_prose_answer(
+                    history, user_message, reserve, temperature, task)
+                # If THAT comes back as "I can't, I have no access", the model
+                # has now said three times over that this turn needs a tool, and
+                # the router's one-shot guess is the only thing still claiming
+                # otherwise. Give it the tools rather than returning the refusal.
+                switched = False
+                async for ev in switch_to_agent(direct, step):
+                    if "__switched__" in ev:
+                        switched = bool(ev["__switched__"])
+                    else:
+                        yield ev
+                if switched:
+                    continue
+                yield done(direct or "I don't have enough to answer that confidently.", step)
+                return
+
+            if call is None:
+                answer = strip_reasoning(buffer).strip()
+                # A reply that is nothing but an unfilled tool call ("{}") is not
+                # an answer. parse_tool_call refuses to execute it and this branch
+                # used to hand the raw text to the user as the reply -- and then
+                # store it, so the next turn had "{}" in context as a worked
+                # example and produced it again in two seconds.
+                degenerate = bool(answer) and is_degenerate_tool_call(answer)
+                if degenerate:
+                    log(f"discarded a degenerate JSON reply at step {step} "
+                        f"({'prose' if prose_lane else 'tool'} lane): {answer[:80]!r}",
+                        logging.WARNING)
+                    yield {"type": "notice", "step": step, "info": True,
+                           "message": "that reply was an empty tool call, not an answer; "
+                                      "asking again for plain text"}
+                    answer = ""
+                # Before the answer clears the quality gates: is it an answer at
+                # all, or the model saying it needed a tool it was not given?
+                # Checked HERE rather than after settle(), because settle spends
+                # a revision step polishing the wording of a refusal and the
+                # drift check has no opinion about one.
+                if answer:
+                    # The revision pass came back asking for the draft instead of
+                    # improving it. Returning that discards a finished answer in
+                    # favour of a question the user cannot act on, and the draft
+                    # is still right here.
+                    if draft and is_missing_draft_reply(answer):
+                        log(f"step {step}: the revision pass asked for the draft "
+                            f"instead of improving it ({answer[:60]!r}); keeping "
+                            "the draft.", logging.WARNING)
+                        answer = draft
+                    switched = False
+                    async for ev in switch_to_agent(answer, step):
+                        if "__switched__" in ev:
+                            switched = bool(ev["__switched__"])
+                        else:
+                            yield ev
+                    if switched:
+                        continue
+                    verdict = None
+                    async for ev in settle(answer, stats, step):
+                        if "__revise__" in ev or "__settled__" in ev:
+                            verdict = ev
+                        else:
+                            yield ev
+                    if "__revise__" in verdict:
+                        continue
+                    yield done(verdict["__settled__"], step)
+                    return
+                # An empty reply -- or an unfilled tool call -- is a hiccup, not
+                # an answer. Nudge once. The rejected text is NEVER appended to
+                # the trace: putting it there is what teaches the model to repeat
+                # it. A placeholder keeps the turn structure without the example.
+                if nudges == 0 and step < self.config.agent_max_steps:
+                    nudges += 1
+                    scratch.append({"role": "assistant", "content": "(no answer)"})
+                    scratch.append({
+                        "role": "user",
+                        "content": ("That reply was an empty JSON object, not an answer. "
+                                    "Answer the question in plain text. Do not output JSON."
+                                    if degenerate else
+                                    "That reply was empty. Answer the question in plain text, "
+                                    "or call exactly one tool as a JSON object."),
+                    })
+                    continue
+                # Out of nudges: one forced tool-free pass beats handing back a
+                # blank turn, which is what yielding "" here did.
+                forced = draft or await self.forced_prose_answer(
+                    history, user_message, reserve, temperature, task)
+                yield done(forced or "I could not produce an answer for that. Try "
+                                     "rephrasing it, or ask me to continue.", step)
+                return
+
+            name, args = call
+
+            if name == "final_answer":
+                answer = str(args.get("answer") or "").strip()
+                # Same gate as the plain-text exit. final_answer is the loop's
+                # other way out, and a refusal delivered through it used to skip
+                # every check the prose exit runs -- the model could sidestep the
+                # switch simply by choosing the JSON syntax for the same reply.
+                if answer:
+                    switched = False
+                    async for ev in switch_to_agent(answer, step):
+                        if "__switched__" in ev:
+                            switched = bool(ev["__switched__"])
+                        else:
+                            yield ev
+                    if switched:
+                        continue
+                    # No tool_call event: final_answer is how the loop exits, not
+                    # an action worth a trace node. Emitting it rendered a stray
+                    # "final_answer:" label above the reply.
+                    verdict = None
+                    async for ev in settle(answer, stats, step):
+                        if "__revise__" in ev or "__settled__" in ev:
+                            verdict = ev
+                        else:
+                            yield ev
+                    if "__revise__" in verdict:
+                        continue
+                    yield done(verdict["__settled__"], step)
+                    return
+                scratch.append({"role": "assistant", "content": strip_reasoning(buffer).strip()})
+                scratch.append({
+                    "role": "user",
+                    "content": "final_answer needs a non-empty answer argument. "
+                               "Reply again with the full answer.",
+                })
+                continue
+
+            if name == "delegate_task":
+                # Handled here rather than in the registry because running a
+                # child agent means awaiting a coroutine on this event loop, and
+                # a registry handler is synchronous.
+                # Named sub_task, not task: `task` in this scope is the
+                # conversation's active TaskState.
+                sub_task = str(args.get("task") or "").strip()
+                caps = str(args.get("capabilities") or "")
+                if not sub_task:
+                    scratch.append({"role": "assistant", "content": "(empty delegation)"})
+                    scratch.append({"role": "user", "content":
+                                    "delegate_task needs a self-contained task. Give "
+                                    "the helper the full instruction, or do it yourself."})
+                    continue
+                if delegated >= self.config.subagent_max_per_turn:
+                    result = (f"You have already delegated "
+                              f"{self.config.subagent_max_per_turn} times this turn. "
+                              "Finish with what you have.")
+                    error = None
+                else:
+                    delegated += 1
+                    yield {"type": "tool_call", "name": name, "args": args, "step": step}
+                    yield {"type": "phase", "label": f"helper {delegated}: {sub_task[:60]}"}
+                    try:
+                        async with self.subagents:
+                            result = await asyncio.wait_for(
+                                self.run_subagent(sub_task, caps, conversation_id),
+                                timeout=self.config.agent_run_timeout)
+                        error = None
+                    except asyncio.TimeoutError:
+                        result = (f"(the helper ran out of time after "
+                                  f"{self.config.agent_run_timeout:.0f}s)")
+                        error = result
+                    except Exception as exc:
+                        result = f"(the helper failed: {type(exc).__name__}: {exc})"
+                        error = result
+                        log(f"subagent failed: {exc}", logging.WARNING)
+                    if not result:
+                        result = "(the helper came back with nothing)"
+                    trace.append({"name": name, "args": args,
+                                  "result": str(result)[:1000], "error": error})
+                    yield {"type": "tool_result", "name": name, "result": result,
+                           "error": error, "step": step}
+                scratch.append({"role": "assistant",
+                                "content": strip_reasoning(buffer).strip()})
+                scratch.append({"role": "user", "content":
+                                f"HELPER RESULT:\n{result}\n\nUse this to answer the "
+                                "original question. You cannot see the work it did."})
+                continue
+
+            signature = f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)}"
+            yield {"type": "tool_call", "name": name, "args": args, "step": step}
+
+            if signature in seen_calls:
+                result = (
+                    f"You already called {name} with these arguments and received a result. "
+                    "Do not repeat it. Answer the user now with what you have, or call a "
+                    "different tool."
+                )
+                error = None
+            else:
+                seen_calls.append(signature)
+                result, error = await asyncio.to_thread(
+                    self.registry.call, name, args, conversation_id
+                )
+
+            budget = self._tool_budget(reserve)
+            result_for_model, was_summarised = await self.compress_tool_result(name, result, budget)
+
+            trace.append({"name": name, "args": args, "result": result[:1000], "error": error})
+            # The document's SOURCE is only ever here, in the call the model just
+            # made: the rendered .pdf is bytes it can never read back. Recording
+            # it is what makes the next turn's "now make it look like X" an edit
+            # of this document rather than a fresh guess at what it said.
+            if name == "create_document" and not error and self.config.task_state_enabled:
+                task.record_document(str(args.get("path") or ""),
+                                     Path(str(args.get("path") or "")).suffix.lower(),
+                                     str(args.get("content") or ""),
+                                     describe_document(
+                                         Path(str(args.get("path") or "")).suffix.lower()))
+                self.save_task(conversation_id, task)
+            yield {"type": "tool_result", "name": name, "result": result, "error": error,
+                   "step": step, "context_chars": len(result_for_model),
+                   "summarised": was_summarised}
+            ev = detail(f"tool {name}: {len(result)} chars returned, "
+                        f"{len(result_for_model)} into context"
+                        + (" (summarised)" if was_summarised else "")
+                        + (f", error: {error}" if error else ""))
+            if ev:
+                yield ev
+
+            scratch.append({"role": "assistant", "content": strip_reasoning(buffer).strip()})
+            scratch.append({
+                "role": "user",
+                "content": f"TOOL RESULT [{name}]:\n{result_for_model}\n\n"
+                           "Use this to answer the original question, or call one more tool "
+                           "if you genuinely still need it.",
+            })
+
+        # Ordinary step budget exhausted without a final answer. Rather than
+        # stopping, keep going in bounded batches: collapse the work so far into a
+        # compact running summary (so memory stays flat and an 8GB machine does
+        # not OOM), then grant another batch of steps, up to hard_step_cap. This
+        # is the "slow down but do not stop" path for a task too big for one pass.
+        extra_batches = 0
+        while (self.config.agent_max_steps * (extra_batches + 1) < self.config.hard_step_cap
+               and (cancel is None or not cancel.is_set())):
+            extra_batches += 1
+            summary = self.running_summary(scratch)
+            # Reset the working set to just the summary: constant memory regardless
+            # of how much has already happened.
+            scratch = [{
+                "role": "user",
+                "content": f"PROGRESS SO FAR (continue the task, do not restart):\n{summary}\n\n"
+                           "Keep going one step at a time. Answer in plain text when done, "
+                           "or call one tool as JSON to make progress.",
+            }]
+            yield {"type": "notice", "step": self.config.agent_max_steps * extra_batches,
+                   "message": "task is large; continuing step by step from a summary"}
+
+            batch_progress = False
+            for extra in range(1, self.config.agent_max_steps + 1):
+                step = self.config.agent_max_steps * extra_batches + extra
+                if cancel is not None and cancel.is_set():
+                    yield {"type": "cancelled", "step": step, "trace": trace}
+                    return
+                messages, _ = self.assemble(base, scratch, reserve)
+                yield {"type": "step", "step": step, "max_steps": self.config.hard_step_cap,
+                       "prompt_tokens": messages_tokens(messages)}
+                buffer = await self.resilient_complete(messages, reserve, temperature) or ""
+                call = parse_tool_call(buffer, known)
+                if call is None:
+                    answer = strip_reasoning(buffer).strip()
+                    if answer and is_degenerate_tool_call(answer):
+                        answer = ""      # an unfilled call, not an answer
+                    if answer:
+                        yield done(answer, step, truncated=True)
+                        return
+                    continue
+                name, args = call
+                repaired = self.repair_tool_call(name, args, known)
+                if repaired is None:
+                    # Same guard as the main loop: correct, never dispatch. Not
+                    # forward motion either, so a batch of these still stalls out
+                    # and salvages instead of grinding to the hard cap.
+                    log(f"step {step}: model asked for an unregistered tool {name!r}; "
+                        "correcting without dispatching it.", logging.WARNING)
+                    scratch.append({"role": "assistant", "content": "(invalid tool name)"})
+                    scratch.append({"role": "user", "content":
+                                    f"{name!r} is not a tool. Use a tool name from your "
+                                    "instructions exactly as written, or answer in plain text."})
+                    continue
+                name, args = repaired
+                batch_progress = True  # a real tool call is forward motion
+                if name == "final_answer":
+                    answer = str(args.get("answer") or "").strip()
+                    if answer:
+                        yield done(answer, step, truncated=True)
+                        return
+                    continue
+                signature = f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)}"
+                yield {"type": "tool_call", "name": name, "args": args, "step": step}
+                if signature in seen_calls:
+                    result, error = ("Already ran that; use the result you have or try "
+                                     "another tool.", None)
+                else:
+                    seen_calls.append(signature)
+                    result, error = await asyncio.to_thread(
+                        self.registry.call, name, args, conversation_id
+                    )
+                budget = self._tool_budget(reserve)
+                result_for_model, _ = await self.compress_tool_result(name, result, budget)
+                trace.append({"name": name, "args": args, "result": result[:1000], "error": error})
+                yield {"type": "tool_result", "name": name, "result": result,
+                       "error": error, "step": step}
+                scratch.append({"role": "assistant", "content": strip_reasoning(buffer).strip()})
+                scratch.append({"role": "user",
+                                "content": f"TOOL RESULT [{name}]:\n{result_for_model}"})
+                self.partial_add(conversation_id, f"Tool {name}: {str(result)[:500]}")
+
+            if not batch_progress:
+                # A whole batch produced no answer and no tool call — almost
+                # always repeated stalls. Continuing would only stretch a stall
+                # into minutes (the 789-second grind). Stop and salvage instead.
+                yield {"type": "notice", "info": True,
+                       "message": "no progress in the last batch; wrapping up with what I have"}
+                break
+
+        # Reached the hard cap, or was cancelled, or a batch stalled out. Force one
+        # plain answer, never an error, from the compact summary so the reply
+        # always closes cleanly.
+        summary = self.running_summary(scratch)
+        final_messages = [
+            {"role": "system", "content": self.config.system_prompt_with_identity},
+            {"role": "user", "content":
+                f"{user_message}\n\nWork so far:\n{summary}\n\n"
+                "Give your best final answer now in plain text. Do not call any tool."},
+        ]
+        answer = await self.resilient_complete(final_messages, reserve, temperature)
+        answer = strip_reasoning(answer).strip()
+        if is_degenerate_tool_call(answer):
+            answer = ""
+        if not answer:
+            # Synthesis itself could not run — hand back the saved work from disk
+            # (falling back to the in-memory summary) so the turn still delivers.
+            answer = self.salvage(
+                conversation_id,
+                "I reached the step limit before finishing in one pass.")
+            if answer.strip() == "I reached the step limit before finishing in one pass.":
+                answer += "\n\nHere is as far as I got:\n" + summary
+        yield done(answer, self.config.hard_step_cap, truncated=True)
+
+
+
+# Re-exported explicitly: the original file was one flat namespace, so private
+# helpers (leading underscore) must cross module boundaries too.
+__all__ = [
+    'Agent',
+]
