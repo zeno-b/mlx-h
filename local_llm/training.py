@@ -31,6 +31,7 @@ from .database import *  # noqa: F401,F403
 from .model_server import *  # noqa: F401,F403
 from .websearch import *  # noqa: F401,F403
 from .sysutil import *  # noqa: F401,F403
+from .train_methods import *  # noqa: F401,F403
 
 
 # mlx-lm prints one of these per evaluation point. The first is measured before
@@ -128,6 +129,11 @@ class RetrainManager:
         # Breakdown of the last export, so run() can gate on the human-approved
         # count rather than on the padded total.
         self.last_export: dict = {}
+        # mlx_lm_lora --help, probed on first use only: a process that never
+        # trains a preference method never spawns that interpreter.
+        self._pref_help: str | None = None
+        # The autopilot plan of the run in progress (None outside autopilot runs).
+        self._autopilot: dict | None = None
 
     # ------------------------------------------------------------------ #
     # Adapter lifecycle
@@ -243,7 +249,10 @@ class RetrainManager:
         # layers; mlx-lm reads -1 as "all". LoRA keeps the top-N default.
         add_if_supported(cmd, self._lora_help, ["--num-layers"], str(self.config.train_num_layers))
         add_if_supported(cmd, self._lora_help, ["--learning-rate", "-lr"], self.config.train_lr)
-        add_if_supported(cmd, self._lora_help, ["--grad-checkpoint", "--gradient-checkpoint"])
+        # Always on unless an autopilot plan found the run fits comfortably
+        # without it (it costs speed, not quality).
+        if (self._autopilot or {}).get("grad_checkpoint", True):
+            add_if_supported(cmd, self._lora_help, ["--grad-checkpoint", "--gradient-checkpoint"])
         add_if_supported(cmd, self._lora_help, ["--max-seq-length", "--seq-length", "--max-seq-len"], self.config.train_seq_len)
         # Evaluation and checkpointing on the same cadence: the val-loss gate
         # below needs a checkpoint file for every iteration it scored.
@@ -595,11 +604,19 @@ class RetrainManager:
     # Run
     # ------------------------------------------------------------------ #
     def run(self, trigger: str = "manual") -> None:
+        method = train_method_name(self.config)
+        if method != "sft":
+            # Preference methods (and unknown names) take their own path, which
+            # refuses rather than falling back to SFT.
+            self._run_preference(method, trigger)
+            return
         if not self.lock.acquire(blocking=False):
             return
 
         backup_path: Path | None = None
         promoted = False
+        shared_config = self.config
+        autopilot: dict | None = None
         try:
             self.status = {"running": True, "message": f"Retraining started from {trigger}"}
             cfg = self.config
@@ -616,6 +633,23 @@ class RetrainManager:
                     "(iterations, learning rate, sequence length) would be ignored. "
                     "Install or repair mlx-lm and try again."}
                 return
+
+            if cfg.train_autopilot:
+                # The plan replaces the recipe for THIS run only: a per-run copy,
+                # so the shared config (and what the Settings panel shows) keeps
+                # the values the admin set.
+                autopilot = self.autopilot_plan("sft")
+                if autopilot.get("fits") is False:
+                    self.status = {"running": False, "message":
+                                   f"Autopilot refused the run. {autopilot['reason']}"}
+                    return
+                if not autopilot.get("estimated"):
+                    log(f"Autopilot: {autopilot['reason']}", logging.WARNING)
+                overrides = autopilot_overrides(autopilot)
+                if overrides:
+                    self.config = cfg = dataclass_replace_safe(cfg, **overrides)
+                self._autopilot = autopilot
+                log(f"Autopilot: {autopilot['reason']}")
 
             count, exported_ids = self.export_feedback()
             stats = self.last_export
@@ -733,6 +767,8 @@ class RetrainManager:
                 "val_loss_baseline": baseline,
                 "val_loss_final": final,
                 "promoted_iteration": best[0] if best else plan["iters"],
+                "method": "sft",
+                "autopilot": autopilot,
             })
             promoted = True
             # Only now: a run that was rolled back must leave its rows untrained
@@ -760,6 +796,227 @@ class RetrainManager:
             except Exception as restart_exc:
                 self.status["message"] += f" Restart error: {restart_exc}"
         finally:
+            self.config = shared_config
+            self._autopilot = None
+            self.lock.release()
+
+    # ------------------------------------------------------------------ #
+    # Training methods and autopilot (train_methods.py)
+    # ------------------------------------------------------------------ #
+    def preference_help(self, refresh: bool = False) -> str:
+        """`mlx_lm_lora.train --help`, cached; "" when mlx-lm-lora is absent."""
+        if self._pref_help is None or (refresh and not self._pref_help):
+            self._pref_help = preference_trainer_help()
+        return self._pref_help
+
+    def method_catalog(self) -> list[dict]:
+        return describe_train_methods(self.config, self._lora_help, self.preference_help())
+
+    def autopilot_plan(self, method: str | None = None) -> dict:
+        """The autopilot's plan for `method` on this machine and corpus (read-only)."""
+        cfg = self.config
+        method = method or train_method_name(cfg)
+        meta = model_train_meta(cfg.model)
+        stats = corpus_token_stats(self.db, cfg, method)
+        helps = [self._lora_help, self._pref_help or ""]
+        plan = plan_autopilot(TOTAL_RAM_GB, meta, stats, method=method, config=cfg,
+                              help_texts=helps)
+        if method != "sft":
+            plan["trainer_problem"] = preference_trainer_problem(method, self.preference_help())
+        return plan
+
+    def _preference_dir(self, method: str) -> Path:
+        # Beside data/sft, resolved through this module's SFT_DIR so a test
+        # sandbox that redirects SFT_DIR redirects this too.
+        return SFT_DIR.parent / "pref" / method
+
+    def export_method(self, method: str) -> dict:
+        """Write the training set for `method` without training. {"busy": True} mid-run."""
+        if not self.lock.acquire(blocking=False):
+            return {"busy": True}
+        try:
+            if method == "sft":
+                count, ids = self.export_feedback()
+                return {"method": "sft", "format": TRAIN_METHOD_SPECS["sft"].data_format,
+                        "counts": dict(self.last_export), "dir": str(SFT_DIR),
+                        "files": [str(SFT_DIR / n) for n in ("train.jsonl", "valid.jsonl")
+                                  if (SFT_DIR / n).exists()],
+                        "feedback_ids": len(ids)}
+            tools = self.export_tool_traces() if method == "grpo" else None
+            result = export_preferences(self.db, self.config, method,
+                                        out_dir=self._preference_dir(method),
+                                        tool_examples=tools)
+            result["sample"] = (result.get("train") or result.get("valid") or [])[:2]
+            result.pop("train", None)
+            result.pop("valid", None)
+            result["feedback_ids"] = len(result.get("feedback_ids") or [])
+            result["trainer_problem"] = preference_trainer_problem(method, self.preference_help())
+            return result
+        finally:
+            self.lock.release()
+
+    def _run_preference(self, method: str, trigger: str) -> None:
+        """A DPO / ORPO / GRPO run through mlx_lm_lora, with the same adapter
+        lifecycle (backup, rollback, best-checkpoint promotion) as SFT."""
+        if not self.lock.acquire(blocking=False):
+            return
+        backup_path: Path | None = None
+        promoted = False
+        shared_config = self.config
+        autopilot: dict | None = None
+        try:
+            cfg = self.config
+            self.status = {"running": True,
+                           "message": f"{method.upper()} training started from {trigger}"}
+            problem = preference_trainer_problem(method, self.preference_help(refresh=True))
+            spec = TRAIN_METHOD_SPECS.get(method)
+            if problem is None and spec is not None and spec.needs_reference:
+                problem = reference_model_problem(cfg)
+            rewards = None
+            if problem is None and method == "grpo":
+                try:
+                    rewards = parse_grpo_reward_spec(cfg.train_grpo_rewards)
+                except ValueError as exc:
+                    problem = str(exc)
+            if problem is not None:
+                log(f"Retrain refused: {problem}", logging.WARNING)
+                self.status = {"running": False, "message": problem}
+                return
+
+            if cfg.train_autopilot:
+                autopilot = self.autopilot_plan(method)
+                if autopilot.get("fits") is False:
+                    self.status = {"running": False, "message":
+                                   f"Autopilot refused the run. {autopilot['reason']}"}
+                    return
+                overrides = autopilot_overrides(autopilot)
+                if overrides:
+                    self.config = cfg = dataclass_replace_safe(cfg, **overrides)
+                self._autopilot = autopilot
+                log(f"Autopilot: {autopilot['reason']}")
+
+            data_dir = self._preference_dir(method)
+            tools = self.export_tool_traces() if method == "grpo" else None
+            export = export_preferences(self.db, cfg, method, out_dir=data_dir,
+                                        tool_examples=tools)
+            counts = export["counts"]
+            self.last_export = dict(counts)
+            if counts["train"] == 0:
+                extra = (f" {counts['dropped_long']} were over TRAIN_SEQ_LEN."
+                         if counts.get("dropped_long") else "")
+                need = ("an approved answer (or a rated tool trace) per prompt"
+                        if method == "grpo" else
+                        "a pair: an approved correction, or an approved thumbs-up and an "
+                        "approved thumbs-down on the same prompt")
+                self.status = {"running": False, "message":
+                               f"No approved {spec.label} examples to train on; each needs "
+                               f"{need}.{extra}"}
+                return
+            if counts["human"] < cfg.train_min_examples:
+                self.status = {"running": False, "message":
+                               f"Only {counts['human']} approved {spec.label} example(s); need "
+                               f"at least {cfg.train_min_examples} to train safely. Collect "
+                               f"more feedback (or lower TRAIN_MIN_EXAMPLES)."}
+                return
+
+            plan = self.plan(counts["train"])
+            reward_file = (write_grpo_reward_file(data_dir / "grpo_rewards.py", rewards)
+                           if method == "grpo" else None)
+            config_path = write_preference_config(data_dir / "trainer_config.yaml", cfg)
+            gc = (self._autopilot or {}).get("grad_checkpoint", True)
+            cmd = build_preference_cmd(cfg, method, self.preference_help(), plan,
+                                       data_dir=data_dir, adapter_dir=ADAPTER_DIR,
+                                       config_path=config_path, reward_file=reward_file,
+                                       rewards=rewards, grad_checkpoint=gc)
+
+            backup_path = self._backup_adapter()
+            clear_adapter_checkpoints(ADAPTER_DIR)
+            self.status["message"] = (f"Exported {counts['examples']} {spec.label} examples; "
+                                      f"{plan['iters']} iterations. Stopping model server.")
+            self.model_manager.stop()
+            self.status["message"] = (f"Training {spec.label} adapter ({plan['iters']} "
+                                      f"iterations over {counts['train']} examples)...")
+
+            train_log = LOG_DIR / "train.log"
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(train_log, "a", encoding="utf-8") as lf:
+                lf.write(f"\n\n{datetime.now(timezone.utc).isoformat()} Training command "
+                         f"({method}):\n{' '.join(cmd)}\n")
+                lf.flush()
+                offset = lf.tell()
+                try:
+                    proc = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT,
+                                          timeout=cfg.train_timeout)
+                except subprocess.TimeoutExpired:
+                    raise RuntimeError(
+                        f"Training exceeded TRAIN_TIMEOUT ({cfg.train_timeout:.0f}s) and was "
+                        f"killed. See logs/train.log.") from None
+                if proc.returncode != 0:
+                    raise RuntimeError(f"Training failed with exit code {proc.returncode}. "
+                                       f"See logs/train.log.")
+            with open(train_log, "r", encoding="utf-8", errors="replace") as lf:
+                lf.seek(offset)
+                run_log = lf.read()
+
+            metrics = parse_trainer_metrics(run_log)
+            best = (self._promote_best(metrics["val_losses"])
+                    if spec.metric == "val_loss" else None)
+            verdict = gate_preference_run(method, metrics, cfg, best)
+            if not verdict["ok"]:
+                raise RuntimeError(verdict["message"])
+            if verdict["ungated"]:
+                log(verdict["message"], logging.WARNING)
+
+            clear_adapter_checkpoints(ADAPTER_DIR)
+            write_adapter_base(ADAPTER_DIR, cfg.model)
+            write_adapter_meta(ADAPTER_DIR, {
+                "trained_at": datetime.now(timezone.utc).isoformat(),
+                "trigger": trigger,
+                "model": cfg.model,
+                "method": method,
+                "trainer": spec.trainer_module,
+                "system_prompt_sha": hashlib.sha256(
+                    cfg.training_system_prompt.encode("utf-8")).hexdigest()[:16],
+                "counts": counts,
+                "plan": plan,
+                "autopilot": autopilot,
+                "learning_rate": cfg.train_lr,
+                "seq_len": cfg.train_seq_len,
+                "fine_tune_type": cfg.train_fine_tune_type,
+                "num_layers": cfg.train_num_layers,
+                "lora": {"rank": cfg.train_lora_rank, "scale": cfg.train_lora_scale,
+                         "dropout": cfg.train_lora_dropout},
+                "beta": cfg.train_beta,
+                "reference": (cfg.train_reference_adapter or "base model")
+                             if spec.needs_reference else None,
+                "rewards": rewards,
+                "gate": verdict,
+                "val_loss_baseline": verdict["baseline"],
+                "val_loss_final": verdict["final"],
+                "val_accuracy_final": (metrics["val_accuracy"][-1][1]
+                                       if metrics["val_accuracy"] else None),
+                "promoted_iteration": best[0] if best else plan["iters"],
+            })
+            promoted = True
+            self.db.mark_trained(export["feedback_ids"])
+
+            self.status["message"] = "Training complete. Restarting model server."
+            self.model_manager.restart()
+            self.status = {"running": False, "message":
+                           f"{spec.label} retraining complete on {counts['examples']} examples. "
+                           f"{verdict['message']}"}
+        except Exception as exc:
+            log(f"Retrain ({method}) failed: {exc}", logging.ERROR)
+            if not promoted:
+                self._rollback_adapter(backup_path)
+            self.status = {"running": False, "message": f"Retrain error: {exc}"}
+            try:
+                self.model_manager.start()
+            except Exception as restart_exc:
+                self.status["message"] += f" Restart error: {restart_exc}"
+        finally:
+            self.config = shared_config
+            self._autopilot = None
             self.lock.release()
 
 

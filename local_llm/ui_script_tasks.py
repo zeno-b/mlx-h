@@ -11,12 +11,15 @@ UI_JS_TASKS = r"""   // --------------------------------------------------------
 
    function toggleTaskForm() {
      var form = document.getElementById("taskForm");
-     form.style.display = form.style.display === "none" ? "block" : "none";
+     var open = form.classList.toggle("hidden") === false;
+     if (open) document.getElementById("tfName").focus();
    }
 
    function statusPill(status) {
      var pill = document.createElement("span");
-     pill.className = "pill " + (status || "");
+     // Run statuses -> the kit's pill modifiers (one colour language app-wide).
+     var map = { completed: "ok", ok: "ok", failed: "error", error: "error" };
+     pill.className = "pill " + (status ? (map[status] || status) : "muted");
      pill.textContent = status || "never run";
      return pill;
    }
@@ -33,9 +36,14 @@ UI_JS_TASKS = r"""   // --------------------------------------------------------
      return Math.round(seconds / 86400) + "d ago";
    }
 
+   // Prompt tokens per agent step, as a bar per step. Growth across steps is
+   // the thing to notice, so a step that grew more than 15% is classed
+   // `growing`. Colours come from the stylesheet (chart tokens), never from
+   // hex values here, so the chart follows light/dark like everything else.
    function renderPrefillCurve(steps) {
      var box = document.getElementById("prefillCurve");
-     box.innerHTML = "";
+     if (!box) return;
+     box.textContent = "";
      if (!steps || steps.length < 2) return;
 
      var values = steps.map(function(s) { return s.prompt_tokens || 0; });
@@ -43,47 +51,29 @@ UI_JS_TASKS = r"""   // --------------------------------------------------------
      var total = values.reduce(function(a, b) { return a + b; }, 0);
 
      var title = document.createElement("div");
-     title.style.fontSize = "11px";
-     title.style.opacity = "0.75";
-     title.style.marginBottom = "4px";
-     title.textContent = "prompt tokens per step (" + total + " total prefill)";
+     title.className = "curve-title hint";
+     title.textContent = "Prompt tokens per step (" + total + " total prefill)";
      box.appendChild(title);
 
      steps.forEach(function(s, i) {
        var row = document.createElement("div");
-       row.style.display = "flex";
-       row.style.alignItems = "center";
-       row.style.gap = "6px";
-       row.style.fontSize = "11px";
-       row.style.lineHeight = "1.5";
-
+       row.className = "curve-row";
        var label = document.createElement("span");
-       label.style.opacity = "0.6";
-       label.style.minWidth = "18px";
-       label.textContent = "s" + (s.step === null ? i + 1 : s.step);
-
+       label.className = "curve-label muted mono";
+       label.textContent = "s" + (s.step === null || s.step === undefined ? i + 1 : s.step);
        var track = document.createElement("span");
-       track.style.flex = "1";
-       track.style.height = "9px";
-       track.style.borderRadius = "3px";
-       track.style.background = "rgba(127,127,127,0.18)";
-       track.style.overflow = "hidden";
-
+       track.className = "curve-track";
        var fill = document.createElement("span");
-       fill.style.display = "block";
-       fill.style.height = "100%";
-       fill.style.width = Math.round(((s.prompt_tokens || 0) / peak) * 100) + "%";
-       // Growth across steps is the thing to notice, so colour by it.
        var growing = i > 0 && (s.prompt_tokens || 0) > values[i - 1] * 1.15;
-       fill.style.background = growing ? "#c2703a" : "#5a8f6f";
+       fill.className = "curve-fill" + (growing ? " growing" : "");
+       // The bar length is data, the one value a class cannot carry.
+       var pct = Math.round(((s.prompt_tokens || 0) / peak) * 100);
+       fill.style.width = pct + "%";
+       fill.style.setProperty("--fill", pct + "%");
        track.appendChild(fill);
-
        var value = document.createElement("span");
-       value.style.opacity = "0.7";
-       value.style.minWidth = "40px";
-       value.style.textAlign = "right";
+       value.className = "curve-value muted mono";
        value.textContent = String(s.prompt_tokens || 0);
-
        row.appendChild(label);
        row.appendChild(track);
        row.appendChild(value);
@@ -91,22 +81,22 @@ UI_JS_TASKS = r"""   // --------------------------------------------------------
      });
 
      var verdict = document.createElement("div");
-     verdict.style.fontSize = "11px";
-     verdict.style.marginTop = "5px";
      var growth = values[values.length - 1] / (values[0] || 1);
      if (growth > 1.5) {
-       verdict.style.color = "#c2703a";
+       verdict.className = "curve-verdict hint warn";
        verdict.textContent = "Prompt grew " + growth.toFixed(1) +
          "x across the run. Shrink tool results or the tool list.";
      } else {
-       verdict.style.opacity = "0.7";
+       verdict.className = "curve-verdict hint";
        verdict.textContent = "Prompt stayed flat across steps.";
      }
      box.appendChild(verdict);
    }
 
    async function loadRunCurve(convId) {
-     if (!convId) return;
+     // The chart lives in Settings > Performance; skip the request when that
+     // markup is not on the page.
+     if (!convId || !document.getElementById("prefillCurve")) return;
      try {
        var out = await fetchJSON("/api/metrics/run/" + encodeURIComponent(convId));
        renderPrefillCurve(out.data.steps || []);
@@ -117,6 +107,7 @@ UI_JS_TASKS = r"""   // --------------------------------------------------------
 
    async function loadPerf() {
      var box = document.getElementById("perfStats");
+     if (!box) return;
      try {
        var out = await fetchJSON("/api/metrics/summary");
        var chat = out.data.chat || {};
@@ -150,21 +141,26 @@ UI_JS_TASKS = r"""   // --------------------------------------------------------
 
    function renderTasks(items) {
      var host = document.getElementById("taskCards");
-     host.innerHTML = "";
+     host.textContent = "";
      if (!items.length) {
-       host.textContent = "No tasks yet.";
+       var empty = document.createElement("div");
+       empty.className = "empty";
+       empty.textContent = "No tasks yet. Create one to have the agent run a goal on demand or on a timer.";
+       host.appendChild(empty);
        return;
      }
      items.forEach(function(task) {
        var card = document.createElement("div");
-       card.className = "card" + (selectedTask === task.id ? " selected" : "");
+       card.className = "card task-card" + (selectedTask === task.id ? " selected" : "");
        card.onclick = function(e) {
          if (e.target.tagName === "BUTTON") return;
          selectTask(task.id);
        };
 
-       var head = document.createElement("h4");
-       var title = document.createElement("span");
+       var head = document.createElement("div");
+       head.className = "card-header row";
+       var title = document.createElement("strong");
+       title.className = "grow";
        title.textContent = task.name;
        head.appendChild(title);
        head.appendChild(statusPill(task.live ? "running" : task.last_status));
@@ -176,7 +172,7 @@ UI_JS_TASKS = r"""   // --------------------------------------------------------
        card.appendChild(goal);
 
        var meta = document.createElement("div");
-       meta.className = "meta";
+       meta.className = "meta hint";
        var parts = [];
        parts.push(task.enabled ? "enabled" : "disabled");
        parts.push(task.interval_seconds > 0 ? "every " + task.interval_seconds + "s" : "manual");
@@ -198,18 +194,15 @@ UI_JS_TASKS = r"""   // --------------------------------------------------------
        actions.appendChild(taskButton(task.enabled ? "Disable" : "Enable", function() {
          updateTask(task.id, { enabled: !task.enabled });
        }));
-       actions.appendChild(taskButton("Delete", function() { deleteTask(task.id, task.name); }));
+       actions.appendChild(taskButton("Delete", function() { deleteTask(task.id, task.name); }, "btn-danger"));
        card.appendChild(actions);
 
        host.appendChild(card);
      });
    }
 
-   function taskButton(label, handler) {
-     var button = document.createElement("button");
-     button.textContent = label;
-     button.onclick = handler;
-     return button;
+   function taskButton(label, handler, extra) {
+     return makeBtn(label, "", handler, extra);
    }
 
    async function createTask() {
@@ -224,7 +217,7 @@ UI_JS_TASKS = r"""   // --------------------------------------------------------
        enabled: true
      };
      if (!body.name || !body.goal) {
-       alert("A task needs a name and a goal.");
+       uiToast("A task needs a name and a goal.", "warn");
        return;
      }
      try {
@@ -239,7 +232,7 @@ UI_JS_TASKS = r"""   // --------------------------------------------------------
        selectTask(out.data.task.id);
        loadTasks();
      } catch (err) {
-       alert("Could not create the task: " + err.message);
+       uiToast("Could not create the task: " + err.message, "error");
      }
    }
 
@@ -252,24 +245,24 @@ UI_JS_TASKS = r"""   // --------------------------------------------------------
        });
        loadTasks();
      } catch (err) {
-       alert("Could not update the task: " + err.message);
+       uiToast("Could not update the task: " + err.message, "error");
      }
    }
 
    async function deleteTask(taskId, name) {
-     if (!window.confirm("Delete " + name + " and its run history?")) return;
+     if (!(await uiConfirm("Delete " + name + " and its run history?"))) return;
      try {
        await fetchJSON("/api/tasks/" + taskId, { method: "DELETE" });
        if (selectedTask === taskId) {
          selectedTask = null;
          closeRun();
-         document.getElementById("runControls").style.display = "none";
+         document.getElementById("runControls").classList.add("hidden");
          document.getElementById("monitorHeader").textContent = "Select a task to watch its runs.";
-         document.getElementById("runFeed").innerHTML = "";
+         document.getElementById("runFeed").textContent = "";
        }
        loadTasks();
      } catch (err) {
-       alert("Could not delete the task: " + err.message);
+       uiToast("Could not delete the task: " + err.message, "error");
      }
    }
 
@@ -277,7 +270,7 @@ UI_JS_TASKS = r"""   // --------------------------------------------------------
      try {
        var out = await fetchJSON("/api/tasks/" + taskId + "/run", { method: "POST" });
        if (out.data.error) {
-         alert(out.data.error);
+         uiToast(out.data.error, "error");
          return;
        }
        selectedTask = taskId;
@@ -285,7 +278,7 @@ UI_JS_TASKS = r"""   // --------------------------------------------------------
        openRun(out.data.run_id);
        loadTasks();
      } catch (err) {
-       alert("Could not start the run: " + err.message);
+       uiToast("Could not start the run: " + err.message, "error");
      }
    }
 
@@ -294,7 +287,7 @@ UI_JS_TASKS = r"""   // --------------------------------------------------------
        await fetchJSON("/api/tasks/" + taskId + "/cancel", { method: "POST" });
        loadTasks();
      } catch (err) {
-       alert("Could not cancel: " + err.message);
+       uiToast("Could not cancel: " + err.message, "error");
      }
    }
 
@@ -303,18 +296,18 @@ UI_JS_TASKS = r"""   // --------------------------------------------------------
 
    async function selectTask(taskId) {
      selectedTask = taskId;
-     document.getElementById("runControls").style.display = "block";
+     document.getElementById("runControls").classList.remove("hidden");
      try {
        var out = await fetchJSON("/api/tasks/" + taskId);
        var task = out.data.task;
        document.getElementById("monitorHeader").textContent =
-         task.name + " -- " + task.goal;
+         task.name + ": " + task.goal;
        renderRunPicker(out.data.runs || []);
        if (out.data.runs && out.data.runs.length) {
          openRun(out.data.runs[0].id);
        } else {
          closeRun();
-         document.getElementById("runFeed").innerHTML = "";
+         document.getElementById("runFeed").textContent = "";
        }
        loadTasks();
      } catch (err) {
@@ -333,7 +326,7 @@ UI_JS_TASKS = r"""   // --------------------------------------------------------
 
    function renderRunPicker(runs) {
      var picker = document.getElementById("runPicker");
-     picker.innerHTML = "";
+     picker.textContent = "";
      runs.forEach(function(run) {
        var option = document.createElement("option");
        option.value = run.id;
@@ -366,7 +359,7 @@ UI_JS_TASKS = r"""   // --------------------------------------------------------
      currentRunId = runId;
      document.getElementById("runPicker").value = runId;
      var feed = document.getElementById("runFeed");
-     feed.innerHTML = "";
+     feed.textContent = "";
      var partial = null;
      var currentCard = null;
 

@@ -44,6 +44,35 @@ from .websearch import *  # noqa: F401,F403
 from .auth import *  # noqa: F401,F403
 from .cluster import *  # noqa: F401,F403
 from .claude_import import *  # noqa: F401,F403
+from .appctx import *  # noqa: F401,F403
+from .prefs import *  # noqa: F401,F403
+from .admission import *  # noqa: F401,F403
+from .backends import *  # noqa: F401,F403
+from .nodesec import *  # noqa: F401,F403
+from .remote_access import *  # noqa: F401,F403
+from .sharding import *  # noqa: F401,F403
+from .train_methods import *  # noqa: F401,F403
+from .catalog import *  # noqa: F401,F403
+from .diagnostics import *  # noqa: F401,F403
+from .streams import *  # noqa: F401,F403
+# The chat routes build and bind a TurnContext per turn (star imports are not
+# transitive, so streams importing turnctx does not put it here).
+from .turnctx import *  # noqa: F401,F403
+from .policy import *  # noqa: F401,F403
+from .workspaces import *  # noqa: F401,F403
+from .openai_compat import *  # noqa: F401,F403
+from .anthropic_compat import *  # noqa: F401,F403
+from .api_tokens import *  # noqa: F401,F403
+from .wire import *  # noqa: F401,F403
+# Multimodal input: the mlx-vlm engine (registers a backend), uploads, speech.
+from .vision import *  # noqa: F401,F403
+from .attachments import *  # noqa: F401,F403
+from .audio import *  # noqa: F401,F403
+from .mcp_server import *  # noqa: F401,F403
+from .tools_extra import *  # noqa: F401,F403
+# Settings > Tools > Catalogue: per-tool capability, risk, source and grants.
+from .tool_catalog import *  # noqa: F401,F403
+# ---- extension imports: one `from .<feature> import *` per feature, above this line ---- #
 
 # Request/Response must be resolvable at MODULE scope: with `from __future__
 # import annotations` every endpoint annotation is a string that FastAPI resolves
@@ -81,6 +110,16 @@ def _define_api_models() -> None:
         max_tokens: int | None = Field(None, ge=16, le=32768)
         temperature: float | None = Field(None, ge=0.0, le=2.0)
         use_history: bool = True
+        # Optional per-turn choices (all absent = today's turn). agent_id runs
+        # the turn as a saved agent profile; project_id confines it to one of
+        # the caller's workspaces; attachments are uploaded ids whose content
+        # becomes part of the user message; model must name the served model
+        # or a configured route target (anything else is a 400, never a
+        # silent fallback to a different model than the one asked for).
+        agent_id: str | None = Field(None, max_length=64)
+        project_id: str | None = Field(None, max_length=128)
+        attachments: list[str] | None = Field(None, max_length=16)
+        model: str | None = Field(None, max_length=200)
 
     class FeedbackRequest(BaseModel):  # noqa: F811
         user_prompt: str = Field(..., min_length=1)
@@ -213,7 +252,13 @@ def create_app(
     router = ClusterRouter(config, node_registry, db)
     health_monitor = HealthMonitor(
         config, node_registry,
-        local_status=lambda: {"status": model_manager.status, "model": config.model})
+        local_status=lambda: {"status": model_manager.status, "model": config.model,
+                              # Cheap read (no memory probe): the router can
+                              # weigh a node's queue, not just up/down.
+                              "queue": generation_gate.snapshot(probe=False),
+                              # Cluster routing / shard planning inputs.
+                              "free_ram_gb": node_free_ram_gb(),
+                              "backend": node_backend_name(config)})
 
     registry = registry or ToolRegistry(config, db)
     model_client = ModelClient(config, cluster=router)
@@ -259,8 +304,21 @@ def create_app(
     # unlimited number of simultaneous chats is an out-of-memory kill waiting to
     # happen on an 8GB Mac; past the bounded queue callers get an honest 503
     # instead of a request that eventually times out.
-    generation_gate = GenerationGate(config.max_concurrent_generations,
-                                     config.generation_queue_depth)
+    #
+    # AdmissionController (admission.py) keeps that slot rule and adds the
+    # memory half: each request reserves its KV cost (prompt + reply budget x
+    # the model's bytes per token, read from its config.json) and waits while
+    # starting it would leave less than admission_min_free_mb free. The
+    # estimate follows the LIVE config, so a model switch or KV_BITS change
+    # resizes reservations without rebuilding the controller.
+    generation_gate = AdmissionController(
+        config.max_concurrent_generations, config.generation_queue_depth,
+        kv_bytes_per_token=lambda: estimate_kv_bytes_per_token(config.model, config.kv_bits),
+        min_free_mb=config.admission_min_free_mb,
+        memory_aware=config.admission_memory_aware)
+    # Scheduled runs share the same budget: a 3am task is one more KV cache in
+    # the same memory as whatever chat is running next to it.
+    tasks.gate = generation_gate
 
     # Failed-login timestamps, keyed twice per attempt: "<ip>|<username>" stops
     # guessing one account's password, and "<ip>|" stops a spray across many
@@ -354,7 +412,13 @@ def create_app(
         allow_origins=_origins,
         allow_credentials=True,
         allow_methods=["GET", "POST", "DELETE"],
-        allow_headers=["Content-Type", "Authorization", "X-Correlation-ID"],
+        # x-api-key / anthropic-version: the Anthropic SDK's credential and
+        # version headers (/v1/messages); Mcp-Session-Id / MCP-Protocol-Version:
+        # the MCP server's session handshake. Origins stay the explicit list.
+        allow_headers=["Content-Type", "Authorization", "X-Correlation-ID",
+                       "x-api-key", "anthropic-version", "Mcp-Session-Id",
+                       "MCP-Protocol-Version"],
+        expose_headers=["Mcp-Session-Id"],
     )
 
     # The UI is embedded in this file, so a cached copy silently defeats every
@@ -387,7 +451,7 @@ def create_app(
                       method=request.method, route=request.url.path, status=500,
                       duration_ms=round((time.time() - started) * 1000, 1),
                       client=(request.client.host if request.client else None),
-                      correlation_id=cid)
+                      correlation_id=cid, user_id=dash_request_user_id(request))
             clear_context()
             raise
         response.headers["X-Correlation-ID"] = cid
@@ -404,12 +468,15 @@ def create_app(
             level = logging.DEBUG
         else:
             level = logging.INFO
+        # The auth dependency binds user_id into a CHILD context that never
+        # flows back out to this middleware, so the record used to carry the
+        # route but not who called it; request.state is shared by reference.
         log_event(_req_log, level, "http.request",
                   method=request.method, route=path,
                   status=response.status_code,
                   duration_ms=round((time.time() - started) * 1000, 1),
                   client=(request.client.host if request.client else None),
-                  correlation_id=cid)
+                  correlation_id=cid, user_id=dash_request_user_id(request))
         clear_context()
         return response
 
@@ -442,7 +509,9 @@ def create_app(
         # the server far more than it costs the attacker. A success clears both
         # counters for that client, so a legitimate user who mistypes and then
         # gets it right is never left locked out.
-        client_ip = request.client.host if request.client else "?"
+        # Behind a TRUSTED_PROXIES proxy every socket peer is the proxy, which
+        # would throttle all users as one; client_ip_for reads the real client.
+        client_ip = client_ip_for(request, config)
         user_key, ip_key = f"{client_ip}|{username.lower()}", f"{client_ip}|"
         ip_limit = LOGIN_MAX_FAILURES * 3
         now = time.time()
@@ -499,7 +568,7 @@ def create_app(
         if not auth.oidc_enabled:
             return JSONResponse({"error": "OIDC/Entra is not configured"}, status_code=400)
         redirect_uri = (config.oidc_redirect_uri
-                        or f"{request.url.scheme}://{request.url.netloc}/api/auth/oidc/callback")
+                        or public_url_for(request, config, "/api/auth/oidc/callback"))
         try:
             url = auth.oidc_authorize_url(redirect_uri)
         except Exception as exc:
@@ -514,9 +583,14 @@ def create_app(
             return HTMLResponse(f"<p>Login failed: {html.escape(error or 'no code')}. "
                                 "<a href='/'>Back</a></p>", status_code=400)
         redirect_uri = (config.oidc_redirect_uri
-                        or f"{request.url.scheme}://{request.url.netloc}/api/auth/oidc/callback")
+                        or public_url_for(request, config, "/api/auth/oidc/callback"))
         try:
             user = await asyncio.to_thread(auth.oidc_exchange, code, state, redirect_uri)
+            if user.get("disabled"):
+                log_event(get_logger("auth"), logging.WARNING, "auth.oidc_disabled",
+                          user_id=user["id"])
+                return HTMLResponse("<p>Login failed: this account is disabled. "
+                                    "<a href='/'>Back</a></p>", status_code=403)
             token = auth.create_session(user, request)
             resp = RedirectResponse("/", status_code=303)
             auth.set_cookie(resp, token)
@@ -572,6 +646,7 @@ def create_app(
         user = db.update_user(user_id, **updates)
         if updates.get("disabled") or updates.get("role") == "user" or updates.get("password_hash"):
             db.delete_user_sessions(user_id)  # force re-login on privilege change
+            revoke_user_tokens(db, user_id, reason="user disabled, demoted or password reset")
         return {"user": _safe_user(user)}
 
     @app.delete("/api/users/{user_id}")
@@ -700,8 +775,13 @@ def create_app(
                 # agents is exactly the request that would otherwise start N
                 # generations at once, and waiting for a slot counts against the
                 # agent's own budget rather than being free.
+                cost = admission_cost_tokens(
+                    [{"role": "system", "content": getattr(_cfg, "system_prompt", "") or ""},
+                     {"role": "user", "content": prompt}],
+                    config.max_tokens, config.context_size)
+
                 async def gated():
-                    async with generation_gate.slot():
+                    async with generation_gate.slot(cost_tokens=cost):
                         return await drive()
 
                 answer, used = await asyncio.wait_for(
@@ -820,63 +900,186 @@ def create_app(
         # peer node to probe this one, and leaks model/load telemetry otherwise.
         if not config.node_token or not auth.check_node_token(request):
             return JSONResponse({"error": "node token required"}, status_code=401)
+        proto = {NODE_PROTOCOL_HEADER: str(NODE_PROTOCOL)}
+        _unused, seal, refused = node_server_open(config, "GET", "/api/node/health",
+                                                  request.headers)
+        if refused:
+            return JSONResponse({"error": refused[1]}, status_code=refused[0], headers=proto)
         cpu, mem = sample_local_load()
-        return {"state": model_manager.status, "model_status": model_manager.status,
+        machine = detect_machine()
+        info = {"state": model_manager.status, "model_status": model_manager.status,
                 "model": config.model, "cpu_pct": cpu, "mem_pct": mem,
                 "node": config.node_name or config.node_role,
-                "active": node_registry.local_node().active}
+                "active": node_registry.local_node().active,
+                # Protocol 2: what the primary needs to route by real capacity
+                # (capabilities follow ram_gb) and to plan layer sharding.
+                "protocol": NODE_PROTOCOL, "ram_gb": machine["ram_gb"],
+                "free_ram_gb": node_free_ram_gb(), "machine": machine["model"],
+                "cores": machine["cores"], "load_ratio": sample_load_ratio(),
+                "backend": node_backend_name(config), "queue": generation_gate.waiting,
+                "shard_capable": node_shard_capable()}
+        if seal is not None:
+            return JSONResponse(seal.json(info), headers=seal.headers())
+        return JSONResponse(info, headers=proto)
 
     @app.post("/api/node/generate")
     async def node_generate(body: dict, request: Request):
         if not config.node_token or not auth.check_node_token(request):
             return JSONResponse({"error": "node token required"}, status_code=401)
+        import httpx
+        from starlette.background import BackgroundTask
+        proto = {NODE_PROTOCOL_HEADER: str(NODE_PROTOCOL)}
+        body, seal, refused = node_server_open(config, "POST", "/api/node/generate",
+                                               request.headers, body)
+        if refused:
+            return JSONResponse({"error": refused[1]}, status_code=refused[0], headers=proto)
         # Validate the peer-supplied body (400 on bad shape, not a leaky 500).
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "body must be a JSON object"}, status_code=400,
+                                headers=proto)
         messages = body.get("messages") or []
         if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
-            return JSONResponse({"error": "messages must be a list of objects"}, status_code=400)
+            return JSONResponse({"error": "messages must be a list of objects"}, status_code=400,
+                                headers=proto)
         try:
             max_tokens = int(body.get("max_tokens") or config.max_tokens)
             temperature = float(body.get("temperature", config.temperature))
         except (TypeError, ValueError):
-            return JSONResponse({"error": "max_tokens/temperature must be numeric"}, status_code=400)
+            return JSONResponse({"error": "max_tokens/temperature must be numeric"},
+                                status_code=400, headers=proto)
         # The local model must be up to serve a peer.
         blocked = not_ready()
         if blocked is not None:
             return blocked
+        # A peer's generation is a KV cache in THIS machine's memory like any
+        # local chat, so it waits in the same admission queue (it used to
+        # bypass it, and a busy primary could stack generations on a node
+        # that was already full). Busy is an honest 503 the primary records.
+        try:
+            ticket = await generation_gate.acquire(cost_tokens=admission_cost_tokens(
+                messages, max_tokens, config.context_size))
+        except GenerationBusy as exc:
+            return JSONResponse({"error": str(exc)}, status_code=503,
+                                headers={**proto, "Retry-After": "5"})
         made = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
+        local_url = node_worker_client._local_chat_url()
+        started = time.time()
+        # Fields of the local server's delta/message forwarded to the caller:
+        # reasoning used to be dropped because the old path re-streamed only
+        # content through ModelClient.
+        forward = ("content", "reasoning", "reasoning_content", "tool_calls")
         if body.get("stream"):
+            payload = node_worker_client.payload(messages, True, max_tokens, temperature)
+
+            def emit(obj) -> str:
+                text = obj if isinstance(obj, str) else json.dumps(obj)
+                return seal.frame(text) if seal is not None else f"data: {text}\n\n"
+
+            def chunk(delta, finish=None, usage=None) -> str:
+                out = {"id": made, "object": "chat.completion.chunk", "created": created,
+                       "model": config.model,
+                       "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+                if usage:
+                    out["usage"] = usage
+                return emit(out)
+
             async def gen():
-                def chunk(delta, finish=None, usage=None):
-                    payload = {"id": made, "object": "chat.completion.chunk",
-                               "created": created, "model": config.model,
-                               "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
-                    if usage:
-                        payload["usage"] = usage
-                    return f"data: {json.dumps(payload)}\n\n"
-                yield chunk({"role": "assistant", "content": ""})
-                stats = GenerationStats()
+                finish_reason, usage, text_len, first_at = "", None, 0, None
                 try:
-                    async for tok in node_worker_client.stream(messages, max_tokens, temperature, stats):
-                        yield chunk({"content": tok})
+                    yield chunk({"role": "assistant", "content": ""})
+                    timeout = httpx.Timeout(config.stall_timeout, connect=15.0, pool=15.0)
+                    async with ModelClient._client().stream(
+                            "POST", local_url, json=payload, timeout=timeout) as resp:
+                        if resp.status_code != 200:
+                            text = (await resp.aread()).decode("utf-8", "replace")
+                            raise RuntimeError(f"local model server returned "
+                                               f"{resp.status_code}: {text[:300]}")
+                        async for line in resp.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            raw = line[6:].strip()
+                            if raw == "[DONE]":
+                                break
+                            try:
+                                data = json.loads(raw)
+                            except ValueError:
+                                continue
+                            if data.get("usage"):
+                                usage = data["usage"]
+                            choices = data.get("choices") or []
+                            if not choices:
+                                continue
+                            first = choices[0] or {}
+                            if first.get("finish_reason"):
+                                finish_reason = str(first["finish_reason"])
+                            delta = {k: v for k, v in (first.get("delta") or {}).items()
+                                     if k in forward and v}
+                            if delta:
+                                if first_at is None:
+                                    first_at = time.time()
+                                text_len += len(str(delta.get("content") or ""))
+                                yield chunk(delta)
+                    if not usage:
+                        est = node_worker_client._stats_from_usage(
+                            None, messages, "x" * text_len, started, first_at)
+                        usage = {"prompt_tokens": est.prompt_tokens,
+                                 "completion_tokens": est.completion_tokens}
+                    yield chunk({}, finish=finish_reason or "stop", usage=usage)
+                    yield emit("[DONE]")
                 except Exception as exc:
-                    yield chunk({"content": f"\n[node error: {type(exc).__name__}]"})
-                yield chunk({}, finish="stop",
-                            usage={"prompt_tokens": stats.prompt_tokens,
-                                   "completion_tokens": stats.completion_tokens})
-                yield "data: [DONE]\n\n"
-            return StreamingResponse(gen(), media_type="text/event-stream")
+                    # An error FRAME, not answer text: the old "[node error: X]"
+                    # content was indistinguishable from what the model said.
+                    log(f"node_generate stream failed: {type(exc).__name__}: {exc}",
+                        logging.WARNING)
+                    yield emit({"error": {"type": "node_error", "message": redact_text(
+                        f"{type(exc).__name__}: {exc}")[:500]}})
+                    yield emit("[DONE]")
+                finally:
+                    generation_gate.release(ticket)
+
+            async def _release_ticket():
+                # Also released here: a client that disconnects before the
+                # generator starts never runs gen()'s finally. Idempotent.
+                generation_gate.release(ticket)
+
+            return StreamingResponse(gen(), media_type="text/event-stream",
+                                     headers=seal.headers() if seal is not None else proto,
+                                     background=BackgroundTask(_release_ticket))
+        payload = node_worker_client.payload(messages, False, max_tokens, temperature)
         try:
-            text, stats = await node_worker_client.complete_with_stats(messages, max_tokens, temperature)
+            timeout = httpx.Timeout(node_worker_client.request_timeout(messages, max_tokens),
+                                    connect=15.0, pool=15.0)
+            resp = await ModelClient._client().post(local_url, json=payload, timeout=timeout)
+            if resp.status_code != 200:
+                raise RuntimeError(f"local model server returned {resp.status_code}: "
+                                   f"{resp.text[:300]}")
+            data = resp.json()
+            first = (data.get("choices") or [{}])[0] or {}
+            message_in = first.get("message") or {}
         except Exception as exc:
             return JSONResponse({"error": redact_text(f"{type(exc).__name__}: {exc}")},
-                                status_code=502)
-        return {"id": made, "object": "chat.completion", "created": created,
-                "model": config.model,
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                             "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": stats.prompt_tokens,
-                          "completion_tokens": stats.completion_tokens}}
+                                status_code=502, headers=proto)
+        finally:
+            generation_gate.release(ticket)
+        message = {"role": "assistant", "content": message_in.get("content") or ""}
+        for key in forward[1:]:
+            if message_in.get(key):
+                message[key] = message_in[key]
+        usage = data.get("usage")
+        if not usage:
+            est = node_worker_client._stats_from_usage(None, messages, message["content"],
+                                                       started, None)
+            usage = {"prompt_tokens": est.prompt_tokens,
+                     "completion_tokens": est.completion_tokens}
+        out = {"id": made, "object": "chat.completion", "created": created,
+               "model": config.model,
+               "choices": [{"index": 0, "message": message,
+                            "finish_reason": first.get("finish_reason") or "stop"}],
+               "usage": usage}
+        if seal is not None:
+            return JSONResponse(seal.json(out), headers=seal.headers())
+        return JSONResponse(out, headers=proto)
 
     # --------------------------------------------- Claude history import -- #
     @app.post("/api/import")
@@ -973,6 +1176,13 @@ def create_app(
             "username": user.get("username"),
             "auth_enabled": config.auth_enabled,
         }
+        # Generation queue. Everyone sees the slot counts (a user staring at a
+        # "queued" chip deserves to know it is 3 of 3 busy, not a hang); the
+        # memory figures are machine telemetry and stay admin-only like the
+        # rest below. On a worker thread: the snapshot may run vm_stat.
+        queue = await asyncio.to_thread(generation_gate.snapshot)
+        payload["queue"] = queue if is_admin else {
+            k: queue.get(k) for k in ("running", "waiting", "limit", "max_waiting")}
         if is_admin:
             payload.update({
                 "web_port": config.web_port,
@@ -1177,9 +1387,22 @@ def create_app(
         contents, never locations), so directory selection has to be served from
         this side. Read-only: names and paths, never file contents.
         """
+        # With workspaces on (or WORKSPACE_ROOTS set) the picker is confined to
+        # the allowed project parents: it is how an admin chooses a shared
+        # project's root, and an unconfined picker would advertise every
+        # directory this server's account can list. Off, it is today's picker.
+        confine = (workspace_allowed_parents(config)
+                   if (config.workspaces_enabled or config.workspace_roots) else None)
         try:
-            base = Path(path).expanduser() if path.strip() else Path.home()
+            if confine:
+                base = Path(path).expanduser() if path.strip() else confine[0]
+            else:
+                base = Path(path).expanduser() if path.strip() else Path.home()
             base = base.resolve()
+            if confine and not any(path_inside(base, parent) for parent in confine):
+                return JSONResponse(
+                    {"error": f"{base} is outside the allowed workspace roots",
+                     "roots": [str(p) for p in confine]}, status_code=403)
             if not base.is_dir():
                 return JSONResponse({"error": f"{base} is not a directory"}, status_code=400)
             entries = []
@@ -1197,12 +1420,16 @@ def create_app(
                     continue
                 if len(entries) >= 300:
                     break
+            parent = str(base.parent) if base.parent != base else None
+            if confine and not any(path_inside(base.parent, p) for p in confine):
+                parent = None
             return {
                 "path": str(base),
-                "parent": str(base.parent) if base.parent != base else None,
-                "home": str(Path.home()),
+                "parent": parent,
+                "home": str(confine[0]) if confine else str(Path.home()),
                 "is_git_repo": (base / ".git").exists(),
                 "entries": entries,
+                "roots": [str(p) for p in confine] if confine else None,
             }
         except PermissionError:
             return JSONResponse({"error": f"no permission to read {path}"}, status_code=403)
@@ -1248,7 +1475,10 @@ def create_app(
                  "indexed": sorted(known)[:20]},
                 status_code=400)
         changed = config.apply({"rag_scope": ",".join(wanted)})
-        return {"scope": config.rag_scope, "changed": changed}
+        # Persist like POST /api/config does: the scope used to reset to the
+        # whole knowledge base on every restart while the panel still showed it.
+        saved = config.save_settings(changed) if changed else []
+        return {"scope": config.rag_scope, "changed": changed, "saved": saved}
 
     @app.get("/api/docs/scope")
     def docs_scope_get(_a: dict = ADMIN):
@@ -1265,105 +1495,11 @@ def create_app(
             return JSONResponse({"error": "nothing to regenerate"}, status_code=400)
         return {"prompt": prompt}
 
-    @app.post("/v1/chat/completions")
-    async def openai_chat_completions(body: dict, user: dict = USER):
-        """OpenAI-compatible endpoint backed by this app's agent.
-
-        Lets external tools (SDKs, editors, other front-ends) drive the full
-        stack — routing, tools, knowledge base, retries — not just the raw model.
-        Supports stream=true (OpenAI-shaped SSE deltas) and non-streaming.
-        """
-        # Validate the client body up front: malformed shape is a 400, not a 500.
-        messages = body.get("messages") or []
-        if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
-            return JSONResponse({"error": {"message": "messages must be a list of objects"}},
-                                status_code=400)
-        try:
-            max_tokens = int(body.get("max_tokens") or config.max_tokens)
-            temperature = float(body.get("temperature", config.temperature))
-        except (TypeError, ValueError):
-            return JSONResponse({"error": {"message": "max_tokens/temperature must be numeric"}},
-                                status_code=400)
-        try:
-            prompt = ""
-            for msg in reversed(messages):
-                if msg.get("role") == "user":
-                    prompt = msg.get("content") or ""
-                    break
-            if not prompt:
-                return JSONResponse({"error": {"message": "no user message provided"}},
-                                    status_code=400)
-            history = [{"role": m.get("role"), "content": m.get("content") or ""}
-                       for m in messages[:-1] if m.get("role") in ("user", "assistant")]
-            cid = f"openai-{uuid.uuid4().hex[:8]}"
-            uid = user["id"]
-
-            # Streaming: emit OpenAI-shaped SSE deltas so editors and SDK clients
-            # that expect stream=True (Continue, Zed, the OpenAI SDK) work.
-            if body.get("stream"):
-                async def sse_stream():
-                    # Re-bind the acting user in the generator's context so RAG
-                    # retrieval and memory tools scope to this caller.
-                    set_acting_user(uid)
-                    made = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-                    created = int(time.time())
-
-                    def chunk(delta: dict, finish=None) -> str:
-                        payload = {
-                            "id": made, "object": "chat.completion.chunk",
-                            "created": created, "model": config.model,
-                            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
-                        }
-                        return f"data: {json.dumps(payload)}\n\n"
-
-                    yield chunk({"role": "assistant", "content": ""})
-                    sent = ""
-                    try:
-                        async for event in agent.run_iterating(prompt, history, cid,
-                                                               max_tokens, temperature):
-                            if event.get("type") == "token":
-                                piece = event.get("token") or ""
-                                if piece:
-                                    sent += piece
-                                    yield chunk({"content": piece})
-                            elif event.get("type") == "final":
-                                full = event.get("answer") or ""
-                                # If the answer never streamed as tokens, send it now.
-                                if full and not sent:
-                                    yield chunk({"content": full})
-                    except Exception as exc:
-                        log(f"openai stream failed: {type(exc).__name__}: {exc}", logging.ERROR)
-                        yield chunk({"content": f"\n[error: {redact_text(str(exc))}]"})
-                    yield chunk({}, finish="stop")
-                    yield "data: [DONE]\n\n"
-
-                return StreamingResponse(sse_stream(), media_type="text/event-stream")
-
-            answer, used = "", []
-            async for event in agent.run_iterating(prompt, history, cid,
-                                                   max_tokens, temperature):
-                if event.get("type") == "final":
-                    answer = event.get("answer") or ""
-                    used = event.get("tools_used") or []
-            return {
-                "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": config.model,
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": answer},
-                    "finish_reason": "stop",
-                }],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-                "x_tools_used": used,
-            }
-        except Exception as exc:
-            log(f"openai_chat_completions failed: {type(exc).__name__}: {exc}", logging.ERROR)
-            return JSONResponse(
-                {"error": {"message": redact_text(f"{type(exc).__name__}: {exc}"),
-                           "type": "internal_error"}},
-                status_code=500)
+    # /v1/chat/completions (and /v1/models, /v1/responses, /v1/messages) live
+    # in openai_compat.py and anthropic_compat.py, registered at the end of this
+    # function. The handler that used to be here ran the agent for every
+    # request; that is now "agent mode", still the default (V1_DEFAULT_MODE),
+    # so a client that never sends a model name gets exactly what it got before.
 
     def _git(args: list[str], limit: int = 60000) -> tuple[bool, str]:
         """Run a read-only git command in the project dir. Returns (ok, output)."""
@@ -1376,8 +1512,25 @@ def create_app(
         except Exception as exc:
             return False, str(exc)
 
+    def _project_scope(project_id: str, user: dict):
+        """Bind a project's root for one request; LookupError/PermissionError
+        when it is missing or not the caller's. No id: the caller's default."""
+        project = resolve_project(db, user, project_id) if project_id else None
+        if project is not None:
+            return workspace_root_bound(_ws_project_root(project))
+        return workspace_root_bound(acting_workspace_root())
+
     @app.get("/api/project/status")
-    def project_status(_a: dict = ADMIN):
+    def project_status(project_id: str = "", _a: dict = ADMIN):
+        """Git state of the admin's root, or of `project_id`'s when given."""
+        try:
+            scope = _project_scope(project_id, _a)
+        except (LookupError, PermissionError):
+            return JSONResponse({"error": "no such project"}, status_code=404)
+        with scope:
+            return _project_status_body()
+
+    def _project_status_body():
         root = str(registry._root())
         is_repo, _ = _git(["rev-parse", "--is-inside-work-tree"])
         branch = ""
@@ -1398,11 +1551,19 @@ def create_app(
         }
 
     @app.get("/api/project/diff")
-    def project_diff(path: str = "", _a: dict = ADMIN):
+    def project_diff(path: str = "", project_id: str = "", _a: dict = ADMIN):
+        try:
+            scope = _project_scope(project_id, _a)
+        except (LookupError, PermissionError):
+            return JSONResponse({"error": "no such project"}, status_code=404)
+        with scope:
+            return _project_diff_body(path, bool(project_id))
+
+    def _project_diff_body(path: str, chosen: bool):
         # Report whether a project is actually configured. Without it the UI
         # cannot tell "your project's diff" from the diff of whatever repo
         # happens to enclose the sandbox workspace (i.e. this app's own source).
-        configured = bool((config.project_dir or "").strip())
+        configured = chosen or bool((config.project_dir or "").strip())
         is_repo, _ = _git(["rev-parse", "--is-inside-work-tree"])
         if not is_repo:
             return {"is_git_repo": False, "diff": "", "project_dir": config.project_dir}
@@ -1414,9 +1575,19 @@ def create_app(
                 "project_dir": config.project_dir}
 
     @app.post("/api/project/revert")
-    def project_revert(_a: dict = ADMIN):
+    def project_revert(project_id: str = "", _a: dict = ADMIN):
         """Undo this session's edits: restore modified tracked files and delete
-        files created this session. Destructive; the UI confirms first."""
+        files created this session. Destructive; the UI confirms first.
+        The session list is per root, so this never touches another root's
+        files with this root's relative paths."""
+        try:
+            scope = _project_scope(project_id, _a)
+        except (LookupError, PermissionError):
+            return JSONResponse({"error": "no such project"}, status_code=404)
+        with scope:
+            return _project_revert_body()
+
+    def _project_revert_body():
         root = registry._root()
         is_repo, _ = _git(["rev-parse", "--is-inside-work-tree"])
         if not is_repo:
@@ -1460,18 +1631,30 @@ def create_app(
     _DOWNLOAD_MAX_BYTES = 64 * 1024 * 1024
 
     @app.get("/api/files/download")
-    def download_file(path: str = Query(..., max_length=512), _u: dict = USER):
+    def download_file(path: str = Query(..., max_length=512),
+                      project_id: str = Query("", max_length=64), _u: dict = USER):
         """Serve a file the agent produced, as an attachment.
 
         Confined to the same root the file tools write into, through the same
         resolver: a download endpoint that did its own path handling would be a
         second place for "../../.ssh/id_rsa" to be got right, and the first one
-        to be got wrong. Any authenticated user may fetch it, which matches the
-        tools: the workspace and the project directory are per-installation, not
-        per-user, so there is nothing here one user has and another does not.
+        to be got wrong.
+
+        The root is the REQUESTER's: with project_id, that project's (after the
+        membership check; not yours answers 404 like missing), otherwise the
+        requester's default root (their own WORKSPACE_DIR/users/<id> with
+        workspaces on, the installation root with them off, which is the one
+        root everybody's tools share and so has nothing per-user to protect).
         """
         try:
-            target = registry._resolve(path)
+            project = resolve_project(db, _u, project_id) if project_id else None
+        except (LookupError, PermissionError):
+            return JSONResponse({"error": "no such project"}, status_code=404)
+        scope_root = (_ws_project_root(project) if project is not None
+                      else default_root_for_user(config, _u))
+        try:
+            with workspace_root_bound(scope_root):
+                target = registry._resolve(path)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         if not target.is_file():
@@ -1611,9 +1794,20 @@ def create_app(
         cleaned = unwrap_answer(strip_reasoning(text or ""))
         return cleaned or (text or "")
 
-    def overrides(request) -> tuple[int, float]:
-        max_tokens = request.max_tokens or config.max_tokens
-        temperature = config.temperature if request.temperature is None else request.temperature
+    def overrides(request, uid: str | None = None) -> tuple[int, float]:
+        # Precedence: the request, then the caller's saved preference, then the
+        # installation default. The preference used to live only in the browser,
+        # so the CLI and API clients got a different temperature than the web UI
+        # for the same person. uid defaults to the identity the auth dependency
+        # bound, so feature routes calling ctx.overrides(request) agree too.
+        mine = user_generation_prefs(db, uid or get_acting_user())
+        max_tokens = request.max_tokens or mine.get("max_tokens") or config.max_tokens
+        if request.temperature is not None:
+            temperature = request.temperature
+        elif mine.get("temperature") is not None:
+            temperature = mine["temperature"]
+        else:
+            temperature = config.temperature
         return max_tokens, temperature
 
     def maybe_autotitle(conversation_id: str, first_message: str) -> None:
@@ -1702,6 +1896,162 @@ def create_app(
         return rejection_retry_message(feedback["prompt"], feedback.get("answer") or "",
                                        message)
 
+    # ------------------------------------------------ chat turn plumbing -- #
+    # Every chat turn is registered (streams.py): a streaming turn runs as its
+    # own task so a dropped connection can resume it, POST .../cancel can stop
+    # it by id, and a reloaded page can find it again.
+    turns = TurnRegistry(config)
+    app.state.turns = turns
+
+    def _chat_default_agent_factory(cfg, profile=None):
+        """The agent for one per-turn config (an agent profile, a model choice).
+
+        Published as app.state.agent_factory so a test or a feature can supply
+        its own agent without reaching into this closure. A turn with neither
+        never calls it: it runs on app.state.agent, exactly as before.
+        """
+        return Agent(cfg, ToolRegistry(cfg, db), ModelClient(cfg, cluster=router))
+
+    app.state.agent_factory = _chat_default_agent_factory
+    # Building an agent builds a ToolRegistry (skills, checkpoints, MCP), far
+    # too much per turn, so per-turn agents are cached by everything that
+    # shapes them. Bounded: oldest evicted first.
+    _chat_agent_cache: dict = {}
+
+    def _chat_config_stamp() -> tuple:
+        # A cached per-turn config is a COPY of the live one. Without this in
+        # the key, a setting an admin changed would never reach a profile agent
+        # built before the change.
+        return tuple(repr(getattr(config, name, None)) for name in Config.MUTABLE)
+
+    def _chat_turn_agent(profile: dict | None, model_id: str) -> tuple:
+        caps = tuple(profile.get("capabilities") or []) if profile else ()
+        factory = getattr(app.state, "agent_factory", None) or _chat_default_agent_factory
+        key = ((profile or {}).get("id"), (profile or {}).get("updated_at"), caps,
+               model_id, config.model, _chat_config_stamp(), id(factory))
+        hit = _chat_agent_cache.get(key)
+        if hit is not None:
+            return hit
+        changes: dict = {}
+        if profile is not None:
+            # The same gating /api/agents/run applies to a profile.
+            changes["agent_tools"] = ",".join(tools_for_capabilities(caps))
+            changes["rag_enabled"] = rag_for_capabilities(caps) and config.rag_enabled
+        if model_id:
+            changes["model"] = model_id
+        cfg = dataclass_replace(config, **changes)
+        built = (cfg, factory(cfg, profile))
+        while len(_chat_agent_cache) >= 32:
+            _chat_agent_cache.pop(next(iter(_chat_agent_cache)))
+        _chat_agent_cache[key] = built
+        return built
+
+    def _chat_served_models() -> set:
+        served = {config.model, resolve_model(config.model, config)}
+        for node in list(getattr(node_registry, "nodes", None) or []):
+            if getattr(node, "model", None):
+                served.add(node.model)
+        return {m for m in served if m}
+
+    async def resolve_turn_options(request, user: dict):
+        """ChatTurnOptions for a chat request, or the JSONResponse refusing it.
+
+        Checked before any streaming starts, so a bad agent, model, project or
+        attachment is an honest 4xx instead of an error event after a 200.
+        """
+        uid = user["id"]
+        role = user.get("role") or "user"
+        opts = ChatTurnOptions(cfg=config, agent=app.state.agent, client=model_client)
+        model_id = ""
+        if request.model:
+            wanted = resolve_model(request.model, config)
+            served = _chat_served_models()
+            if wanted not in served:
+                # Never a silent fallback: an answer from a different model
+                # than the one asked for is worse than a refusal.
+                return JSONResponse(
+                    {"error": f"model {request.model!r} is not served here",
+                     "served": sorted(served)}, status_code=400)
+            if wanted != config.model:
+                model_id = wanted
+        profile = None
+        if request.agent_id:
+            row = await asyncio.to_thread(db.get_agent, request.agent_id)
+            # A disabled profile does not exist for a non-admin: /api/agents
+            # does not list it either.
+            if row is None or (not row.get("enabled") and role != "admin"):
+                return JSONResponse({"error": "agent not found"}, status_code=404)
+            allowed = chat_role_capabilities(role, config)
+            wanted_caps = set(row.get("capabilities") or [])
+            profile = dict(row, capabilities=[c for c in CAPABILITY_ORDER
+                                              if c in wanted_caps and c in allowed])
+        if profile is not None or model_id:
+            try:
+                opts.cfg, opts.agent = _chat_turn_agent(profile, model_id)
+            except Exception as exc:
+                log(f"per-turn agent failed to build: {exc}", logging.WARNING)
+                return JSONResponse({"error": redact_text(str(exc))}, status_code=500)
+            if model_id:
+                opts.client = ModelClient(opts.cfg, cluster=router)
+        opts.profile, opts.model = profile, model_id
+        if request.project_id:
+            resolver = optional_feature("workspaces", "resolve_project")
+            if not callable(resolver):
+                return JSONResponse({"error": "projects not available"}, status_code=400)
+            try:
+                opts.project = await asyncio.to_thread(resolver, db, user, request.project_id)
+            except (LookupError, PermissionError):
+                opts.project = None
+            except Exception as exc:
+                return JSONResponse({"error": redact_text(str(exc))}, status_code=400)
+            if not opts.project:
+                return JSONResponse({"error": "project not found"}, status_code=404)
+        if request.attachments:
+            ids = [str(i).strip() for i in request.attachments if str(i).strip()]
+            if any(len(i) > 128 for i in ids):
+                return JSONResponse({"error": "attachment ids are at most 128 characters"},
+                                    status_code=400)
+            parts_for = optional_feature("attachments", "content_parts_for")
+            if not callable(parts_for):
+                return JSONResponse({"error": "attachments not available"}, status_code=400)
+            if not getattr(config, "attachments_enabled", True):
+                return JSONResponse({"error": "attachments are switched off "
+                                              "(ATTACHMENTS_ENABLED=0)"}, status_code=400)
+            try:
+                parts = await asyncio.to_thread(parts_for, db, uid, ids)
+            except (LookupError, PermissionError):
+                return JSONResponse({"error": "attachment not found"}, status_code=404)
+            except Exception as exc:
+                return JSONResponse({"error": redact_text(str(exc))}, status_code=400)
+            opts.attachments = list(parts or [])
+            # Can the model answering this turn see the image parts? The agent
+            # takes turn.extras["vision"] as authoritative; served_vision asks
+            # the engine AND the model (VISION_MODE overrides). A model override
+            # may live on another node, so only the config speaks for it.
+            vision_for = optional_feature("vision", "served_vision")
+            if callable(vision_for) and any(
+                    isinstance(p, dict) and p.get("type") == "image_url"
+                    for p in opts.attachments):
+                try:
+                    seen, why = await asyncio.to_thread(
+                        vision_for, None if opts.model else model_manager, opts.cfg)
+                except Exception as exc:
+                    seen, why = False, f"vision check failed: {exc}"
+                opts.vision = bool(seen)
+                log(f"Turn with image attachments: vision={bool(seen)} ({why})",
+                    logging.DEBUG)
+        return opts
+
+    def _chat_turn_context(turn, user: dict, opts, interactive: bool) -> TurnContext:
+        turn_ctx = TurnContext(
+            turn_id=turn.turn_id, user_id=user["id"], conversation_id=turn.conversation_id,
+            role=user.get("role") or "user", interactive=interactive,
+            cancel=turn.cancel, emit=turn.emit,
+            agent_profile=opts.profile, project=opts.project)
+        if isinstance(getattr(opts, "vision", None), bool):
+            turn_ctx.extras["vision"] = opts.vision
+        return turn_ctx
+
     @app.post("/api/chat")
     async def chat(request: ChatRequest, user: dict = USER):
         start_time = time.time()
@@ -1710,9 +2060,13 @@ def create_app(
         if blocked is not None:
             db.log_metric("chat", (time.time() - start_time) * 1000, 503, "not ready")
             return blocked
+        opts = await resolve_turn_options(request, user)
+        if isinstance(opts, JSONResponse):
+            return opts
+        agent_kwargs = {"attachments": opts.attachments} if opts.attachments else {}
 
         conversation_id, history = load_history(request, uid)
-        max_tokens, temperature = overrides(request)
+        max_tokens, temperature = overrides(request, uid)
         use_agent = config.agent_enabled if request.agent is None else request.agent
         # Mirror the streaming handler: route substantive messages through the
         # agent so the model router runs, even with the agent toggle off.
@@ -1745,6 +2099,8 @@ def create_app(
             # go") that fails the substantive test would otherwise be answered on
             # the plain lane with the slash command still in the prompt.
             use_agent = True
+        if opts.forces_agent:
+            use_agent = True
 
         # Recorded before generating, so a failed or empty run still leaves the
         # question in the transcript instead of silently dropping the turn. The
@@ -1761,25 +2117,64 @@ def create_app(
                   conversation_id=conversation_id, user_id=uid, agent=use_agent,
                   content=content_for_log(request.message))
 
+        # The KV this turn will hold at its peak: the prompt as assembled
+        # (system + history + message) plus the reply budget, capped at the
+        # context window. The agent lane grows past this with tool results,
+        # but each step is trimmed back to the same window.
+        cost = admission_cost_tokens(
+            [{"role": "system", "content": config.system_prompt_with_identity},
+             *history, {"role": "user", "content": for_model}],
+            max_tokens, config.context_size)
         try:
-            await generation_gate.acquire()
+            ticket = await generation_gate.acquire(cost_tokens=cost)
         except GenerationBusy as exc:
+            # chat_in_flight was raised above and the finally below never runs
+            # on this path. Before this decrement every 503 leaked +1, and since
+            # the scheduler waits for chat_in_flight == 0, one burst of 503s
+            # stopped every scheduled task until restart.
+            tasks.chat_in_flight = max(0, tasks.chat_in_flight - 1)
             db.log_metric("chat", (time.time() - start_time) * 1000, 503, str(exc),
                           user_id=uid)
             return JSONResponse({"error": str(exc)}, status_code=503,
                                 headers={"Retry-After": "5"})
+        except BaseException:
+            # Client gone while queued (CancelledError): same leak, same fix.
+            tasks.chat_in_flight = max(0, tasks.chat_in_flight - 1)
+            raise
+        # Registered only once it holds a slot, so a refusal above leaves no
+        # turn behind. Nobody watches this endpoint's events, so the turn is
+        # not interactive: a tool that needs approval gets the unattended
+        # policy's answer instead of waiting for a click nobody can make.
+        turn = turns.create(uid, conversation_id, detachable=False, interactive=False)
+        turn_ctx = _chat_turn_context(turn, user, opts, interactive=False)
+        turn_ctx.suspend_admission = lambda: generation_gate.suspend(ticket)
+        bound_turn = set_current_turn(turn_ctx)
         try:
             stats: GenerationStats | None = None
+            reasoning = ""
+            tools_used: list = []
+            cancelled = False
             if use_agent:
                 answer = ""
                 trace: list[dict] = []
                 error: str | None = None
-                async for event in agent.run_iterating(
-                    for_model, history, conversation_id, max_tokens, temperature
+                async for event in opts.agent.run_iterating(
+                    for_model, history, conversation_id, max_tokens, temperature,
+                    **agent_kwargs
                 ):
-                    if event["type"] == "final":
+                    # Buffered like a streaming turn's, so the partial answer
+                    # and reasoning are known if the turn is cancelled by id.
+                    turn.push(event)
+                    if event["type"] == "cancelled":
+                        answer = clean_reply(event.get("partial") or turn.partial_text())
+                        trace = event.get("trace") or []
+                        reasoning = turn.reasoning_text()
+                        cancelled = True
+                    elif event["type"] == "final":
                         answer = event["answer"]
                         trace = event.get("trace", [])
+                        reasoning = event.get("reasoning") or turn.reasoning_text()
+                        tools_used = event.get("tools_used") or []
                         # The final event carries the turn's totals. Dropping
                         # them left this endpoint reporting "usage": null for
                         # every agent turn while the streaming one reported it.
@@ -1812,16 +2207,19 @@ def create_app(
                 messages, _ = trim_to_context(
                     system, history, user_msg, config.context_size, max_tokens
                 )
-                answer, stats = await model_client.complete_with_stats(
+                answer, stats = await opts.client.complete_with_stats(
                     messages, max_tokens, temperature, conversation_id=conversation_id
                 )
+                reasoning = reasoning_of(answer)
                 answer = plain_lane_answer(answer, stats, max_tokens)
                 trace = []
 
-            db.add_message(
-                conversation_id, "assistant", answer,
-                meta={"trace": trace} if trace else None, user_id=uid,
-            )
+            if answer or not cancelled:
+                db.add_message(
+                    conversation_id, "assistant", answer,
+                    meta=turn_message_meta(trace, reasoning, tools_used, cancelled),
+                    user_id=uid,
+                )
             db.log_metric(
                 "chat", (time.time() - start_time) * 1000, 200,
                 stats=stats, model=config.model, conversation_id=conversation_id, user_id=uid,
@@ -1830,36 +2228,55 @@ def create_app(
                       conversation_id=conversation_id, user_id=uid, agent=use_agent,
                       tool_count=len(trace),
                       content=content_for_log(answer))
-            return {
+            result = {
                 "answer": answer,
                 "conversation_id": conversation_id,
                 "agent": use_agent,
                 "trace": trace,
                 "usage": stats.as_event() if stats else None,
+                "reasoning": reasoning,
+                "turn_id": turn.turn_id,
             }
+            if cancelled:
+                result["cancelled"] = True
+            return result
         except Exception as exc:
             log(f"/api/chat failed: {type(exc).__name__}: {exc}", logging.ERROR)
             db.log_metric("chat", (time.time() - start_time) * 1000, 503, str(exc), user_id=uid)
             return JSONResponse(content={"error": redact_text(str(exc))}, status_code=503)
         finally:
-            generation_gate.release()
+            reset_current_turn(bound_turn)
+            turn.finish("cancelled" if cancelled else None)
+            generation_gate.release(ticket)
             tasks.chat_in_flight = max(0, tasks.chat_in_flight - 1)
             tasks.note_chat_activity()
 
     @app.post("/api/chat/stream")
-    async def chat_stream(request: ChatRequest, user: dict = USER):
+    async def chat_stream(request: ChatRequest, raw: Request, user: dict = USER):
         """Streaming chat over Server-Sent Events.
 
         Emits the same event vocabulary whether or not the agent is on, so the
         browser has one code path: step, token, tool_call, tool_result, final.
+
+        The turn runs as its own task feeding a buffered turn (streams.py) and
+        this response is one subscriber of it. With `X-Stream-Ids: 1` every
+        frame carries its sequence id and a dropped connection leaves the turn
+        running for TURN_DETACH_GRACE_S, so the client can resume it from
+        /api/chat/turns/{turn_id}/events?after=<last id>. Without the header
+        the frames and the disconnect behaviour are exactly the old ones.
         """
         blocked = not_ready()
         if blocked is not None:
             return blocked
 
         uid = user["id"]
+        opts = await resolve_turn_options(request, user)
+        if isinstance(opts, JSONResponse):
+            return opts
+        agent_kwargs = {"attachments": opts.attachments} if opts.attachments else {}
+        want_ids = wants_stream_ids(raw.headers)
         conversation_id, history = load_history(request, uid)
-        max_tokens, temperature = overrides(request)
+        max_tokens, temperature = overrides(request, uid)
         use_agent = config.agent_enabled if request.agent is None else request.agent
         # Route substantive messages through the agent even when the agent
         # toggle is off, so the model router can decide answer vs search vs
@@ -1894,6 +2311,8 @@ def create_app(
             # go") that fails the substantive test would otherwise be answered on
             # the plain lane with the slash command still in the prompt.
             use_agent = True
+        if opts.forces_agent:
+            use_agent = True
 
         # A short "no, wrong" is feedback on the PREVIOUS answer: record it, and
         # re-ask that request with the complaint attached instead of answering
@@ -1905,49 +2324,136 @@ def create_app(
         if for_model != request.message:
             use_agent = True
 
-        async def sse(event: dict) -> str:
-            return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-
-        async def event_generator() -> AsyncGenerator[str, None]:
+        async def turn_events(turn: ChatTurn, turn_ctx: TurnContext) -> AsyncGenerator[dict, None]:
+            """The turn itself, as events; drive_turn buffers them for subscribers."""
             answer = ""
             trace: list[dict] = []
+            reasoning = ""
+            tools_used: list = []
+            cancelled = False
             start_time = time.time()
-            # Re-bind the acting user in this generator's context so RAG retrieval
-            # and memory tools scope correctly during streaming.
-            set_acting_user(uid)
             tasks.note_chat_activity()
             tasks.chat_in_flight += 1
             log_event(get_logger("chat"), logging.INFO, "chat.start",
                       conversation_id=conversation_id, user_id=uid, agent=use_agent,
-                      streaming=True, content=content_for_log(request.message))
+                      streaming=True, turn_id=turn.turn_id,
+                      content=content_for_log(request.message))
             # The slot is taken inside the generator, not before the response:
             # a client that disconnects before consuming the stream never runs
             # this body, so acquiring earlier would leak a slot per abandoned
             # request. The queue-full case becomes an SSE error event because
             # the status line is already committed by then.
+            #
+            # The acquire runs in its own task so this generator can keep
+            # talking while it waits: each change of queue position becomes a
+            # {"type": "queued"} event (re-sent every 15s as a keepalive while
+            # nothing moves, so a proxy does not cut an idle stream), and the
+            # browser shows "queued (2nd)" instead of a spinner that looks hung.
+            cost = admission_cost_tokens(
+                [{"role": "system", "content": config.system_prompt_with_identity},
+                 *history, {"role": "user", "content": for_model}],
+                max_tokens, config.context_size)
+            queued: list[dict] = []
+            moved = asyncio.Event()
+
+            def on_wait(position: int, snap: dict) -> None:
+                queued.append({"type": "queued", "position": position,
+                               "running": snap.get("running", 0),
+                               "limit": snap.get("limit", 0)})
+                moved.set()
+
+            acquiring = asyncio.ensure_future(
+                generation_gate.acquire(cost_tokens=cost, on_wait=on_wait))
+            last_queued: dict | None = None
             try:
-                await generation_gate.acquire()
+                while not acquiring.done():
+                    if queued:
+                        # Only the newest position matters; older ones are stale.
+                        last_queued = queued[-1]
+                        queued.clear()
+                        yield last_queued
+                        continue
+                    moved.clear()
+                    mover = asyncio.ensure_future(moved.wait())
+                    try:
+                        done, _ = await asyncio.wait({acquiring, mover}, timeout=15,
+                                                     return_when=asyncio.FIRST_COMPLETED)
+                    finally:
+                        mover.cancel()
+                    if not done and last_queued is not None:
+                        yield last_queued
+                ticket = acquiring.result()
             except GenerationBusy as exc:
                 tasks.chat_in_flight = max(0, tasks.chat_in_flight - 1)
                 await asyncio.to_thread(
                     db.log_metric, "chat_stream", 0.0, 503, str(exc), user_id=uid)
-                yield await sse({"type": "error", "error": str(exc)})
-                yield "data: [DONE]\n\n"
+                yield {"type": "error", "error": str(exc)}
                 return
+            except BaseException:
+                # Client gone while queued (CancelledError at the wait, or
+                # GeneratorExit at a yield): leave the queue, give back a slot
+                # granted in the same instant, and undo the in-flight count.
+                if not acquiring.done():
+                    acquiring.cancel()
+                elif not acquiring.cancelled() and acquiring.exception() is None:
+                    generation_gate.release(acquiring.result())
+                tasks.chat_in_flight = max(0, tasks.chat_in_flight - 1)
+                raise
+            # The ticket was taken in the helper task; bind it here so a
+            # ticket-less release() or suspend() in this task finds it.
+            generation_gate.adopt(ticket)
+
+            def requeued(position: int, snap: dict) -> None:
+                turn.push({"type": "queued", "position": position,
+                           "running": snap.get("running", 0),
+                           "limit": snap.get("limit", 0)})
+
+            # A turn waiting on a human (tool approval) gives its slot back and
+            # queues again afterwards, showing the queue like the first time.
+            turn_ctx.suspend_admission = lambda: generation_gate.suspend(
+                ticket, on_wait=requeued)
             try:
-                yield await sse({"type": "start", "conversation_id": conversation_id, "agent": use_agent})
+                yield {"type": "start", "conversation_id": conversation_id,
+                       "agent": use_agent, "turn_id": turn.turn_id}
                 if fb:
-                    yield await sse({"type": "notice", "info": True, "message": fb["label"]})
+                    yield {"type": "notice", "info": True, "message": fb["label"]}
                 await asyncio.to_thread(db.add_message, conversation_id, "user", request.message, user_id=uid)
+                if use_agent and opts.project:
+                    # Say which project files (AGENTS.md and friends) the agent
+                    # reads this turn, so the user can see instructions the
+                    # model follows. Only for a project turn: a turn without
+                    # one keeps today's exact frames.
+                    injected = optional_feature("workspaces", "context_injected_event")
+                    if callable(injected):
+                        event = await asyncio.to_thread(
+                            injected, getattr(opts.agent, "registry", None), opts.project)
+                        if event:
+                            yield event
                 if use_agent:
-                    async for event in agent.run_iterating(
-                        for_model, history, conversation_id, max_tokens, temperature
+                    async for event in opts.agent.run_iterating(
+                        for_model, history, conversation_id, max_tokens, temperature,
+                        **agent_kwargs
                     ):
-                        yield await sse(event)
                         if event["type"] == "final":
+                            event.setdefault("turn_id", turn.turn_id)
+                            # An agent that does not report reasoning yet still
+                            # streamed it as think tokens; the buffer kept them.
+                            if not event.get("reasoning"):
+                                event["reasoning"] = turn.reasoning_text()
                             answer = event["answer"]
                             trace = event.get("trace", [])
-                        elif event["type"] == "usage":
+                            reasoning = event["reasoning"]
+                            tools_used = event.get("tools_used") or []
+                        elif event["type"] == "cancelled":
+                            event.setdefault("turn_id", turn.turn_id)
+                            event["partial"] = clean_reply(
+                                event.get("partial") or turn.partial_text())
+                            answer = event["partial"]
+                            trace = event.get("trace") or []
+                            reasoning = turn.reasoning_text()
+                            cancelled = True
+                        yield event
+                        if event["type"] == "usage":
                             await asyncio.to_thread(
                                 db.log_metric,
                                 "agent_step", event["total_ms"], 200,
@@ -1968,8 +2474,8 @@ def create_app(
                         system, history, user_msg, config.context_size, max_tokens
                     )
                     if dropped:
-                        yield await sse({"type": "context", "dropped": dropped,
-                                         "tokens": messages_tokens(messages)})
+                        yield {"type": "context", "dropped": dropped,
+                               "tokens": messages_tokens(messages)}
                     plain_stats = GenerationStats()
                     # Accumulate tokens in a list and join once: repeated string
                     # concatenation in a hot loop is O(n^2) and drags on long replies.
@@ -1990,31 +2496,56 @@ def create_app(
                     # leaves the answer bubble holding only the answer, which
                     # makes the final event a no-op for it.
                     splitter = ThinkSplitter()
-                    async for token in model_client.stream(
+                    reasoning_parts: list[str] = []
+                    tokens = opts.client.stream(
                         messages, max_tokens, temperature, plain_stats,
                         conversation_id=conversation_id
-                    ):
-                        answer_parts.append(token)
-                        for kind, piece in splitter.feed(token):
-                            if not piece:
-                                continue
-                            yield await sse({
-                                "type": "think_token" if kind == "think" else "token",
-                                "token": piece, "step": 1})
+                    )
+                    try:
+                        async for token in tokens:
+                            # This lane has no agent loop to notice a cancel,
+                            # so it checks between tokens itself.
+                            if turn.cancel.is_set():
+                                cancelled = True
+                                break
+                            answer_parts.append(token)
+                            for kind, piece in splitter.feed(token):
+                                if not piece:
+                                    continue
+                                if kind == "think":
+                                    reasoning_parts.append(piece)
+                                yield {
+                                    "type": "think_token" if kind == "think" else "token",
+                                    "token": piece, "step": 1}
+                    finally:
+                        # Close the model stream now rather than at garbage
+                        # collection: a cancelled answer must free the server.
+                        closer = getattr(tokens, "aclose", None)
+                        if closer is not None:
+                            await closer()
                     # Whatever the splitter is still holding back as a possible
                     # partial tag. Nothing arrives after the last token, so
                     # without this an answer ending in "a < b" loses its tail.
                     for kind, piece in splitter.flush():
-                        yield await sse({
+                        if kind == "think":
+                            reasoning_parts.append(piece)
+                        yield {
                             "type": "think_token" if kind == "think" else "token",
-                            "token": piece, "step": 1})
+                            "token": piece, "step": 1}
+                    reasoning = "".join(reasoning_parts).strip()
+                if not use_agent and cancelled:
+                    # What was written before the cancel is kept and stored.
+                    answer = clean_reply(turn.partial_text())
+                    yield {"type": "cancelled", "step": 1, "partial": answer,
+                           "trace": [], "turn_id": turn.turn_id}
+                elif not use_agent:
                     # The final event still carries the cleaned text: the
                     # splitter handles the tags, clean_reply also strips the
                     # answer scaffolding a small model wraps around its reply,
                     # and this is what gets stored.
                     answer = plain_lane_answer("".join(answer_parts), plain_stats,
                                                max_tokens, reasoning_shown=True)
-                    yield await sse({"type": "usage", "step": 1, **plain_stats.as_event()})
+                    yield {"type": "usage", "step": 1, **plain_stats.as_event()}
                     await asyncio.to_thread(
                         db.log_metric,
                         "chat_stream_gen", plain_stats.total_ms, 200, stats=plain_stats,
@@ -2023,37 +2554,89 @@ def create_app(
                     # Carry the cost of the turn on the final event: the footer
                     # under the answer reads these, and this lane has no tools,
                     # so generation wall-clock is the whole turn.
-                    yield await sse({"type": "final", "answer": answer, "steps": 1,
-                                     "trace": [],
-                                     "prompt_tokens": plain_stats.prompt_tokens,
-                                     "completion_tokens": plain_stats.completion_tokens,
-                                     "elapsed_ms": round(plain_stats.total_ms, 1)})
+                    yield {"type": "final", "answer": answer, "steps": 1,
+                           "trace": [],
+                           "prompt_tokens": plain_stats.prompt_tokens,
+                           "completion_tokens": plain_stats.completion_tokens,
+                           "elapsed_ms": round(plain_stats.total_ms, 1),
+                           "reasoning": reasoning, "turn_id": turn.turn_id}
 
                 if answer:
+                    # Reasoning and tools are stored with the answer so a
+                    # reopened conversation can show them again, not only the
+                    # live stream.
                     await asyncio.to_thread(
                         db.add_message,
                         conversation_id, "assistant", answer,
-                        meta={"trace": trace} if trace else None, user_id=uid,
+                        meta=turn_message_meta(trace, reasoning, tools_used, cancelled),
+                        user_id=uid,
                     )
+                    turn.persisted = True
                     # Give a brand-new conversation a short title derived from the
                     # opening question, so the history list is readable at a glance.
                     await asyncio.to_thread(maybe_autotitle, conversation_id, request.message)
-                    log_event(get_logger("chat"), logging.INFO, "chat.completed",
+                    log_event(get_logger("chat"), logging.INFO,
+                              "chat.cancelled" if cancelled else "chat.completed",
                               conversation_id=conversation_id, user_id=uid,
                               agent=use_agent, streaming=True, tool_count=len(trace),
-                              content=content_for_log(answer))
+                              turn_id=turn.turn_id, content=content_for_log(answer))
                 await asyncio.to_thread(
                     db.log_metric, "chat_stream", (time.time() - start_time) * 1000, 200,
                     user_id=uid)
             except Exception as exc:
                 log(f"/api/chat/stream failed: {type(exc).__name__}: {exc}", logging.ERROR)
                 db.log_metric("chat_stream", (time.time() - start_time) * 1000, 503, str(exc), user_id=uid)
-                yield await sse({"type": "error", "error": redact_text(str(exc))})
+                yield {"type": "error", "error": redact_text(str(exc))}
             finally:
-                generation_gate.release()
+                generation_gate.release(ticket)
                 tasks.chat_in_flight = max(0, tasks.chat_in_flight - 1)
                 tasks.note_chat_activity()
-            yield "data: [DONE]\n\n"
+
+        async def store_cut(turn: ChatTurn) -> dict | None:
+            """The turn's task was cancelled outright: keep what it had written.
+
+            The cooperative path (the loop saw the cancel event) stores its own
+            partial above; this covers a turn stopped mid-await, where none of
+            that code got to run.
+            """
+            if turn.ended:
+                return None
+            partial = clean_reply(turn.partial_text()) if turn.partial_text().strip() else ""
+            if partial and not turn.persisted:
+                await asyncio.to_thread(
+                    db.add_message, conversation_id, "assistant", partial,
+                    meta=turn_message_meta(None, turn.reasoning_text(), None, True),
+                    user_id=uid)
+                turn.persisted = True
+            log_event(get_logger("chat"), logging.INFO, "chat.cancelled",
+                      conversation_id=conversation_id, user_id=uid, turn_id=turn.turn_id,
+                      reason=turn.cancel_reason or "cancelled",
+                      content=content_for_log(partial))
+            return {"type": "cancelled", "partial": partial, "trace": [],
+                    "turn_id": turn.turn_id, "reason": turn.cancel_reason or "cancelled"}
+
+        async def event_generator() -> AsyncGenerator[str, None]:
+            # Re-bind the acting user in this generator's context so RAG retrieval
+            # and memory tools scope correctly during streaming. The turn task
+            # below copies this context, and binds the TurnContext in its own.
+            set_acting_user(uid)
+            # Created here, not before the response: a client that disconnects
+            # before consuming the stream never runs this body, so it never
+            # starts a turn (or takes a generation slot) nobody will read.
+            turn = turns.create(uid, conversation_id, resumable=want_ids)
+            turn_ctx = _chat_turn_context(turn, user, opts, interactive=True)
+
+            async def produce() -> None:
+                bound = set_current_turn(turn_ctx)
+                try:
+                    await drive_turn(turn, turn_events(turn, turn_ctx),
+                                     on_hard_cancel=lambda: store_cut(turn))
+                finally:
+                    reset_current_turn(bound)
+
+            turn.task = asyncio.ensure_future(produce())
+            async for frame in turn_frames(turn, 0, ids=want_ids, grace=turns.grace):
+                yield frame
 
         return StreamingResponse(
             event_generator(),
@@ -2101,6 +2684,17 @@ def create_app(
             # re-sync; changing the node topology needs a restart.)
             if any(k in changed for k in ("log_level", "log_format", "log_chat_content")):
                 configure_logging(config, force=True)
+            # The admission controller holds its own copies; hand it the
+            # clamped values. Growing admits waiters at once, shrinking lets
+            # running generations finish. Thread-safe: this handler is sync.
+            if any(k in changed for k in ("max_concurrent_generations",
+                                          "generation_queue_depth")):
+                generation_gate.resize(config.max_concurrent_generations,
+                                       config.generation_queue_depth)
+            if any(k in changed for k in ("admission_memory_aware",
+                                          "admission_min_free_mb")):
+                generation_gate.configure(memory_aware=config.admission_memory_aware,
+                                          min_free_mb=config.admission_min_free_mb)
         # Report any requested mutable field that was rejected (e.g. a bad value)
         # so the UI can tell the user rather than silently dropping it.
         ignored = [k for k in requested
@@ -2234,11 +2828,30 @@ def create_app(
             "catalog": model_catalog(config),
             "adapters": [{"id": "none", "path": "", "modified": None}] + list_adapters(),
             "cache_dir": str(hf_cache_dir()),
+            # Catalogue (catalog.py): every alias the switcher accepts, this
+            # machine's RAM for the per-entry fits_in_ram, and the applied
+            # benchmark recommendation (None until `deploy.py recommend --apply`).
+            "aliases": model_aliases(config),
+            "model_alias": config.model_alias,
+            "ram_gb": round(TOTAL_RAM_GB, 1),
+            "recommended": read_recommendation(ram_gb=TOTAL_RAM_GB),
         }
 
     @app.post("/api/models/select")
     def select_model(request: ModelSelectRequest, _a: dict = ADMIN):
-        """Point the model server at a different model or adapter and restart it."""
+        """Point the model server at a different model or adapter and restart it.
+
+        request.model may be an alias ("coder", or one from MODEL_ALIASES); it
+        is resolved here, before the manager or the router ever sees it, so
+        config.model is always a repo id that LARGE_MODEL_MARKERS can match.
+        """
+        bench_job = getattr(app.state, "bench_job", None)
+        if bench_job is not None and bench_job.running:
+            return JSONResponse(
+                content={"error": "A benchmark sweep owns the model server. "
+                                  "Watch /api/bench/status."},
+                status_code=409,
+            )
         if retrain_manager.status.get("running"):
             return JSONResponse(
                 content={"error": "Retraining is running and owns the model server."},
@@ -2251,13 +2864,17 @@ def create_app(
                          "running": running},
                 status_code=409,
             )
+        requested_model = (request.model or "").strip()
+        resolved_model = resolve_model(requested_model, config) if requested_model else None
         try:
-            changed = model_manager.swap(request.model, request.adapter)
+            changed = model_manager.swap(resolved_model, request.adapter)
         except ValueError as exc:
             return JSONResponse(content={"error": str(exc)}, status_code=400)
 
-        if request.model:
-            config.model = request.model
+        if resolved_model:
+            config.model = resolved_model
+            config.model_alias = (requested_model.lower()
+                                  if resolved_model != requested_model else "")
         if request.adapter is not None:
             config.adapter = request.adapter
         if request.max_kv_size is not None and request.max_kv_size != config.max_kv_size:
@@ -2272,6 +2889,9 @@ def create_app(
             "restarting": bool(changed or request.restart),
             "changed": changed,
             "current": model_manager.describe(),
+            "model": config.model,
+            "resolved": resolved_model,
+            "alias": config.model_alias,
             "note": "Weights download on first use. Watch /api/logs/model for progress.",
         }
 
@@ -2300,25 +2920,44 @@ def create_app(
     # agent that can undo its own writes can also undo yours, and "the model
     # decided to revert your file" is not a failure mode worth introducing.
 
+    # Owner-scoped since checkpoints carry the user they were captured for: the
+    # final event offers every user an undo link, and an admin-only route meant
+    # nobody else could use it, while an unscoped one would list (and undo)
+    # other people's turns. Admins still see all, including ownerless ones.
     @app.get("/api/checkpoints")
-    def list_checkpoints(limit: int = Query(20, ge=1, le=200), _a: dict = ADMIN):
+    def list_checkpoints(limit: int = Query(20, ge=1, le=200), user: dict = USER):
+        owner = None if user.get("role") == "admin" else user["id"]
         return {
-            "checkpoints": [c.as_dict() for c in registry.checkpoints.list(limit)],
+            "checkpoints": [c.as_dict()
+                            for c in registry.checkpoints.list(limit, user_id=owner)],
             "enabled": config.checkpoints_enabled,
             "keep": config.checkpoint_keep,
         }
 
     @app.post("/api/checkpoints/{checkpoint_id}/rollback")
-    def rollback_checkpoint(checkpoint_id: str, _a: dict = ADMIN):
+    def rollback_checkpoint(checkpoint_id: str, user: dict = USER):
         checkpoint = registry.checkpoints.get(checkpoint_id)
-        if checkpoint is None:
+        admin = user.get("role") == "admin"
+        if checkpoint is None or (not admin and checkpoint.user_id != user["id"]):
             return JSONResponse({"error": f"no checkpoint {checkpoint_id!r}"},
                                 status_code=404)
+        if not admin:
+            # Still allowed to write there? Membership can be withdrawn after
+            # the turn, and a rollback is a write into the checkpoint's root.
+            cp_root = Path(checkpoint.root).resolve()
+            allowed = user_allowed_roots(db, config, user,
+                                         installation_root=registry._root())
+            if not any(path_inside(cp_root, r) for r in allowed):
+                return JSONResponse(
+                    {"error": "you no longer have access to that checkpoint's project"},
+                    status_code=403)
         restored, problems = registry.checkpoints.rollback(checkpoint_id)
         # Files restored underneath the tools mean the "changed this session"
-        # list is now wrong; drop the ones that went back.
+        # list is now wrong; drop the ones that went back (from the list of the
+        # root they were restored in, which may not be the caller's default).
+        session = registry._ws_session_changed_for(checkpoint.root)
         for rel in restored:
-            registry.changed_files.discard(rel)
+            session.discard(rel)
         log(f"Rolled back checkpoint {checkpoint_id}: {len(restored)} file(s) restored"
             + (f", {len(problems)} problem(s)" if problems else ""))
         return {"rolled_back": checkpoint_id, "restored": restored,
@@ -2404,6 +3043,10 @@ def create_app(
         if not db.can_access_conversation(conversation_id, user["id"]):
             return JSONResponse({"error": "not found"}, status_code=404)
         messages = db.get_messages(conversation_id, limit, user_id=user["id"])
+        # meta is a JSON column; decoded here so the UI can replay a stored
+        # turn's reasoning and tool calls without parsing a string field.
+        for message in messages:
+            message["meta"] = parse_message_meta(message.get("meta"))
         return {
             "conversation_id": conversation_id,
             "messages": messages,
@@ -2439,8 +3082,13 @@ def create_app(
         rather than queued -- the next rating will do it, and a slow chat is a
         worse outcome than a skill written later.
         """
+        # Its prompt quotes the turn and the correction, so that is its KV cost.
+        cost = admission_cost_tokens(
+            [{"role": "user", "content": user_prompt}, {"role": "assistant", "content": answer},
+             {"role": "user", "content": correction or ""}],
+            config.max_tokens, config.context_size)
         try:
-            await generation_gate.acquire()
+            ticket = await generation_gate.acquire(cost_tokens=cost)
         except GenerationBusy:
             log("Skipped skill learning: the model is busy.", logging.DEBUG)
             return
@@ -2451,7 +3099,7 @@ def create_app(
         except Exception as exc:
             log(f"Background skill learning failed: {exc}", logging.WARNING)
         finally:
-            generation_gate.release()
+            generation_gate.release(ticket)
 
     @app.post("/api/feedback")
     async def feedback(request: FeedbackRequest, user: dict = USER):
@@ -2559,6 +3207,47 @@ def create_app(
             "SELECT * FROM metrics ORDER BY timestamp DESC LIMIT ?", (limit,)
         ).fetchall()
         return {"metrics": [dict(r) for r in rows]}
+
+    # ---- Feature routers ------------------------------------------------- #
+    # Large route surfaces (OpenAI/Anthropic compatibility, settings schema,
+    # approvals, workspaces, dashboards, ...) live in their own modules and
+    # register here with one shared context, so they reuse the same auth
+    # dependencies, admission gate and readiness check as the built-in routes
+    # instead of growing this function. See appctx.py for the rules.
+    ctx = ApiContext(
+        config=config, db=db, model_manager=model_manager,
+        retrain_manager=retrain_manager, registry=registry,
+        model_client=model_client, agent=agent, tasks=tasks, auth=auth,
+        router=router, node_registry=node_registry,
+        health_monitor=health_monitor, importer=importer,
+        generation_gate=generation_gate, USER=USER, ADMIN=ADMIN,
+        not_ready=not_ready, load_history=load_history, overrides=overrides,
+        agent_for_profile=_agent_for_profile,
+        node_worker_client=node_worker_client,
+    )
+    app.state.ctx = ctx
+    register_prefs(app, ctx)
+    register_backends(app, ctx)
+    register_cluster(app, ctx)
+    register_training(app, ctx)
+    register_catalog(app, ctx)
+    register_policy(app, ctx)
+    register_workspaces(app, ctx)
+    register_streams(app, ctx)
+    register_openai_compat(app, ctx)
+    register_anthropic_compat(app, ctx)
+    # The CLI login shares the web login's failure buckets, so a terminal is
+    # not a second, independent password-guessing oracle (api_tokens.py).
+    ctx.extras["login_throttle"] = {"failures": _login_failures, "blocked": _login_blocked,
+                                    "record": _login_record_failure, "sweep": _login_sweep}
+    register_api_tokens(app, ctx)
+    register_wire(app, ctx)
+    register_attachments(app, ctx)
+    register_audio(app, ctx)
+    register_mcp_server(app, ctx)
+    register_tools_extra(app, ctx)
+    register_tool_catalog(app, ctx)
+    # ---- extension routes: one `register_<feature>(app, ctx)` per feature, above this line ---- #
 
     return app
 

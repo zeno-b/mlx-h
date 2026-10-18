@@ -16,6 +16,9 @@ from .core import *  # noqa: F401,F403
 from .obslog import *  # noqa: F401,F403
 from .config import *  # noqa: F401,F403
 from .llm import *  # noqa: F401,F403
+from .toolparse import *  # noqa: F401,F403
+from .nodesec import *  # noqa: F401,F403
+from .backends import *  # noqa: F401,F403
 
 
 class ModelClient:
@@ -31,6 +34,10 @@ class ModelClient:
     def __init__(self, config: Config, cluster: Any = None):
         self.config = config
         self.cluster = cluster
+        # The tool-call parser reads TOOL_CALL_FORMAT / TOOL_CALL_REPAIR from
+        # the live config at parse time (toolparse.tool_call_policy), so a
+        # Settings change applies to the next reply without a restart.
+        bind_tool_call_config(config)
 
     # One pooled HTTP client for the whole process, not one per request and not
     # one per ModelClient. A fresh AsyncClient per request means a fresh TCP
@@ -42,6 +49,10 @@ class ModelClient:
     # so nothing config-specific is baked into the shared client.
     _shared_http: Any = None
     _shared_loop: Any = None
+    # Peer nodes get their own pool: TLS options (NODE_CA_FILE, client cert),
+    # the plaintext policy and E2E sealing live in its transport (nodesec.py),
+    # so the local mlx server is never routed through them.
+    _peer_http: dict = {}
 
     @classmethod
     def _client(cls):
@@ -70,8 +81,35 @@ class ModelClient:
         return cls._shared_http
 
     @classmethod
+    def _peer_client(cls, config: Any):
+        """The AsyncClient for remote nodes, per event loop and security settings."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        key = (id(loop), node_client_key(config))
+        client = cls._peer_http.get(key)
+        if client is None or client.is_closed:
+            # Clients bound to another (finished) loop cannot be awaited here.
+            for stale in [k for k in cls._peer_http if k[0] != id(loop)]:
+                cls._peer_http.pop(stale, None)
+            client = cls._peer_http[key] = node_async_client(config)
+        return client
+
+    def _client_for(self, node: Any):
+        if node is None or getattr(node, "is_local", True):
+            return self._client()
+        return self._peer_client(self.config)
+
+    @classmethod
     async def aclose(cls) -> None:
         """Release the pooled connections on shutdown. Safe to call twice."""
+        peers, cls._peer_http = list(cls._peer_http.values()), {}
+        for peer in peers:
+            try:
+                await peer.aclose()
+            except Exception:  # noqa: BLE001 - shutdown must never raise
+                pass
         client, cls._shared_http, cls._shared_loop = cls._shared_http, None, None
         if client is not None and not client.is_closed:
             try:
@@ -98,15 +136,25 @@ class ModelClient:
         req = cluster.classify(model=self.config.model, kind=kind)
         decision = cluster.select(req)
         targets = []
+        refusal = getattr(cluster.registry, "refusal", None)
         for node in decision.candidates:
             if node.is_local:
                 targets.append((node, self._local_chat_url(), {}, decision))
-            else:
-                headers = {}
-                if self.config.node_token:
-                    headers["Authorization"] = f"Bearer {self.config.node_token}"
-                url = node.remote_url.rstrip("/") + "/api/node/generate"
-                targets.append((node, url, headers, decision))
+                continue
+            # A peer the security policy refuses (plain http to a public host,
+            # E2E key without `cryptography`) is never dispatched to; the
+            # heartbeat already shows why in the cluster panel.
+            problem = refusal(node) if refusal is not None else ""
+            if problem:
+                continue
+            # A paired node has its own token; others use the first NODE_TOKEN
+            # (the list form exists for rotation on the receiving side).
+            headers = node_auth_headers(self.config, node)
+            url = node.remote_url.rstrip("/") + "/api/node/generate"
+            targets.append((node, url, headers, decision))
+        if not targets:
+            local = cluster.registry.local_node()
+            targets.append((local, self._local_chat_url(), {}, decision))
         return targets
 
     @staticmethod
@@ -129,6 +177,24 @@ class ModelClient:
         return any(s in text for s in ("connection", "refused", "reset",
                                        "timed out", "unreachable"))
 
+    @classmethod
+    def _should_fail_over(cls, node: Any, exc: Exception) -> bool:
+        """_is_connection_error, plus the ways only a PEER node can fail.
+
+        A peer that refuses the call (401/403 token or E2E key mismatch, 400
+        "this node cannot read sealed traffic", a policy refusal raised by the
+        peer transport) or reports an in-band error frame cannot serve this
+        request, but another node may. The local server never answers those,
+        so local behaviour is unchanged.
+        """
+        if cls._is_connection_error(exc):
+            return True
+        if node is None or getattr(node, "is_local", True):
+            return False
+        if isinstance(exc, (NodeSecurityError, NodePeerError)):
+            return True
+        return bool(re.search(r"returned 4\d\d", str(exc).lower()))
+
     async def wait_until_ready(self, timeout: float = 40.0) -> bool:
         """Wait until the server can actually GENERATE, or until timeout.
 
@@ -144,7 +210,9 @@ class ModelClient:
         deadline = time.time() + timeout
         delay = 0.5
         probe_body = {
-            "model": self.config.model,
+            # The backend's request name, not the repo id: on mlx-lm a repo id
+            # reloads the weights WITHOUT the LoRA adapter (backends.py).
+            "model": request_model_for(self.config),
             "messages": [{"role": "user", "content": "ok"}],
             "max_tokens": 1,
             "temperature": 0.0,
@@ -230,9 +298,14 @@ class ModelClient:
         stream: bool,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        extra: dict | None = None,
     ) -> dict:
         body = {
-            "model": self.config.model,
+            # mlx-lm maps only "default_model" onto its CLI --adapter-path; the
+            # repo id made every request reload the base weights without the
+            # feedback adapter (backends.request_model_for). A peer node's
+            # /api/node/generate ignores this field and builds its own.
+            "model": request_model_for(self.config),
             "messages": messages,
             "stream": stream,
             "temperature": self.config.temperature if temperature is None else temperature,
@@ -259,31 +332,66 @@ class ModelClient:
             # Both spellings are in circulation; unknown keys are ignored.
             body["chat_template_kwargs"] = {"enable_thinking": False}
             body["enable_thinking"] = False
+        if extra:
+            for key, value in extra.items():
+                if key in _MC_PASSTHROUGH and value is not None:
+                    body[key] = value
+        # One answer to "is thinking on", in both spellings. A caller's extra
+        # may set either one (or the template kwargs dict); whichever it set
+        # wins over the config default, and the other spelling is made to
+        # agree, because a server that reads one and a template that reads the
+        # other disagreeing is how a "thinking off" request still thinks.
+        kwargs = body.get("chat_template_kwargs")
+        kwargs = dict(kwargs) if isinstance(kwargs, dict) else {}
+        thinking = None
+        if extra and isinstance(extra.get("enable_thinking"), bool):
+            thinking = extra["enable_thinking"]
+        elif extra and isinstance((extra.get("chat_template_kwargs") or {}).get("enable_thinking"), bool):
+            thinking = extra["chat_template_kwargs"]["enable_thinking"]
+        elif "enable_thinking" in body or "enable_thinking" in kwargs:
+            thinking = bool(kwargs.get("enable_thinking", body.get("enable_thinking")))
+        if thinking is not None:
+            kwargs["enable_thinking"] = thinking
+            body["enable_thinking"] = thinking
+        if kwargs:
+            body["chat_template_kwargs"] = kwargs
         return body
 
     def _stats_from_usage(self, usage: dict | None, messages: list[dict], text: str,
-                          started: float, first_token_at: float | None) -> GenerationStats:
+                          started: float, first_token_at: float | None,
+                          reasoning_text: str = "") -> GenerationStats:
         total_ms = (time.time() - started) * 1000
         ttft_ms = ((first_token_at - started) * 1000) if first_token_at else total_ms
+        details = (usage or {}).get("completion_tokens_details") or {}
+        reasoning_tokens = int(details.get("reasoning_tokens") or 0) if isinstance(details, dict) else 0
+        if not reasoning_tokens and reasoning_text:
+            reasoning_tokens = estimate_tokens(reasoning_text)
         if usage:
-            return GenerationStats(
+            stats = GenerationStats(
                 prompt_tokens=int(usage.get("prompt_tokens") or 0),
                 completion_tokens=int(usage.get("completion_tokens") or 0),
                 ttft_ms=ttft_ms, total_ms=total_ms, from_server=True,
             )
-        return GenerationStats(
-            prompt_tokens=messages_tokens(messages),
-            completion_tokens=estimate_tokens(text),
-            ttft_ms=ttft_ms, total_ms=total_ms, from_server=False,
-        )
+        else:
+            stats = GenerationStats(
+                prompt_tokens=messages_tokens(messages),
+                completion_tokens=estimate_tokens(text) + estimate_tokens(reasoning_text),
+                ttft_ms=ttft_ms, total_ms=total_ms, from_server=False,
+            )
+        stats.cached_tokens = _mc_cached_tokens(usage)
+        stats.reasoning_tokens = reasoning_tokens
+        stats.ttft_measured = first_token_at is not None
+        return stats
 
     async def complete(
         self,
         messages: list[dict],
         max_tokens: int | None = None,
         temperature: float | None = None,
+        extra: dict | None = None,
     ) -> str:
-        text, _ = await self.complete_with_stats(messages, max_tokens, temperature)
+        text, _ = await self.complete_with_stats(messages, max_tokens, temperature,
+                                                 extra=extra)
         return text
 
     async def complete_with_stats(
@@ -293,6 +401,7 @@ class ModelClient:
         temperature: float | None = None,
         kind: str = "chat",
         conversation_id: str | None = None,
+        extra: dict | None = None,
     ) -> tuple[str, GenerationStats]:
         import httpx
         import uuid as _uuid
@@ -313,19 +422,30 @@ class ModelClient:
                 try:
                     timeout = httpx.Timeout(
                         self.request_timeout(messages, max_tokens), connect=15.0, pool=15.0)
-                    client = self._client()
+                    client = self._client_for(node)
                     resp = await client.post(url, headers=headers, timeout=timeout,
-                                             json=self.payload(messages, False, max_tokens, temperature))
-                    if resp.status_code != 200:
-                        fallback = self.payload(messages, False, max_tokens, temperature)
+                                             json=self.payload(messages, False, max_tokens, temperature, extra))
+                    # The max_tokens-less retry is for a local mlx server that
+                    # rejects the field; a peer applies it itself, and its 502
+                    # or 503 must reach the failover below, not run twice.
+                    if resp.status_code != 200 and (node is None or node.is_local):
+                        fallback = self.payload(messages, False, max_tokens, temperature, extra)
                         fallback.pop("max_tokens", None)
                         resp = await client.post(url, headers=headers, timeout=timeout,
                                                  json=fallback)
                     if resp.status_code != 200:
                         raise RuntimeError(f"model server returned {resp.status_code}: {resp.text[:300]}")
                     data = resp.json()
-                    text = data["choices"][0]["message"]["content"]
-                    stats = self._stats_from_usage(data.get("usage"), messages, text, started, None)
+                    # content can be null (a pure tool-call reply, or mlx-lm's
+                    # "schema requires content" None); reasoning and native
+                    # tool_calls arrive beside it (mlx_lm/server.py
+                    # generate_response: message.reasoning, message.tool_calls).
+                    # The reasoning is NOT prepended here: callers of the
+                    # non-streaming path parse the text directly (routing JSON)
+                    # and never saw reasoning before; only its cost is counted.
+                    text, reasoning_text = _mc_message_text(data["choices"][0].get("message"))
+                    stats = self._stats_from_usage(data.get("usage"), messages, text, started,
+                                                   None, reasoning_text)
                     stats.finish_reason = str(
                         (data["choices"][0] or {}).get("finish_reason") or "")
                     dur = (time.time() - started) * 1000
@@ -347,7 +467,7 @@ class ModelClient:
                                             error=self.classify_error(exc), correlation_id=cid,
                                             task_id=task_id, conversation_id=conversation_id, user_id=get_acting_user())
                     if (node is not None and attempt + 1 < len(targets)
-                            and self._is_connection_error(exc)):
+                            and self._should_fail_over(node, exc)):
                         log_event(get_logger("model"), 30, "model.failover",
                                   from_node=node.name, error=self.classify_error(exc),
                                   correlation_id=cid, task_id=task_id)
@@ -374,6 +494,7 @@ class ModelClient:
         stats: GenerationStats | None = None,
         kind: str = "chat",
         conversation_id: str | None = None,
+        extra: dict | None = None,
     ) -> AsyncGenerator[str, None]:
         """Yield content deltas. When `stats` is passed it is filled in place.
 
@@ -381,7 +502,121 @@ class ModelClient:
         caller needs the numbers even when it breaks out of the loop early, which
         the agent does on every completed tool call. Fails over to another node
         only before the first token arrives (never mid-stream).
+
+        A server that separates reasoning (mlx_lm/server.py puts it in
+        delta.reasoning; others use reasoning_content) has it re-wrapped here
+        as <think>...</think>, so ThinkSplitter shows it live exactly as it does
+        for a model that writes the tags itself; before, it was dropped and a
+        thinking model's whole reasoning phase streamed as silence. Native
+        delta.tool_calls are collected and emitted at the end as the canonical
+        {"tool": ..., "args": ...} text the agent loop already parses.
         """
+        events = self._stream_core(messages, max_tokens, temperature, stats, kind,
+                                   conversation_id, extra)
+        in_think = False
+        said = False
+        calls = _McToolCalls()
+        try:
+            async for event in events:
+                etype = event["type"]
+                if etype == "reasoning":
+                    if not in_think:
+                        in_think = True
+                        yield "<think>"
+                    yield event["text"]
+                elif etype == "content":
+                    if in_think:
+                        in_think = False
+                        yield "</think>"
+                    said = said or bool(event["text"].strip())
+                    yield event["text"]
+                elif etype == "tool_call_delta":
+                    calls.add(event)
+            if in_think:
+                in_think = False
+                yield "</think>"
+            synthesized = calls.protocol_text()
+            if synthesized:
+                yield ("\n" + synthesized) if said else synthesized
+        finally:
+            await events.aclose()
+
+    async def stream_events(
+        self,
+        messages: list[dict],
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        stats: GenerationStats | None = None,
+        kind: str = "chat",
+        conversation_id: str | None = None,
+        extra: dict | None = None,
+    ) -> AsyncGenerator[dict, None]:
+        """Typed generation events, for callers that want structure, not text.
+
+        Yields dicts with a "type":
+          content          {"text"}
+          reasoning        {"text"}
+          tool_call_delta  {"index", "id", "name", "arguments", "source", "done"}
+                           source "native" passes the server's delta.tool_calls
+                           through as they arrive (and a final done=True event
+                           per call carrying parsed "args"); source "prompt" is
+                           a call found in the TEXT by ToolCallStreamDetector,
+                           only when extra={"parse_tool_calls": True} (with an
+                           optional "known_tools" set). Detected call text is
+                           then not repeated as content.
+          finish           {"reason"}  ("stop", "length", "tool_calls")
+          usage            {"usage"}   the server's raw usage object
+        Same routing, failover and cluster bracketing as stream(); `stats` is
+        filled in place the same way.
+        """
+        opts = extra or {}
+        detector = (ToolCallStreamDetector(opts.get("known_tools"))
+                    if opts.get("parse_tool_calls") else None)
+        events = self._stream_core(messages, max_tokens, temperature, stats, kind,
+                                   conversation_id, extra)
+        calls = _McToolCalls()
+        flushed = False
+        try:
+            async for event in events:
+                etype = event["type"]
+                if etype == "content" and detector is not None:
+                    for out in _mc_detector_events(detector.feed(event["text"])):
+                        yield out
+                    continue
+                if etype == "tool_call_delta":
+                    calls.add(event)
+                    yield event
+                    continue
+                if etype == "finish":
+                    for done in calls.finished():
+                        yield done
+                    if detector is not None and not flushed:
+                        flushed = True
+                        for out in _mc_detector_events(
+                                detector.flush(truncated=event["reason"] == "length")):
+                            yield out
+                yield event
+            for done in calls.finished():
+                yield done
+            if detector is not None and not flushed:
+                flushed = True
+                for out in _mc_detector_events(detector.flush()):
+                    yield out
+        finally:
+            await events.aclose()
+
+    async def _stream_core(
+        self,
+        messages: list[dict],
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        stats: GenerationStats | None = None,
+        kind: str = "chat",
+        conversation_id: str | None = None,
+        extra: dict | None = None,
+    ) -> AsyncGenerator[dict, None]:
+        """The one streaming implementation: routing, failover, cluster
+        bracketing and stats, yielding raw typed events (see stream_events)."""
         import httpx
         import uuid as _uuid
         targets = self._targets(kind)
@@ -392,6 +627,7 @@ class ModelClient:
         usage: dict | None = None
         finish_reason = ""
         text_len = 0
+        reasoning_len = 0
         last_error: Exception | None = None
         active_node = None
         node_ended = True
@@ -404,6 +640,7 @@ class ModelClient:
                 first_token_at = None
                 usage = None
                 text_len = 0
+                reasoning_len = 0
                 streaming_started = False
                 active_node, node_ended = node, False
                 if self.cluster is not None and node is not None:
@@ -414,10 +651,10 @@ class ModelClient:
                     # silence rather than capping total generation time. See
                     # request_timeout for the non-streaming path.
                     timeout = httpx.Timeout(self.config.stall_timeout, connect=15.0, pool=15.0)
-                    client = self._client()
+                    client = self._client_for(node)
                     async with client.stream(
                         "POST", url, headers=headers, timeout=timeout,
-                        json=self.payload(messages, True, max_tokens, temperature)
+                        json=self.payload(messages, True, max_tokens, temperature, extra)
                     ) as resp:
                         if resp.status_code != 200:
                             body = (await resp.aread()).decode("utf-8", "replace")
@@ -437,15 +674,35 @@ class ModelClient:
                             choices = data.get("choices") or []
                             if not choices:
                                 continue
-                            if choices[0].get("finish_reason"):
-                                finish_reason = str(choices[0]["finish_reason"])
-                            delta = (choices[0].get("delta") or {}).get("content", "")
-                            if delta:
-                                if first_token_at is None:
-                                    first_token_at = time.time()
-                                    streaming_started = True
-                                text_len += len(delta)
-                                yield delta
+                            choice = choices[0] or {}
+                            delta = choice.get("delta") or {}
+                            content = delta.get("content") or ""
+                            reasoning = (delta.get("reasoning")
+                                         or delta.get("reasoning_content") or "")
+                            native = delta.get("tool_calls") or []
+                            if not native and isinstance(delta.get("function_call"), dict):
+                                native = [{"index": 0, "function": delta["function_call"]}]
+                            if not isinstance(native, list):
+                                native = []
+                            if (content or reasoning or native) and first_token_at is None:
+                                first_token_at = time.time()
+                                streaming_started = True
+                            if isinstance(reasoning, str) and reasoning:
+                                reasoning_len += len(reasoning)
+                                yield {"type": "reasoning", "text": reasoning}
+                            if isinstance(content, str) and content:
+                                text_len += len(content)
+                                yield {"type": "content", "text": content}
+                            for position, call in enumerate(native):
+                                if isinstance(call, dict):
+                                    event = _mc_tool_delta(call, position)
+                                    text_len += len(event["arguments"]) + len(event["name"])
+                                    yield event
+                            if choice.get("finish_reason"):
+                                finish_reason = str(choice["finish_reason"])
+                                yield {"type": "finish", "reason": finish_reason}
+                        if usage:
+                            yield {"type": "usage", "usage": usage}
                     # Completed this node successfully.
                     if self.cluster is not None and node is not None:
                         self.cluster.end(node, True, (time.time() - started) * 1000)
@@ -465,7 +722,7 @@ class ModelClient:
                                             error=self.classify_error(exc), correlation_id=cid,
                                             task_id=task_id, conversation_id=conversation_id, user_id=get_acting_user())
                     if (node is not None and not streaming_started
-                            and attempt + 1 < len(targets) and self._is_connection_error(exc)):
+                            and attempt + 1 < len(targets) and self._should_fail_over(node, exc)):
                         log_event(get_logger("model"), 30, "model.failover",
                                   from_node=node.name, error=self.classify_error(exc),
                                   correlation_id=cid, task_id=task_id)
@@ -485,7 +742,8 @@ class ModelClient:
                 self.cluster.release(task_id)
             if stats is not None:
                 measured = self._stats_from_usage(
-                    usage, messages, "x" * text_len, started, first_token_at
+                    usage, messages, "x" * text_len, started, first_token_at,
+                    "x" * reasoning_len,
                 )
                 stats.prompt_tokens = measured.prompt_tokens
                 stats.completion_tokens = measured.completion_tokens
@@ -493,6 +751,179 @@ class ModelClient:
                 stats.ttft_ms = measured.ttft_ms
                 stats.total_ms = measured.total_ms
                 stats.from_server = measured.from_server
+                stats.cached_tokens = measured.cached_tokens
+                stats.reasoning_tokens = measured.reasoning_tokens
+                stats.ttft_measured = measured.ttft_measured
+
+
+# ---------------------------------------------------------------------------
+# Response intake helpers
+# ---------------------------------------------------------------------------
+# Request keys a caller may pass through payload(extra=...). A whitelist, not a
+# blind merge: "model", "messages", "stream" and "max_tokens" are owned by
+# payload() (routing, the adapter alias and the context budget depend on
+# them), and an arbitrary key from a route body must never reach the server.
+_MC_PASSTHROUGH = frozenset({
+    "tools", "tool_choice", "parallel_tool_calls", "response_format", "stop",
+    "seed", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty",
+    "logit_bias", "logprobs", "top_logprobs", "chat_template_kwargs",
+    "enable_thinking", "reasoning_effort", "num_draft_tokens",
+    "xtc_probability", "xtc_threshold",
+})
+
+
+def _mc_cached_tokens(usage: Any) -> int:
+    """usage.prompt_tokens_details.cached_tokens (mlx_lm/server.py sets it
+    from its prompt cache), or a flat usage.cached_tokens; 0 when absent."""
+    if not isinstance(usage, dict):
+        return 0
+    details = usage.get("prompt_tokens_details")
+    value = details.get("cached_tokens") if isinstance(details, dict) else None
+    if value is None:
+        value = usage.get("cached_tokens")
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _mc_tool_delta(call: dict, position: int) -> dict:
+    """One native tool_calls entry as a typed event.
+
+    Shape per mlx_lm/server.py ToolCallFormatter._format: {"id", "type":
+    "function", "function": {"name", "arguments": <JSON string>}, "index"}.
+    OpenAI-style servers stream the name once and the arguments in fragments,
+    so every field is optional here and _McToolCalls joins them by index.
+    """
+    fn = call.get("function")
+    fn = fn if isinstance(fn, dict) else {}
+    index = call.get("index")
+    if not isinstance(index, int) or isinstance(index, bool):
+        index = position
+    args = fn.get("arguments", call.get("arguments"))
+    if isinstance(args, (dict, list)):
+        args = json.dumps(args, ensure_ascii=False)
+    elif args is None:
+        args = ""
+    name = fn.get("name") or call.get("name") or ""
+    return {"type": "tool_call_delta", "index": index, "id": str(call.get("id") or ""),
+            "name": str(name), "arguments": str(args), "source": "native", "done": False}
+
+
+class _McToolCalls:
+    """Native tool-call deltas joined by index into whole calls."""
+
+    def __init__(self) -> None:
+        self._calls: dict[int, dict] = {}
+        self._emitted: set[int] = set()
+
+    def add(self, event: dict) -> None:
+        if event.get("source", "native") != "native" or event.get("done"):
+            return
+        slot = self._calls.setdefault(event["index"], {"id": "", "name": "", "arguments": ""})
+        if event.get("id") and not slot["id"]:
+            slot["id"] = event["id"]
+        if event.get("name") and not slot["name"]:
+            slot["name"] = event["name"]
+        slot["arguments"] += event.get("arguments") or ""
+
+    def parsed(self) -> list[tuple[int, ParsedToolCall]]:
+        _fmt, repair = tool_call_policy()
+        out = []
+        for index in sorted(self._calls):
+            slot = self._calls[index]
+            name = slot["name"].strip()
+            if not name:
+                continue            # never invent a name for a nameless call
+            repairs: list = []
+            raw = slot["arguments"]
+            args = _tp_args(raw, repair, repairs) if raw.strip() else {}
+            out.append((index, ParsedToolCall(
+                name=name, args=args, raw=raw, format="openai",
+                recovered=bool(repairs), repairs=list(dict.fromkeys(repairs)),
+                id=slot["id"])))
+        return out
+
+    def protocol_text(self) -> str:
+        """The calls as the canonical {"tool", "args"} text the agent parses."""
+        return "\n".join(call.as_protocol() for _i, call in self.parsed())
+
+    def finished(self) -> list[dict]:
+        """A done=True event per whole call not reported yet."""
+        events = []
+        for index, call in self.parsed():
+            if index in self._emitted:
+                continue
+            self._emitted.add(index)
+            events.append({"type": "tool_call_delta", "index": index, "id": call.id,
+                           "name": call.name, "arguments": call.raw, "args": call.args,
+                           "source": "native", "done": True, "recovered": call.recovered,
+                           "repairs": call.repairs})
+        return events
+
+
+def _mc_content_text(content: Any) -> str:
+    """message.content as text: null is "" (a pure tool-call reply), and a
+    list of content parts is joined from its text parts."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(str(part.get("text") or "") for part in content
+                       if isinstance(part, dict) and part.get("type", "text") == "text")
+    return ""
+
+
+def _mc_message_text(message: Any) -> tuple[str, str]:
+    """(answer text, reasoning text) of a non-streaming choices[0].message.
+
+    Native message.tool_calls are appended as canonical protocol text, so a
+    server that parsed the call out of the model's text (mlx-lm does for any
+    tokenizer with a tool parser) no longer hands the agent an empty reply.
+    """
+    if not isinstance(message, dict):
+        return "", ""
+    text = _mc_content_text(message.get("content"))
+    reasoning = message.get("reasoning") or message.get("reasoning_content") or ""
+    native = message.get("tool_calls") or []
+    if not native and isinstance(message.get("function_call"), dict):
+        native = [{"function": message["function_call"]}]
+    if isinstance(native, list) and native:
+        calls = _McToolCalls()
+        for position, call in enumerate(native):
+            if isinstance(call, dict):
+                calls.add(_mc_tool_delta(call, position))
+        synthesized = calls.protocol_text()
+        if synthesized:
+            text = (text.rstrip() + "\n" + synthesized) if text.strip() else synthesized
+    return text, reasoning if isinstance(reasoning, str) else ""
+
+
+def _mc_detector_events(events: list[dict]) -> list[dict]:
+    """ToolCallStreamDetector events as stream_events events (source "prompt").
+
+    An aborted call's text is released as content: it was held back while it
+    looked like a call, so nothing the model wrote is lost.
+    """
+    out = []
+    for ev in events:
+        kind = ev["type"]
+        if kind == "text":
+            out.append({"type": "content", "text": ev["text"]})
+        elif kind == "args_delta":
+            out.append({"type": "tool_call_delta", "index": ev["index"], "id": "",
+                        "name": "", "arguments": ev["delta"], "source": "prompt",
+                        "done": False})
+        elif kind == "call_end":
+            call = ev["call"]
+            out.append({"type": "tool_call_delta", "index": ev["index"], "id": call.id,
+                        "name": call.name,
+                        "arguments": json.dumps(call.args, ensure_ascii=False),
+                        "args": call.args, "source": "prompt", "done": True,
+                        "format": call.format, "recovered": call.recovered,
+                        "repairs": call.repairs, "late": bool(ev.get("late"))})
+        elif kind == "call_abort":
+            out.append({"type": "content", "text": ev["raw"], "aborted_call": ev["index"]})
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -535,5 +966,12 @@ __all__ = [
     'BARE_URL',
     'ModelClient',
     'TRIVIAL_MESSAGE',
+    '_MC_PASSTHROUGH',
+    '_McToolCalls',
     '_TRIVIAL_TAIL',
+    '_mc_cached_tokens',
+    '_mc_content_text',
+    '_mc_detector_events',
+    '_mc_message_text',
+    '_mc_tool_delta',
 ]

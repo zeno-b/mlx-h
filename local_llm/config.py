@@ -16,6 +16,7 @@ from typing import Literal
 
 from .core import *  # noqa: F401,F403
 from .sysutil import *  # noqa: F401,F403
+from .toolparse import *  # noqa: F401,F403
 
 
 # The search provider is locked to DuckDuckGo Lite (see websearch.SearchBackend).
@@ -811,6 +812,287 @@ class Config:
     import_max_uncompressed_bytes: int = field(default_factory=lambda: int(os.environ.get("IMPORT_MAX_UNCOMPRESSED_BYTES", str(1024 * 1024 * 1024))))
     import_max_file_bytes: int = field(default_factory=lambda: int(os.environ.get("IMPORT_MAX_FILE_BYTES", str(50 * 1024 * 1024))))
 
+    # ----------------------------------------------------------------- #
+    # Feature settings. Each feature adds its own commented block of fields
+    # ABOVE the marker line below (never edit another feature's block). Keep
+    # defaults scalar (bool/int/float/str): the /api/config schema is generated
+    # from MUTABLE by default-value type and skips anything else. Structured
+    # values are JSON strings.
+    # ----------------------------------------------------------------- #
+    # --- Admission control (item 6, admission.py) --------------------------- #
+    # max_concurrent_generations / generation_queue_depth (above) stay the slot
+    # count and the waiting-room MULTIPLIER (max waiting = slots x depth); these
+    # two add the memory half. With memory awareness on, a request that would
+    # leave less than admission_min_free_mb of free memory (after the KV
+    # reserved by everything already running, plus its own) waits for a running
+    # generation to finish instead of starting; a request is still always
+    # admitted when nothing else is running. Free memory is read from psutil or
+    # vm_stat; when neither works the check switches itself off. The floor
+    # scales with RAM because the backend's own working set (prompt cache,
+    # Metal buffer cache) does: 384MB on 8GB, 768MB up to 24GB, 1.5GB above.
+    # Off by default so an upgrade admits exactly what the slot gate did; turn
+    # it on (env or Settings) once the floor suits the machine.
+    admission_memory_aware: bool = field(default_factory=lambda: os.environ.get(
+        "ADMISSION_MEMORY_AWARE", "0") == "1")
+    admission_min_free_mb: int = field(default_factory=lambda: int(
+        os.environ.get("ADMISSION_MIN_FREE_MB")
+        or (384 if TOTAL_RAM_GB < 14 else 768 if TOTAL_RAM_GB <= 24 else 1536)))
+    # --- Inference backend (item 1, backends.py) --------------------------- #
+    # Which engine serves the model. "mlx-lm" is today's mlx_lm.server command
+    # line, unchanged; "mlx-lm-turbo" is the same server with batching, prompt
+    # cache and speculative decoding sized from RAM and concurrency;
+    # "openai-external" launches BACKEND_COMMAND. Restart-only: the engine is a
+    # process, and the UI cannot swap it under a running generation.
+    model_backend: str = field(default_factory=lambda: os.environ.get(
+        "MODEL_BACKEND", "mlx-lm").strip().lower())
+    # Speculative decoding: a small model of the same family proposes tokens
+    # the served model verifies. "" is off; "auto" asks the model catalogue.
+    # On mlx-lm 0.32 a loaded draft model turns continuous batching off.
+    draft_model: str = field(default_factory=lambda: os.environ.get("DRAFT_MODEL", "").strip())
+    # Tokens the draft proposes per step. 0 keeps the server's default (3).
+    num_draft_tokens: int = field(default_factory=lambda: int(
+        os.environ.get("NUM_DRAFT_TOKENS", "0")))
+    # openai-external only: the start command, with {python} {model} {port}
+    # {host} {adapter} {draft_model} placeholders, and the comma-separated
+    # capability names the engine has (backends.BACKEND_CAPABILITIES).
+    backend_command: str = field(default_factory=lambda: os.environ.get("BACKEND_COMMAND", ""))
+    backend_capabilities: str = field(default_factory=lambda: os.environ.get(
+        "BACKEND_CAPABILITIES", ""))
+    # Appended verbatim (shell-split) to any backend's command line: an escape
+    # hatch for a flag this app does not model yet.
+    backend_extra_args: str = field(default_factory=lambda: os.environ.get(
+        "BACKEND_EXTRA_ARGS", ""))
+    # --- Cluster, sharding, remote access (items 4, 15, 20: cluster.py, ------ #
+    # sharding.py, nodesec.py, remote_access.py). All restart-only: they shape
+    # the node set, the listening socket or the peer clients, which are built
+    # once at startup.
+    # Peer nodes: a JSON list ([{"name": "studio", "url": "https://...",
+    # "ram_gb": 64}] or ["https://..."]) or comma-separated URLs. Merged with
+    # STUDIO_NODE_URL (the one-node shorthand). Empty: nodes paired with
+    # `deploy.py cluster join` (DATA_DIR/cluster_nodes.json) are used instead.
+    cluster_nodes: str = field(default_factory=lambda: os.environ.get("CLUSTER_NODES", "").strip())
+    # mlx.launch hostfile for MODEL_BACKEND=mlx-distributed (layer-sharded
+    # serving). Empty means DATA_DIR/cluster_hostfile.json.
+    cluster_hostfile: str = field(default_factory=lambda: os.environ.get("CLUSTER_HOSTFILE", "").strip())
+    # Interface the web server binds. Anything but loopback is refused unless
+    # AUTH_ENABLED=1 (and warned about unless AUTH_COOKIE_SECURE=1).
+    web_host: str = field(default_factory=lambda: os.environ.get("WEB_HOST", "127.0.0.1").strip())
+    # Reverse proxies whose X-Forwarded-For is believed (comma IPs/CIDRs).
+    # Empty: the socket peer is the client, exactly as before.
+    trusted_proxies: str = field(default_factory=lambda: os.environ.get("TRUSTED_PROXIES", "").strip())
+    # The externally visible origin (https://llm.example.com) behind a proxy or
+    # tunnel; the OIDC redirect URI is derived from it.
+    public_base_url: str = field(default_factory=lambda: os.environ.get("PUBLIC_BASE_URL", "").strip())
+    # TLS for peer node URLs: a private CA bundle and an optional client cert.
+    node_ca_file: str = field(default_factory=lambda: os.environ.get("NODE_CA_FILE", "").strip())
+    node_client_cert: str = field(default_factory=lambda: os.environ.get("NODE_CLIENT_CERT", "").strip())
+    node_client_key: str = field(default_factory=lambda: os.environ.get("NODE_CLIENT_KEY", "").strip())
+    # Plain http:// to a non-private, non-tailnet peer is refused unless this is 1.
+    node_allow_plaintext: bool = field(default_factory=lambda: os.environ.get("NODE_ALLOW_PLAINTEXT", "0") == "1")
+    # Optional end-to-end sealing key for node traffic (32 bytes, hex or
+    # base64; needs the optional `cryptography` package). SECRET.
+    node_e2e_key: str = field(default_factory=lambda: os.environ.get("NODE_E2E_KEY", "").strip())
+    # Tool-call parsing (toolparse.py). "auto" accepts every model family's
+    # format (Hermes <tool_call>, Qwen3-Coder <function=...>, Llama 3.x,
+    # Mistral [TOOL_CALLS], pythonic, Gemma, DeepSeek, Kimi, GLM, gpt-oss);
+    # a comma list narrows it. The canonical {"tool","args"} JSON is always on.
+    tool_call_format: str = field(default_factory=lambda: os.environ.get("TOOL_CALL_FORMAT", "auto").strip())
+    # Recover broken structured output (4-bit models drop quotes, leave
+    # trailing commas, stop before the closing brace). Every repair is
+    # recorded on the parsed call; tool names are never invented.
+    tool_call_repair: bool = field(default_factory=lambda: os.environ.get("TOOL_CALL_REPAIR", "1") == "1")
+    # Model catalogue (catalog.py). MODEL_ALIASES is a JSON object of
+    # {"alias": "repo/id"} merged over the built-in aliases (fast, balanced,
+    # coder, reasoning, vision, tiny, large). model_alias is informational: the
+    # alias --model / MODEL_ID named, while `model` always holds the resolved id.
+    model_aliases: str = field(default_factory=lambda: os.environ.get("MODEL_ALIASES", "").strip())
+    model_alias: str = ""
+    # Benchmark recommendation (deploy.py recommend): the slowest decode speed a
+    # recommended model may have, and RAM kept free beyond its measured peak
+    # (0 = automatic: the larger of 2.5GB and a quarter of RAM).
+    bench_min_decode_tps: float = field(default_factory=lambda: float(
+        os.environ.get("BENCH_MIN_DECODE_TPS", "10")))
+    bench_headroom_gb: float = field(default_factory=lambda: float(
+        os.environ.get("BENCH_HEADROOM_GB", "0")))
+    # Training methods and autopilot (train_methods.py). sft is the original
+    # mlx_lm.lora loop, unchanged; dpo/orpo/grpo run through the optional
+    # mlx-lm-lora package and are refused (never silently SFT) without it; kto
+    # is export-only (no installed trainer implements it).
+    train_method: str = field(default_factory=lambda: os.environ.get("TRAIN_METHOD", "sft").strip().lower())
+    # 1: derive layers, rank, batch, sequence window and gradient checkpointing
+    # from RAM, the model's config.json and the corpus, and refuse a run that
+    # will not fit. 0 keeps the configured recipe exactly.
+    train_autopilot: bool = field(default_factory=lambda: os.environ.get("TRAIN_AUTOPILOT", "0") == "1")
+    # Preference strength for DPO/ORPO/GRPO (mlx_lm_lora --beta; its default 0.1).
+    train_beta: float = field(default_factory=lambda: float(os.environ.get("TRAIN_BETA", "0.1")))
+    # Reference model for DPO/GRPO. Empty: the base model. A path must be a full
+    # model directory (fuse an adapter first); mlx_lm_lora loads it without one.
+    train_reference_adapter: str = field(default_factory=lambda: os.environ.get("TRAIN_REFERENCE_ADAPTER", "").strip())
+    # GRPO reward terms and weights (experimental): tool_call, format, length.
+    train_grpo_rewards: str = field(default_factory=lambda: os.environ.get("TRAIN_GRPO_REWARDS", "tool_call:1.0,format:0.5,length:0.25").strip())
+    # Promote a preference run that produced no comparable metric (GRPO always,
+    # DPO/ORPO without validation points). Off: such runs are rolled back.
+    train_promote_ungated: bool = field(default_factory=lambda: os.environ.get("TRAIN_PROMOTE_UNGATED", "0") == "1")
+    # --- Chat turns (streams.py) ---
+    # Seconds a streaming chat turn keeps running after its client disconnects,
+    # so a page reload or a dropped connection can resume it (GET
+    # /api/chat/turns/{id}/events) instead of losing the work in flight. 0
+    # cancels on disconnect, as before turns were resumable.
+    turn_detach_grace_s: float = field(default_factory=lambda: float(os.environ.get("TURN_DETACH_GRACE_S", "30")))
+    # Workspaces and projects (workspaces.py). 1: a non-admin's file tools work
+    # in their own WORKSPACE_DIR/users/<id> (created on first use) and a turn
+    # can be confined to a project root; admins keep PROJECT_DIR. 0 keeps the
+    # single installation root everyone shared before.
+    workspaces_enabled: bool = field(default_factory=lambda: os.environ.get("WORKSPACES_ENABLED", "0") == "1")
+    # Parent directories an admin may put a shared project's root under (comma
+    # list). Empty: the workspace directory and PROJECT_DIR. With workspaces on
+    # it also confines the admin folder browser (/api/browse).
+    workspace_roots: str = field(default_factory=lambda: os.environ.get("WORKSPACE_ROOTS", "").strip())
+    # Tool approval policy (policy.py). off = every call runs as before (only
+    # explicit override rows apply); risky = write/exec/external calls wait for
+    # the user's approval; all = every call does.
+    tool_approval_mode: str = field(default_factory=lambda: os.environ.get(
+        "TOOL_APPROVAL_MODE", "off").strip().lower())
+    # What "ask" becomes when nobody can answer (scheduled task, API call):
+    # deny (default) or allow.
+    tool_approval_unattended: str = field(default_factory=lambda: os.environ.get(
+        "TOOL_APPROVAL_UNATTENDED", "deny").strip().lower())
+    # Seconds an approval prompt waits before it counts as a refusal.
+    tool_approval_timeout_s: int = field(default_factory=lambda: int(
+        os.environ.get("TOOL_APPROVAL_TIMEOUT_S", "120")))
+    # Prompt-injection defence: after a turn read web/MCP/mail content, its
+    # write/exec/external calls need a fresh approval (when the mode is not off).
+    tool_approval_taint: bool = field(default_factory=lambda: os.environ.get(
+        "TOOL_APPROVAL_TAINT", "1") == "1")
+    # Per-role rules, JSON: {"user": {"risk:exec": "deny"}, "admin": {"*": "allow"}}.
+    tool_approval_roles: str = field(default_factory=lambda: os.environ.get(
+        "TOOL_APPROVAL_ROLES", "").strip())
+    # OpenAI / Anthropic compatible API (openai_compat.py, anthropic_compat.py).
+    # What a /v1 request whose model is a plain alias or repo id runs as:
+    # "agent" (this app's agent with its server-side tools, today's
+    # /v1/chat/completions behaviour) or "raw" (the model with the client's own
+    # tools, for coding clients that run their own tool loop). "raw/<alias>"
+    # and "agent/<profile>" model names choose per request either way.
+    v1_default_mode: str = field(default_factory=lambda: os.environ.get(
+        "V1_DEFAULT_MODE", "agent").strip().lower())
+    # 0 refuses raw mode entirely (every /v1 request then runs the agent).
+    v1_raw_enabled: bool = field(default_factory=lambda: os.environ.get(
+        "V1_RAW_ENABLED", "1") == "1")
+    # API tokens and CLI sign-in (api_tokens.py, auth.py device flow).
+    # Lifetime of a new API token in days, and the longest one a request may
+    # ask for (a request can shorten it, never extend it); 0 = no expiry.
+    api_token_default_ttl_days: int = field(default_factory=lambda: int(
+        os.environ.get("API_TOKEN_DEFAULT_TTL_DAYS", "90")))
+    # Entra app registration with "Allow public client flows" for terminal
+    # sign-in (OIDC device code). Empty = device sign-in off. A public client
+    # id is not a secret; it may equal OIDC_CLIENT_ID when that app allows it.
+    oidc_cli_client_id: str = field(default_factory=lambda: os.environ.get(
+        "OIDC_CLI_CLIENT_ID", "").strip())
+    # MCP server endpoint and the gated tool set (mcp_server.py, tools_extra.py).
+    # Capability keys per role, JSON: {"user": ["web_search", "file_ops"],
+    # "admin": ["*"]}. A role that is not listed keeps every capability, so the
+    # empty default is today's rule (the profile alone decides). Narrows agent
+    # profiles in chat and the tools this app offers as an MCP server.
+    role_capabilities: str = field(default_factory=lambda: os.environ.get(
+        "ROLE_CAPABILITIES", "").strip())
+    # Serve this app's tools to MCP clients (Claude Code, IDEs) at POST /mcp,
+    # behind the same sign-in. Off by default: it is a new way in.
+    mcp_server_enabled: bool = field(default_factory=lambda: os.environ.get(
+        "MCP_SERVER_ENABLED", "0") == "1")
+    # Which of the newer tools (browse_page, git, http_request, ...) the default
+    # agent registers when it has no allowlist: "" none (today's prompt), "all",
+    # or a comma list. A profile that grants a capability gets its tools anyway.
+    extra_tools: str = field(default_factory=lambda: os.environ.get(
+        "EXTRA_TOOLS", "").strip())
+    # Read-only databases for the database tool, JSON {"name": "/path/to.db"}
+    # (SQLite). SQLite files inside the acting root are always reachable.
+    database_urls: str = field(default_factory=lambda: os.environ.get(
+        "DATABASE_URLS", "").strip())
+    # notify tool channels: a webhook (ntfy / Slack-compatible JSON POST; the
+    # URL usually embeds a token, so it is a secret) and a macOS notification
+    # when the server runs on this Mac's own console session.
+    notify_webhook_url: str = field(default_factory=lambda: os.environ.get(
+        "NOTIFY_WEBHOOK_URL", "").strip())
+    notify_macos: bool = field(default_factory=lambda: os.environ.get(
+        "NOTIFY_MACOS", "1") == "1")
+    # image_generate: a command template run without a shell, with {prompt},
+    # {output}, {width}, {height}, {steps} filled per argument. Empty uses
+    # mflux-generate when it is installed; otherwise the tool says it is
+    # unavailable.
+    image_gen_command: str = field(default_factory=lambda: os.environ.get(
+        "IMAGE_GEN_COMMAND", "").strip())
+    image_gen_timeout_s: int = field(default_factory=lambda: int(
+        os.environ.get("IMAGE_GEN_TIMEOUT_S", "600")))
+    # Mailbox the email/calendar/contacts tools fall back to when the acting
+    # user has no address of their own (auth off, or an admin). A signed-in
+    # user only ever reaches their own mailbox.
+    o365_user: str = field(default_factory=lambda: os.environ.get("O365_USER", "").strip())
+    # Multimodal input (attachments.py, audio.py, vision.py). Uploads a chat
+    # turn can attach: images, audio (transcribed) and documents (read as text).
+    attachments_enabled: bool = field(default_factory=lambda: os.environ.get(
+        "ATTACHMENTS_ENABLED", "1") == "1")
+    # Largest single upload, in bytes (also caps /v1/audio/transcriptions).
+    attachment_max_bytes: int = field(default_factory=lambda: int(
+        os.environ.get("ATTACHMENT_MAX_BYTES", str(20 * 1024 * 1024))))
+    # Total stored per user, in MB; 0 = unlimited.
+    attachment_quota_mb: int = field(default_factory=lambda: int(
+        os.environ.get("ATTACHMENT_QUOTA_MB", "1024")))
+    # Where uploads are stored. Empty: DATA_DIR/attachments (next to the database).
+    attachments_dir: str = field(default_factory=lambda: os.environ.get(
+        "ATTACHMENTS_DIR", "").strip())
+    # Can the served model see images? auto asks the engine and the model
+    # (vision.served_vision); on/off override it for setups auto cannot see.
+    vision_mode: str = field(default_factory=lambda: os.environ.get(
+        "VISION_MODE", "auto").strip().lower())
+    # Speech-to-text model (mlx-whisper) and text-to-speech model and voice
+    # (mlx-audio). Loaded on first use only; never downloaded unless used.
+    whisper_model: str = field(default_factory=lambda: os.environ.get(
+        "WHISPER_MODEL", "mlx-community/whisper-tiny").strip())
+    tts_model: str = field(default_factory=lambda: os.environ.get(
+        "TTS_MODEL", "mlx-community/Kokoro-82M-bf16").strip())
+    tts_voice: str = field(default_factory=lambda: os.environ.get(
+        "TTS_VOICE", "af_heart").strip())
+    # Cloud fallback for oversized prefill (cloud.py). Off by default, which is
+    # today's behaviour: every prompt stays on this machine. On, a prompt the
+    # local model cannot prefill well (larger than the context window even after
+    # trimming, slower than CLOUD_MIN_PREFILL_S at the measured prompt speed, or
+    # at least CLOUD_MIN_PROMPT_TOKENS) may go to a cloud model, but only for an
+    # allowed role and only after that user's consent.
+    cloud_fallback_enabled: bool = field(default_factory=lambda: os.environ.get(
+        "CLOUD_FALLBACK_ENABLED", "0") == "1")
+    # openai: any OpenAI-compatible /chat/completions endpoint; anthropic: /v1/messages.
+    cloud_provider: str = field(default_factory=lambda: os.environ.get(
+        "CLOUD_PROVIDER", "openai").strip().lower())
+    # Empty: the provider's public endpoint (https://api.openai.com/v1 or
+    # https://api.anthropic.com). Restart-only, like the key: it is where
+    # user content goes.
+    cloud_base_url: str = field(default_factory=lambda: os.environ.get(
+        "CLOUD_BASE_URL", "").strip())
+    cloud_model: str = field(default_factory=lambda: os.environ.get(
+        "CLOUD_MODEL", "").strip())
+    cloud_api_key: str = field(default_factory=lambda: os.environ.get(
+        "CLOUD_API_KEY", "").strip())
+    # per_request asks on every turn that would go to the cloud; per_user also
+    # offers "this conversation" and "always", which unattended runs may use.
+    cloud_consent: str = field(default_factory=lambda: os.environ.get(
+        "CLOUD_CONSENT", "per_request").strip().lower())
+    # Offer the cloud when the estimated local prefill takes at least this many
+    # seconds at the measured prompt speed; 0 turns this trigger off.
+    cloud_min_prefill_s: float = field(default_factory=lambda: float(
+        os.environ.get("CLOUD_MIN_PREFILL_S", "120")))
+    # Offer the cloud for any prompt of at least this many tokens; 0 = off.
+    cloud_min_prompt_tokens: int = field(default_factory=lambda: int(
+        os.environ.get("CLOUD_MIN_PROMPT_TOKENS", "0")))
+    # Who may be offered the cloud: role names and user:<id or username>
+    # entries, comma separated; * is everyone.
+    cloud_allowed_roles: str = field(default_factory=lambda: os.environ.get(
+        "CLOUD_ALLOWED_ROLES", "admin").strip())
+    # Cloud tokens (prompt + reply) one user may spend per calendar month (UTC);
+    # 0 = no cap.
+    cloud_max_tokens_per_user_month: int = field(default_factory=lambda: int(
+        os.environ.get("CLOUD_MAX_TOKENS_PER_USER_MONTH", "0")))
+    # ---- extension fields: feature blocks above this line ---- #
+
     seed_demo: bool = False
     retrain_now: bool = False
     export_only: bool = False
@@ -821,7 +1103,15 @@ class Config:
     SECRET_FIELDS = (
         "admin_password", "test_password", "oidc_client_secret", "node_token",
         "o365_client_secret",
+        "node_e2e_key",   # cluster: E2E sealing key for node traffic
+        "notify_webhook_url",   # notify tool: webhook URLs carry their token
+        "cloud_api_key",   # cloud fallback: the provider's API key
+        # ---- extension secrets: above this line ---- #
     )
+    # JSON settings shown by public() with their credential-like values masked
+    # (see mask_structured_secrets), so GET /api/config and --print-config
+    # never print an MCP bearer token or a server env secret.
+    MASKED_STRUCTURED_FIELDS = ("mcp_servers", "database_urls")
 
     # Settings the web UI is allowed to change at runtime. Anything not listed
     # here needs a process restart and is rejected by /api/config.
@@ -882,6 +1172,44 @@ class Config:
         "route_mem_pct", "route_load_ratio", "route_sla_ms", "route_cooldown_s",
         "large_model_markers",
         "heartbeat_interval", "heartbeat_timeout",
+        # Admission control: the slot count and queue multiplier resize the
+        # live controller (POST /api/config calls resize), the memory floor and
+        # switch are re-read by it immediately.
+        "max_concurrent_generations", "generation_queue_depth",
+        "admission_memory_aware", "admission_min_free_mb",
+        # Tool-call parsing: read on every parse, so a change applies to the
+        # next reply.
+        "tool_call_format", "tool_call_repair",
+        # Model catalogue: aliases resolve on the next switch; the bench
+        # thresholds apply to the next recommendation.
+        "model_aliases", "bench_min_decode_tps", "bench_headroom_gb",
+        # Training method and autopilot: read when a run starts.
+        "train_method", "train_autopilot", "train_beta", "train_reference_adapter",
+        "train_grpo_rewards", "train_promote_ungated",
+        # Chat turns: read when a client disconnects, so it applies to the
+        # next detach.
+        "turn_detach_grace_s",
+        # Workspaces: read on every tool call (the root resolves per context),
+        # so a change applies to the next call.
+        "workspaces_enabled", "workspace_roots",
+        # Tool approval policy: read on every tool call, so a change applies
+        # to the next call.
+        "tool_approval_mode", "tool_approval_unattended", "tool_approval_timeout_s",
+        "tool_approval_taint", "tool_approval_roles",
+        # OpenAI / Anthropic compatible API: read per request, so a change
+        # applies to the next /v1 call.
+        "v1_default_mode", "v1_raw_enabled",
+        # MCP server endpoint and role capabilities: read per request.
+        "mcp_server_enabled", "role_capabilities",
+        # Multimodal input: limits are read per upload, the vision mode per
+        # turn, the speech models on their next load.
+        "attachments_enabled", "attachment_max_bytes", "attachment_quota_mb",
+        "vision_mode", "whisper_model", "tts_model", "tts_voice",
+        # Cloud fallback: read on every model call, so a change applies to the
+        # next one. Provider, endpoint, model and key stay restart-only.
+        "cloud_fallback_enabled", "cloud_consent", "cloud_min_prefill_s",
+        "cloud_min_prompt_tokens", "cloud_allowed_roles", "cloud_max_tokens_per_user_month",
+        # ---- extension mutable settings: one commented group per feature, above this line ---- #
     )
 
     # The only supported search provider. DuckDuckGo Lite, exclusively.
@@ -1013,6 +1341,14 @@ class Config:
         for secret in self.SECRET_FIELDS:
             if secret in data:
                 data[secret] = "***set***" if data.get(secret) else ""
+        # Structured settings that may EMBED credentials (MCP server headers and
+        # env, a DSN with a password). Not SECRET_FIELDS: those are blanked on
+        # load from saved settings and reported only as set/unset, and the
+        # shape of these (which servers, which databases) is worth showing.
+        # Only the values that could be credentials are masked.
+        for name in self.MASKED_STRUCTURED_FIELDS:
+            if data.get(name):
+                data[name] = mask_structured_secrets(str(data[name]))
         data["mutable"] = list(self.MUTABLE)
         return data
 
@@ -1280,6 +1616,237 @@ class Config:
         self.import_max_uncompressed_bytes = max(1024, self.import_max_uncompressed_bytes)
         self.import_max_file_bytes = max(1024, self.import_max_file_bytes)
 
+        # --- Admission control ----------------------------------------------- #
+        # GenerationGate already floored both at 1 internally, so the clamp only
+        # makes the stored value match what the gate uses. 64 slots is beyond
+        # any Mac's KV budget; the multiplier caps the waiting room at 64x that.
+        self.max_concurrent_generations = min(64, max(1, self.max_concurrent_generations))
+        self.generation_queue_depth = min(64, max(1, self.generation_queue_depth))
+        self.admission_min_free_mb = min(1_048_576, max(0, self.admission_min_free_mb))
+
+        # --- Inference backend ----------------------------------------------- #
+        # An unknown backend name is NOT rewritten here: backends.get_backend
+        # falls back to mlx-lm with a warning, and /api/backends shows what was
+        # asked for. Only the shape is normalised.
+        self.model_backend = str(self.model_backend or "mlx-lm").strip().lower() or "mlx-lm"
+        self.draft_model = str(self.draft_model or "").strip()
+        self.num_draft_tokens = min(64, max(0, int(self.num_draft_tokens or 0)))
+        self.backend_command = str(self.backend_command or "").strip()
+        self.backend_capabilities = ",".join(
+            part.strip().lower() for part in str(self.backend_capabilities or "").split(",")
+            if part.strip())
+        self.backend_extra_args = str(self.backend_extra_args or "").strip()
+
+        # --- Cluster / remote access ---------------------------------------- #
+        # An empty bind host would make uvicorn listen on every interface,
+        # the opposite of what "unset" should mean.
+        self.web_host = str(self.web_host or "").strip() or "127.0.0.1"
+        self.public_base_url = str(self.public_base_url or "").strip().rstrip("/")
+
+        # --- Tool-call parsing --- #
+        # An unknown format name falls back to "auto": a typo must not
+        # silently stop every non-JSON tool call from parsing.
+        self.tool_call_format = normalise_tool_call_format(self.tool_call_format)
+        self.tool_call_repair = bool(self.tool_call_repair)
+
+        # --- Model catalogue --- #
+        # MODEL_ALIASES must be a JSON object of non-empty strings. A malformed
+        # value is refused, not adopted, for the same reason as model_cutoff: a
+        # typo in the Settings panel must not wipe aliases that MODEL_ID or a
+        # client already depends on. The last good value is remembered on the
+        # instance (apply({}) runs at construction, so it always exists);
+        # dropping the key from `changed` puts it in /api/config's `ignored`.
+        _cat_raw = str(self.model_aliases or "").strip()
+        try:
+            _cat_obj = json.loads(_cat_raw) if _cat_raw else {}
+            _cat_ok = isinstance(_cat_obj, dict) and all(
+                isinstance(k, str) and k.strip() and "/" not in k
+                and isinstance(v, str) and v.strip() for k, v in _cat_obj.items())
+        except ValueError:
+            _cat_ok = False
+        if _cat_ok:
+            self.model_aliases = _cat_raw
+            self.__dict__["_catalog_aliases_ok"] = _cat_raw
+        else:
+            _cat_prev = self.__dict__.get("_catalog_aliases_ok", "")
+            log(f"Ignoring invalid MODEL_ALIASES {_cat_raw[:80]!r} (expected a JSON "
+                'object like {"chat": "mlx-community/Qwen2.5-3B-Instruct-4bit"}); '
+                "keeping the previous aliases.", logging.WARNING)
+            self.model_aliases = _cat_prev
+            if "model_aliases" in changed:
+                changed.remove("model_aliases")
+        self.bench_min_decode_tps = min(200.0, max(1.0, float(self.bench_min_decode_tps)))
+        self.bench_headroom_gb = min(256.0, max(0.0, float(self.bench_headroom_gb)))
+
+        # --- Training methods --- #
+        # An unknown method is kept (normalised) rather than rewritten to sft:
+        # the run then refuses it by name, where a rewrite would train SFT
+        # silently on a typo.
+        self.train_method = str(self.train_method or "sft").strip().lower() or "sft"
+        self.train_autopilot = bool(self.train_autopilot)
+        try:
+            beta = float(self.train_beta)
+        except (TypeError, ValueError):
+            beta = 0.1
+        self.train_beta = min(10.0, max(0.0, beta if beta == beta else 0.1))
+        self.train_reference_adapter = str(self.train_reference_adapter or "").strip()
+        self.train_grpo_rewards = str(self.train_grpo_rewards or "").strip()
+        self.train_promote_ungated = bool(self.train_promote_ungated)
+
+        # --- Chat turns ---
+        try:
+            grace = float(self.turn_detach_grace_s)
+        except (TypeError, ValueError):
+            grace = 30.0
+        # NaN fails every comparison, so it would survive min/max untouched.
+        self.turn_detach_grace_s = min(600.0, max(0.0, grace if grace == grace else 30.0))
+
+        # --- Workspaces --- #
+        self.workspaces_enabled = bool(self.workspaces_enabled)
+        self.workspace_roots = ",".join(
+            part.strip() for part in str(self.workspace_roots or "").split(",") if part.strip())
+
+        # --- Tool approval policy --- #
+        # An unknown mode becomes "risky", not "off": a typo in a safety
+        # setting must fail towards asking, never towards silently allowing.
+        _pol_mode = str(self.tool_approval_mode or "").strip().lower()
+        _pol_aliases = {"": "off", "0": "off", "false": "off", "none": "off",
+                        "1": "risky", "true": "risky", "on": "risky", "ask": "risky"}
+        _pol_mode = _pol_aliases.get(_pol_mode, _pol_mode)
+        if _pol_mode not in ("off", "risky", "all"):
+            log(f"Unknown TOOL_APPROVAL_MODE {_pol_mode[:40]!r}; using 'risky'.",
+                logging.WARNING)
+            _pol_mode = "risky"
+        self.tool_approval_mode = _pol_mode
+        self.tool_approval_unattended = (
+            "allow" if str(self.tool_approval_unattended or "").strip().lower() == "allow"
+            else "deny")
+        try:
+            _pol_timeout = int(self.tool_approval_timeout_s)
+        except (TypeError, ValueError):
+            _pol_timeout = 120
+        self.tool_approval_timeout_s = min(3600, max(5, _pol_timeout))
+        self.tool_approval_taint = bool(self.tool_approval_taint)
+        # TOOL_APPROVAL_ROLES must be a JSON object of objects; a malformed value
+        # is refused (kept at the last good one), like MODEL_ALIASES above.
+        _pol_raw = str(self.tool_approval_roles or "").strip()
+        try:
+            _pol_obj = json.loads(_pol_raw) if _pol_raw else {}
+            _pol_ok = isinstance(_pol_obj, dict) and all(
+                isinstance(v, dict) for v in _pol_obj.values())
+        except (TypeError, ValueError):
+            _pol_ok = False
+        if _pol_ok:
+            self.tool_approval_roles = _pol_raw
+            self.__dict__["_policy_roles_ok"] = _pol_raw
+        else:
+            log(f"Ignoring invalid TOOL_APPROVAL_ROLES {_pol_raw[:80]!r} (expected a JSON "
+                'object like {"user": {"risk:exec": "ask"}}).', logging.WARNING)
+            self.tool_approval_roles = self.__dict__.get("_policy_roles_ok", "")
+            if "tool_approval_roles" in changed:
+                changed.remove("tool_approval_roles")
+
+        # --- OpenAI / Anthropic compatible API ---
+        _v1_mode = str(self.v1_default_mode or "").strip().lower()
+        if _v1_mode not in ("agent", "raw"):
+            log(f"Ignoring invalid V1_DEFAULT_MODE {_v1_mode[:40]!r} (expected agent or raw); "
+                "using agent.", logging.WARNING)
+            _v1_mode = "agent"
+        self.v1_default_mode = _v1_mode
+        self.v1_raw_enabled = bool(self.v1_raw_enabled)
+
+        # --- API tokens / CLI sign-in ---
+        try:
+            _tok_ttl = int(self.api_token_default_ttl_days)
+        except (TypeError, ValueError):
+            _tok_ttl = 90
+        self.api_token_default_ttl_days = min(3650, max(0, _tok_ttl))
+        self.oidc_cli_client_id = str(self.oidc_cli_client_id or "").strip()
+
+        # --- MCP server + gated tools ---
+        self.mcp_server_enabled = bool(self.mcp_server_enabled)
+        # ROLE_CAPABILITIES must be a JSON object of lists; a malformed value is
+        # refused (kept at the last good one) rather than locking everyone out
+        # or, worse, silently granting everything a typo was meant to narrow.
+        _rc_raw = str(self.role_capabilities or "").strip()
+        try:
+            _rc_obj = json.loads(_rc_raw) if _rc_raw else {}
+            _rc_ok = isinstance(_rc_obj, dict) and all(
+                isinstance(v, list) and all(isinstance(c, str) for c in v)
+                for v in _rc_obj.values())
+        except (TypeError, ValueError):
+            _rc_ok = False
+        if _rc_ok:
+            self.role_capabilities = _rc_raw
+            self.__dict__["_role_caps_ok"] = _rc_raw
+        else:
+            log(f"Ignoring invalid ROLE_CAPABILITIES {_rc_raw[:80]!r} (expected a JSON "
+                'object like {"user": ["web_search"], "admin": ["*"]}).', logging.WARNING)
+            self.role_capabilities = self.__dict__.get("_role_caps_ok", "")
+            if "role_capabilities" in changed:
+                changed.remove("role_capabilities")
+        try:
+            _ig_timeout = int(self.image_gen_timeout_s)
+        except (TypeError, ValueError):
+            _ig_timeout = 600
+        self.image_gen_timeout_s = min(3600, max(10, _ig_timeout))
+        # --- Multimodal input ---
+        self.attachments_enabled = bool(self.attachments_enabled)
+        self.attachment_max_bytes = min(512 * 1024 * 1024,
+                                        max(1024, int(self.attachment_max_bytes)))
+        self.attachment_quota_mb = min(1024 * 1024, max(0, int(self.attachment_quota_mb)))
+        _mm_vision = str(self.vision_mode or "").strip().lower()
+        if _mm_vision not in ("auto", "on", "off"):
+            log(f"Ignoring invalid VISION_MODE {_mm_vision[:40]!r} (expected auto, on or "
+                "off); using auto.", logging.WARNING)
+            _mm_vision = "auto"
+        self.vision_mode = _mm_vision
+        # Repo ids and voice names only: these reach a model loader, so a path
+        # or URL typed into Settings must not.
+        for _mm_name, _mm_default in (("whisper_model", "mlx-community/whisper-tiny"),
+                                      ("tts_model", "mlx-community/Kokoro-82M-bf16"),
+                                      ("tts_voice", "af_heart")):
+            _mm_value = str(getattr(self, _mm_name) or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*(/[A-Za-z0-9][A-Za-z0-9_.-]*)?",
+                                _mm_value or "-") or len(_mm_value) > 200:
+                if _mm_value:
+                    log(f"Ignoring invalid {_mm_name.upper()} {_mm_value[:60]!r}; using "
+                        f"{_mm_default}.", logging.WARNING)
+                _mm_value = _mm_default
+            setattr(self, _mm_name, _mm_value)
+        # --- Cloud fallback --- #
+        self.cloud_fallback_enabled = bool(self.cloud_fallback_enabled)
+        _cl_provider = str(self.cloud_provider or "").strip().lower()
+        if _cl_provider not in ("openai", "anthropic"):
+            log(f"Ignoring invalid CLOUD_PROVIDER {_cl_provider[:40]!r} (expected openai "
+                "or anthropic); using openai.", logging.WARNING)
+            _cl_provider = "openai"
+        self.cloud_provider = _cl_provider
+        # An endpoint that is not http(s) is refused outright: this URL receives
+        # user content, so a typo must not turn into some other scheme handler.
+        _cl_url = str(self.cloud_base_url or "").strip().rstrip("/")
+        if _cl_url and not re.match(r"^https?://[^\s/]+", _cl_url):
+            log(f"Ignoring invalid CLOUD_BASE_URL {_cl_url[:60]!r} (expected http(s)://...); "
+                "using the provider default.", logging.WARNING)
+            _cl_url = ""
+        self.cloud_base_url = _cl_url
+        self.cloud_model = str(self.cloud_model or "").strip()[:200]
+        # An unknown consent mode becomes per_request, the stricter one.
+        _cl_consent = str(self.cloud_consent or "").strip().lower().replace("-", "_")
+        if _cl_consent not in ("per_request", "per_user"):
+            log(f"Ignoring invalid CLOUD_CONSENT {_cl_consent[:40]!r} (expected per_request "
+                "or per_user); using per_request.", logging.WARNING)
+            _cl_consent = "per_request"
+        self.cloud_consent = _cl_consent
+        self.cloud_min_prefill_s = min(86400.0, max(0.0, float(self.cloud_min_prefill_s)))
+        self.cloud_min_prompt_tokens = min(10_000_000, max(0, int(self.cloud_min_prompt_tokens)))
+        self.cloud_allowed_roles = ",".join(
+            part.strip() for part in str(self.cloud_allowed_roles or "").split(",")
+            if part.strip())[:2000]
+        self.cloud_max_tokens_per_user_month = min(
+            1_000_000_000_000, max(0, int(self.cloud_max_tokens_per_user_month)))
+        # ---- extension clamps: one `# --- <Feature> ---` block per feature, above this line ---- #
+
         for name, old in before.items():
             if getattr(self, name) != old and name not in changed:
                 changed.append(name)
@@ -1330,6 +1897,76 @@ CAPABILITY_GROUPS = {
                        "in Settings).",
         "tools": ["o365_mail", "o365_files", "o365_calendar"],
     },
+    # --- The named tool capabilities (tools_extra.py) and MCP. The six keys
+    # above stay for stored profiles and expand exactly as before; these are
+    # finer-grained and several overlap them on purpose (web_search is inside
+    # web_api). New tools register only when a capability (or EXTRA_TOOLS)
+    # asks for them, so the default agent's prompt is unchanged.
+    "web_search": {"label": "Web search", "description": "Search the web (DuckDuckGo Lite).",
+                   "tools": ["web_search"]},
+    "browse_page": {"label": "Browse pages",
+                    "description": "Open a web page as readable text with its links, "
+                                   "and follow one link on the same site.",
+                    "tools": ["browse_page", "fetch_url"]},
+    "code_interpreter": {"label": "Code interpreter",
+                         "description": "A Python session whose variables persist across "
+                                        "calls in a conversation (needs --allow-python).",
+                         "tools": ["code_interpreter"]},
+    "shell": {"label": "Shell", "description": "Run shell commands and the test suite "
+                                               "(needs --allow-shell).",
+              "tools": ["run_shell", "run_tests"]},
+    "git": {"label": "Git", "description": "Status, diff, log, show and branches of the "
+                                           "project repository; stage and commit (never push).",
+            "tools": ["git", "git_commit"]},
+    "create_document": {"label": "Create documents",
+                        "description": "Write PDF, Word, Excel, PowerPoint and other documents.",
+                        "tools": ["create_document"]},
+    "spreadsheet": {"label": "Spreadsheets",
+                    "description": "Read cells and ranges of .xlsx/.csv files and write sheets.",
+                    "tools": ["spreadsheet", "spreadsheet_write"]},
+    "pdf_extract": {"label": "PDF extraction",
+                    "description": "Page count and the text of chosen pages of a PDF.",
+                    "tools": ["pdf_extract"]},
+    "image_analyze": {"label": "Image analysis",
+                      "description": "Describe or answer questions about an image (needs a "
+                                     "vision model).",
+                      "tools": ["image_analyze"]},
+    "image_generate": {"label": "Image generation",
+                       "description": "Generate an image with a local generator (mflux or "
+                                      "IMAGE_GEN_COMMAND).",
+                       "tools": ["image_generate"]},
+    "email": {"label": "Email", "description": "Search and read your Outlook mail; sending "
+                                               "asks first (Microsoft Graph).",
+              "tools": ["email", "email_send"]},
+    "calendar": {"label": "Calendar", "description": "Read your Outlook calendar; creating "
+                                                     "events asks first (Microsoft Graph).",
+                 "tools": ["calendar", "calendar_create"]},
+    "contacts": {"label": "Contacts", "description": "Search your Outlook contacts "
+                                                     "(Microsoft Graph).",
+                 "tools": ["contacts"]},
+    "http_request": {"label": "HTTP requests",
+                     "description": "Call public HTTP APIs with any method, headers and "
+                                    "body; anything but GET asks first.",
+                     "tools": ["http_request"]},
+    "database": {"label": "Databases (read-only)",
+                 "description": "Run read-only SQL against configured SQLite databases "
+                                "or .db files in the project.",
+                 "tools": ["database"]},
+    "knowledge_search": {"label": "Search indexed documents",
+                         "description": "Full-text search of the documents you indexed.",
+                         "tools": ["search_docs"]},
+    "task_scheduler": {"label": "Scheduled tasks",
+                       "description": "Create, list and cancel your own scheduled agent "
+                                      "tasks (never with more tools than you have).",
+                       "tools": ["task_scheduler"]},
+    "notify": {"label": "Notifications",
+               "description": "Send you a short notification (in-app, webhook, macOS).",
+               "tools": ["notify"]},
+    "mcp": {"label": "MCP servers",
+            "description": "Every tool of every configured MCP server. Grant a single "
+                           "server with its own MCP: key instead.",
+            "tools": []},   # dynamic: see register_capability_resolver / mcp.py
+    # ---- extension capabilities: above this line ---- #
 }
 
 # Tools every agent always has: the loop's exit condition plus harmless utilities
@@ -1338,6 +1975,24 @@ ALWAYS_ON_TOOLS = ["final_answer", "calculator", "current_time", "weather"]
 
 # Order capabilities are shown in the UI.
 CAPABILITY_ORDER = ["file_ops", "code_exec", "web_api", "knowledge", "memory", "office365"]
+# The named tool capabilities and MCP (one "mcp:<server>" key per configured
+# server is inserted after "mcp" by mcp.mcp_sync_capabilities).
+CAPABILITY_ORDER += [
+    "web_search", "browse_page", "code_interpreter", "shell", "git", "create_document",
+    "spreadsheet", "pdf_extract", "image_analyze", "image_generate", "email", "calendar",
+    "contacts", "http_request", "database", "knowledge_search", "task_scheduler",
+    "notify", "mcp",
+]
+
+# Capabilities whose tools are only known at run time (MCP servers). Each
+# resolver maps a capability list to extra concrete tool names.
+_CAPABILITY_RESOLVERS: list = []
+
+
+def register_capability_resolver(fn) -> None:
+    """Add a fn(capabilities) -> [tool names] for dynamic capabilities."""
+    if fn not in _CAPABILITY_RESOLVERS:
+        _CAPABILITY_RESOLVERS.append(fn)
 
 
 def tools_for_capabilities(capabilities) -> list[str]:
@@ -1351,6 +2006,11 @@ def tools_for_capabilities(capabilities) -> list[str]:
     for key in CAPABILITY_ORDER:
         if key in caps:
             allowed.extend(CAPABILITY_GROUPS[key]["tools"])
+    for resolver in list(_CAPABILITY_RESOLVERS):
+        try:
+            allowed.extend(resolver(caps) or [])
+        except Exception as exc:  # noqa: BLE001 - a dynamic capability is optional
+            log(f"capability resolver failed: {exc}", logging.WARNING)
     # De-dupe, preserve order.
     seen: set[str] = set()
     out: list[str] = []
@@ -1376,6 +2036,80 @@ def public_capabilities() -> list[dict]:
     ]
 
 
+def capabilities_for_role(role: str | None, config: object = None) -> list[str]:
+    """The capability keys a role may use, from ROLE_CAPABILITIES.
+
+    A role missing from the table (or no table at all, the default) keeps every
+    capability: today's rule, where the profile alone decides. "*" is every
+    key; "mcp" also grants every per-server "mcp:<server>" key. A key whose
+    tools are all granted by other keys counts as granted too, so a role given
+    the legacy "code_exec" may use a profile that asks for "shell" (the same
+    tools), but not one that asks for "code_interpreter".
+    """
+    every = list(CAPABILITY_ORDER)
+    raw = str(getattr(config, "role_capabilities", "") or "").strip() if config is not None else ""
+    try:
+        table = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        table = {}
+    if not isinstance(table, dict) or str(role or "user") not in table:
+        return every
+    entry = table[str(role or "user")]
+    if not isinstance(entry, list):
+        return []           # fail closed on a shape the clamp would have refused
+    granted = {c for c in entry if isinstance(c, str)}
+    if "*" in granted:
+        return every
+    if "mcp" in granted:
+        granted |= {k for k in every if k.startswith("mcp:")}
+    tools: set[str] = set()
+    for key in granted:
+        tools.update((CAPABILITY_GROUPS.get(key) or {}).get("tools") or [])
+    for key in every:
+        group_tools = (CAPABILITY_GROUPS.get(key) or {}).get("tools") or []
+        if group_tools and set(group_tools) <= tools:
+            granted.add(key)
+    return [k for k in every if k in granted]
+
+
+_MASK_KEYS = re.compile(r"(?i)(secret|password|passwd|token|api[-_]?key|bearer|"
+                        r"authorization|credential|cookie|private[-_]?key)")
+
+
+def mask_structured_secrets(text: str) -> str:
+    """A JSON setting with its credential-like values replaced by "***".
+
+    Every value under "env" or "headers" is masked (that is where MCP servers
+    take their tokens), as is any key that names a credential and any
+    user:password@ in a URL. Text that is not JSON is masked as a whole: an
+    unparseable value cannot be shown safely.
+    """
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        return "***set***" if text else ""
+
+    def scrub_url(value: str) -> str:
+        return re.sub(r"(?i)(://)([^/@\s]+)@", r"\1***@", value)
+
+    def walk(node: object, parent: str = "") -> object:
+        if isinstance(node, dict):
+            out = {}
+            for key, value in node.items():
+                if parent in ("env", "headers") or _MASK_KEYS.search(str(key)):
+                    out[key] = "***" if not isinstance(value, (dict, list)) else walk(value, key)
+                else:
+                    out[key] = walk(value, str(key).lower())
+            return out
+        if isinstance(node, list):
+            return [walk(item, parent) for item in node]
+        if isinstance(node, str):
+            return scrub_url(node)
+        return node
+
+    return json.dumps(walk(data))
+
+
 # Re-exported explicitly: the original file was one flat namespace, so private
 # helpers (leading underscore) must cross module boundaries too.
 __all__ = [
@@ -1389,4 +2123,7 @@ __all__ = [
     'tools_for_capabilities',
     'rag_for_capabilities',
     'public_capabilities',
+    'register_capability_resolver',
+    'capabilities_for_role',
+    'mask_structured_secrets',
 ]

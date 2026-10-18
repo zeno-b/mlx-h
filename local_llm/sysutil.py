@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .core import *  # noqa: F401,F403
+from .catalog import *  # noqa: F401,F403
 
 
 LOG_FILES = {"model": "model_server.log", "train": "train.log", "tasks": "tasks.log"}
@@ -101,6 +102,11 @@ def wait_for_model_ready(
     the port before the weights finish loading, so treating an open port as
     readiness makes the first real request hang or fail against a server that is
     still initialising. A one-token completion is the only cheap proof of life.
+
+    `model_id` is the request "model" value, which is not always the repo id:
+    mlx-lm maps only "default_model" onto its CLI --adapter-path, so a probe
+    carrying the repo id would reload the base weights without the adapter
+    (ModelServerManager passes backends.request_model_for()).
     """
     import urllib.error
     import urllib.request
@@ -160,6 +166,20 @@ def help_cmd(module: str) -> str:
         return ""
 
 
+def help_has_flag(help_text: str, flag: str) -> bool:
+    """True when `flag` appears in --help output as a whole option name.
+
+    A plain substring test was wrong: "--prompt-cache" is a substring of
+    "--prompt-cache-size", so on mlx-lm 0.32 (which has no persistent prompt
+    cache flag at all) PROMPT_CACHE_DIR appended "--prompt-cache <dir>", and
+    argparse exited at startup with "ambiguous option". The flag must not be
+    preceded or followed by a word character or a hyphen.
+    """
+    if not help_text or not flag:
+        return False
+    return re.search(r"(?<![\w-])" + re.escape(flag) + r"(?![\w-])", help_text) is not None
+
+
 def add_if_supported(
     cmd: list[str],
     help_text: str,
@@ -169,7 +189,7 @@ def add_if_supported(
     if not help_text:
         return False
     for name in names:
-        if name in help_text:
+        if help_has_flag(help_text, name):
             cmd.append(name)
             if value is not None:
                 cmd.append(str(value))
@@ -393,12 +413,27 @@ def model_catalog(config: "Config") -> list[dict]:
     for known in DEFAULT_MODEL_CATALOG:
         if known not in ids:
             ids.append(known)
-    if config.model not in ids:
-        ids.insert(0, config.model)
-    return [
-        {"id": item, "cached": model_is_cached(item), "current": item == config.model}
-        for item in ids
-    ]
+    # An alias passed straight to Config (deploy.py --list-models --model coder)
+    # is shown as the repo it stands for, not as a model called "coder".
+    current = resolve_model(config.model, config)
+    if current not in ids:
+        ids.insert(0, current)
+    # Catalogue metadata (catalog.py) is additive: id/cached/current keep their
+    # meaning for every existing caller; the rest says what the model is and
+    # whether this machine can hold it.
+    aliases = model_aliases(config)
+    recommended = (read_recommendation(ram_gb=TOTAL_RAM_GB) or {}).get("model_id")
+    out = []
+    for item in ids:
+        meta = model_metadata(item)
+        out.append({
+            "id": item, "cached": model_is_cached(item), "current": item == current,
+            "aliases": sorted(name for name, info in aliases.items() if info["id"] == item),
+            "meta": meta,
+            "fits_in_ram": fits_in_ram(meta),
+            "recommended": bool(recommended) and item == recommended,
+        })
+    return out
 
 
 
@@ -419,6 +454,7 @@ __all__ = [
     'clear_adapter_checkpoints',
     'get_free_port',
     'help_cmd',
+    'help_has_flag',
     'hf_cache_dir',
     'list_adapters',
     'model_catalog',

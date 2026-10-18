@@ -29,9 +29,13 @@ from .config import *  # noqa: F401,F403
 from .database import *  # noqa: F401,F403
 from .skills import *  # noqa: F401,F403
 from .checkpoints import *  # noqa: F401,F403
+from .turnctx import *  # noqa: F401,F403
+from .workspaces import *  # noqa: F401,F403
 from .mcp import *  # noqa: F401,F403
 from .websearch import *  # noqa: F401,F403
 from .calculator import *  # noqa: F401,F403
+from .policy import *  # noqa: F401,F403
+from .tools_extra import *  # noqa: F401,F403
 from .codecheck import check_code, parser_for
 from . import documents
 from .documents import describe_document  # noqa: F401
@@ -118,6 +122,21 @@ class Tool:
     # Directive appended after a non-terminal tool's result, telling the model
     # what to do with it. A sensible default is used when this is None.
     seed_directive: str | None = None
+    # --- Approval policy metadata (policy.py; all optional, defaults keep the
+    # built-in classification) ---
+    # risk: read | write | exec | external. None = policy's table by name, MCP
+    # annotations for MCP tools, otherwise "external" (unknown means it may
+    # reach outside the machine).
+    risk: str | None = None
+    # The CAPABILITY_GROUPS key this tool belongs to, so a policy rule can say
+    # "cap:code_exec". None = looked up in CAPABILITY_GROUPS.
+    capability: str | None = None
+    # MCP tool annotations (readOnlyHint, destructiveHint, ...) as the server
+    # sent them; policy derives the risk from them when `risk` is None.
+    annotations: dict | None = None
+    # True when the result is untrusted outside content (taints the turn for
+    # the prompt-injection rule). None = policy decides by name.
+    taints: bool | None = None
 
     def spec(self) -> dict:
         return {
@@ -162,25 +181,98 @@ class ToolRegistry:
         self.checkpoints = CheckpointStore(
             DATA_DIR / "checkpoints", keep=config.checkpoint_keep,
             max_file_bytes=config.checkpoint_max_file_bytes)
-        self.checkpoint_id: str | None = None
-
-        # Skills loaded during the CURRENT turn, in order. The agent reads this
-        # to attribute an outcome, which is what closes the learning loop: a
-        # rating is about the answer, and this is how we know which procedures
-        # contributed to it. Reset per turn by the agent.
-        self.skills_used: list[str] = []
-        # Files the tools have created or modified this session, so you can see at
-        # a glance what changed before reviewing with git.
-        self.changed_files: set[str] = set()
-        # Documents create_document produced during the CURRENT turn, in order.
-        # Separate from changed_files because these are deliverables, not edits:
-        # the turn ends with a download link per entry, and a .pdf the user is
-        # meant to open has nothing to do with "review the diff before pushing".
-        # Reset per turn by the agent.
-        self.documents_written: list[str] = []
-        # Set per request so memory writes can record where they came from.
-        self.conversation_id: str | None = None
+        # The per-turn attributes (checkpoint_id, skills_used, changed_files,
+        # documents_written, conversation_id) are properties over a turn-scoped
+        # holder, see _ws_state below. This is the holder used outside a turn
+        # (CLI, selftest, a direct tool test): exactly the old shared
+        # attributes. The session-wide "changed this session" sets are kept per
+        # root, so one user's edits never appear in (or get reverted from)
+        # another root's list.
+        self._ws_default = WorkspaceTurnState()
+        self._ws_session_changed: dict[str, set[str]] = {}
         self._register_defaults()
+
+    # ------------------------------------------------ per-turn state ----
+    # These were plain attributes on this shared object, so two users' turns
+    # running at once wrote into the same lists: one user's final event could
+    # offer the other's document as a download link, and a checkpoint id set by
+    # one turn captured the other turn's writes. They now resolve per turn
+    # (workspaces.registry_turn_state: an explicit scope or the bound
+    # TurnContext), with the same attribute access the agent and tests use.
+    def _ws_state(self) -> WorkspaceTurnState:
+        state = registry_turn_state(self)
+        if state is not None:
+            return state
+        default = self.__dict__.get("_ws_default")
+        if default is None:
+            default = self.__dict__["_ws_default"] = WorkspaceTurnState()
+        return default
+
+    def _ws_session_changed_for(self, root: Path | str) -> set[str]:
+        sessions = self.__dict__.setdefault("_ws_session_changed", {})
+        return sessions.setdefault(str(root), set())
+
+    @property
+    def checkpoint_id(self) -> str | None:
+        """Undo point for this turn. Set by the agent at the start of a turn;
+        None means writes are not being recorded (a task run, a direct tool
+        test). The store itself is cheap and holds no state."""
+        return self._ws_state().checkpoint_id
+
+    @checkpoint_id.setter
+    def checkpoint_id(self, value: str | None) -> None:
+        self._ws_state().checkpoint_id = value
+
+    @property
+    def skills_used(self) -> list[str]:
+        """Skills loaded during the CURRENT turn, in order. The agent reads this
+        to attribute an outcome, which is what closes the learning loop: a
+        rating is about the answer, and this is how we know which procedures
+        contributed to it. Reset per turn by the agent."""
+        return self._ws_state().skills_used
+
+    @skills_used.setter
+    def skills_used(self, value: list[str]) -> None:
+        self._ws_state().skills_used = value
+
+    @property
+    def documents_written(self) -> list[str]:
+        """Documents create_document produced during the CURRENT turn, in order.
+        Separate from changed_files because these are deliverables, not edits:
+        the turn ends with a download link per entry. Reset per turn by the
+        agent."""
+        return self._ws_state().documents_written
+
+    @documents_written.setter
+    def documents_written(self, value: list[str]) -> None:
+        self._ws_state().documents_written = value
+
+    @property
+    def conversation_id(self) -> str | None:
+        """Set per call so memory writes can record where they came from."""
+        return self._ws_state().conversation_id
+
+    @conversation_id.setter
+    def conversation_id(self, value: str | None) -> None:
+        self._ws_state().conversation_id = value
+
+    @property
+    def changed_files(self) -> set[str]:
+        """Files the tools created or modified: this turn's inside a turn,
+        otherwise this session's for the current root (what the Codebase panel
+        lists and /api/project/revert undoes)."""
+        state = registry_turn_state(self)
+        if state is not None:
+            return state.changed_files
+        return self._ws_session_changed_for(self._root())
+
+    @changed_files.setter
+    def changed_files(self, value) -> None:
+        state = registry_turn_state(self)
+        if state is not None:
+            state.changed_files = set(value)
+        else:
+            self.__dict__.setdefault("_ws_session_changed", {})[str(self._root())] = set(value)
 
     def normalise_args(self, tool: Tool, args: dict) -> dict:
         """Map common argument-name mistakes onto the tool's real parameters.
@@ -574,6 +666,10 @@ class ToolRegistry:
         if self._o365_configured():
             self._register_o365()
 
+        # The named capability tools (browse_page, git, http_request, ...):
+        # only those this registry's allowlist (or EXTRA_TOOLS) asks for.
+        register_extra_tools(self, Tool)
+
         # MCP tools last, so a remote server is added to a registry that is
         # otherwise complete and cannot displace anything.
         self._register_mcp()
@@ -585,7 +681,8 @@ class ToolRegistry:
             # include them is not misconfigured, so their absence is expected and
             # must not be reported as a bad tool name.
             conditional = {"run_shell", "run_python", "run_tests",
-                           "o365_mail", "o365_files", "o365_calendar"}
+                           "o365_mail", "o365_files", "o365_calendar",
+                           *EXTRA_TOOL_NAMES, *(n for n in allow if n.startswith("mcp_"))}
             unknown = allow - set(self._tools) - conditional
             if unknown:
                 log(f"AGENT_TOOLS names tools that do not exist: {', '.join(sorted(unknown))}",
@@ -874,7 +971,16 @@ class ToolRegistry:
     def _root(self) -> Path:
         """The directory the file tools operate in: the configured project, or the
         sandboxed workspace when none is set. Falls back to the workspace if the
-        configured project path does not exist."""
+        configured project path does not exist.
+
+        Workspaces come first (workspaces.workspace_root_for): a pinned root
+        (the execute_code bridge, a download for a project), the project on the
+        bound TurnContext, or with WORKSPACES_ENABLED=1 a non-admin's own
+        WORKSPACE_DIR/users/<id>. None of those applies outside a request, so
+        the CLI, the selftest and a disabled install keep the single root."""
+        scoped = workspace_root_for(self.config, self.db)
+        if scoped is not None:
+            return scoped
         pd = (self.config.project_dir or "").strip()
         if pd:
             root = Path(pd).expanduser()
@@ -894,6 +1000,13 @@ class ToolRegistry:
         parts = candidate.relative_to(root).parts if candidate != root else ()
         if ".git" in parts:
             raise ValueError("refusing to touch the .git directory")
+        # With per-user roots on, the bare workspace directory (an admin with no
+        # PROJECT_DIR) CONTAINS everyone's users/<id> roots. An admin's turn
+        # tidying "the workspace" must not wander into them.
+        if (parts and parts[0] == "users" and getattr(self.config, "workspaces_enabled", False)
+                and root == WORKSPACE_DIR.resolve()):
+            raise ValueError("users/ holds other users' workspaces; open their "
+                             "project instead")
         return candidate
 
     # ---------------------------------------------------------------- MCP ----
@@ -908,7 +1021,10 @@ class ToolRegistry:
         if not self.config.mcp_servers:
             return
         try:
-            MCP.configure(self.config.mcp_servers, timeout=self.config.mcp_timeout)
+            # Children get the sandbox allowlist plus their spec's own env, not
+            # this server's environment (which holds AUTH_*, O365 and HF secrets).
+            MCP.configure(self.config.mcp_servers, timeout=self.config.mcp_timeout,
+                          base_env=self._sandbox_env())
             specs = MCP.tools()
         except Exception as exc:
             log(f"MCP unavailable: {type(exc).__name__}: {exc}", logging.WARNING)
@@ -920,12 +1036,17 @@ class ToolRegistry:
                 log(f"Skipping MCP tool {spec.local_name!r}: that name is taken.",
                     logging.WARNING)
                 continue
+            # capability "mcp:<server>": a profile or role reaches it by granting
+            # "mcp" or that key (tools_for_capabilities expands both to these
+            # names). The annotations are what policy.py reads for the risk.
             self._add(Tool(
                 name=spec.local_name,
                 description=spec.description,
                 parameters=spec.parameters,
                 required=spec.required,
                 handler=self._mcp_handler(spec),
+                capability=f"mcp:{spec.server}",
+                annotations=spec.annotations,
             ))
         if specs:
             log(f"MCP: {len(specs)} tool(s) from "
@@ -1048,6 +1169,13 @@ class ToolRegistry:
             if budget <= 0:
                 notes.append(f"ignored @{token}: no context budget left")
                 break
+            # A pasted @url is a fetch and @file a read: same approval policy
+            # and audit as the tool (policy.reference_refusal), and a fetched
+            # page taints the turn. Fast no-op with approvals off.
+            refusal = await asyncio.to_thread(reference_refusal, self, token)
+            if refusal:
+                notes.append(refusal)
+                continue
             try:
                 label, body = await self._resolve_reference(token, budget)
             except Exception as exc:
@@ -1094,7 +1222,13 @@ class ToolRegistry:
             return str(target)
 
     def _note_change(self, target: Path) -> None:
-        self.changed_files.add(self._rel(target))
+        rel = self._rel(target)
+        state = registry_turn_state(self)
+        if state is not None:
+            state.changed_files.add(rel)
+        # Also the session list for this root, so the Codebase panel still
+        # shows what chat turns changed there.
+        self._ws_session_changed_for(self._root()).add(rel)
 
     def _save_text(self, target: Path, content: str) -> None:
         """Record the file's original bytes, then write it.
@@ -2189,7 +2323,14 @@ class ToolRegistry:
         A real module rather than a string constant in this file: it can be
         linted and tested, and its own docstrings do not have to survive being
         nested inside another string literal (they did not).
+
+        The single-file deploy_bundled.py has no sibling file to read, so
+        bundle.py embeds the shim in _BUNDLED_SOURCES; that copy wins when it
+        exists, and the package reads the real file.
         """
+        bundled = globals().get("_BUNDLED_SOURCES") or {}
+        if "tool_rpc_shim.py" in bundled:
+            return bundled["tool_rpc_shim.py"]
         return (Path(__file__).with_name("tool_rpc_shim.py")
                 .read_text(encoding="utf-8"))
 
@@ -2210,6 +2351,26 @@ class ToolRegistry:
         root = self._root()
         token = secrets.token_hex(16)
         registry = self
+        # The bridge answers the script from socketserver threads, and a plain
+        # thread does NOT inherit contextvars. Inside Handler.handle the acting
+        # user was therefore None, which every scoped store reads as "admin,
+        # unscoped": a script calling tools.recall_memory() got EVERY user's
+        # notes. Capture who this script runs for here, in the tool call's own
+        # context, and re-bind it for each bridged call.
+        import contextvars
+        bridge_context = contextvars.copy_context()
+        bridge_user = get_acting_user()
+        bridge_conversation = get_acting_conversation() or self.conversation_id
+        bridge_turn = current_turn()
+
+        def _bridged(tool_name: str, tool_args: dict):
+            set_acting_user(bridge_user)
+            set_acting_conversation(bridge_conversation)
+            set_current_turn(bridge_turn)
+            # Pinned, not re-derived: the subprocess runs in `root`, so the
+            # tools it calls must resolve paths against the same directory.
+            bind_workspace_root(root)
+            return registry.call(tool_name, tool_args, bridge_conversation)
         budget = {"calls": self.config.execute_code_max_calls}
         lock = threading.Lock()
 
@@ -2241,7 +2402,9 @@ class ToolRegistry:
                 # Through call(), so every per-tool guard, the path confinement,
                 # the argument aliasing and the tool_calls audit trail apply
                 # exactly as they do to a model-issued call.
-                result, error = registry.call(name, args, registry.conversation_id)
+                # A copy per request: one Context cannot be entered by two
+                # threads at once, and a script may call tools concurrently.
+                result, error = bridge_context.copy().run(_bridged, name, args)
                 if error:
                     return self._reply({"ok": False, "error": error[:2000]})
                 return self._reply({"ok": True, "result": result})
@@ -2372,12 +2535,29 @@ class ToolRegistry:
             return error, error
 
         clean = self.normalise_args(tool, args)
+        # Approval policy, enforced here synchronously and failing closed. The
+        # agent loop asks the human first (policy.decide + BROKER); this is the
+        # backstop for every path that cannot ask (execute_code's RPC bridge,
+        # /api/tools/call, a task run, an old dispatch site): a deny, or an
+        # "ask" nobody approved, never runs. It reads the turn from the
+        # contextvar, so this signature (and tests that swap call for a
+        # lambda) stay as they were. TOOL_APPROVAL_MODE=off with no override
+        # rows returns at once: today's behaviour, no database access.
+        refusal = enforce_tool_policy(self, tool, name, args, conversation_id)
+        if refusal:
+            if self.db:
+                self.db.log_tool_call(conversation_id, name, clean, "", 0.0, refusal,
+                                      user_id=get_acting_user())
+            return refusal, refusal
         try:
             result = str(tool.handler(**clean))
             error = None
         except Exception as exc:
             result = f"{type(exc).__name__}: {exc}"
             error = result
+        # A fetched page or an MCP result may carry instructions the user never
+        # wrote; remember that this turn has read one (policy taint rule).
+        note_tool_result(name, tool, error)
         duration = (time.time() - start) * 1000
         # Keep the full-ish result here. The agent decides separately how much
         # of it is worth spending context on, after a summarisation pass.

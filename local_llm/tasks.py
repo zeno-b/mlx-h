@@ -21,6 +21,8 @@ from .model_server import *  # noqa: F401,F403
 from .training import *  # noqa: F401,F403
 from .sysutil import *  # noqa: F401,F403
 from .tools import *  # noqa: F401,F403
+from .admission import *  # noqa: F401,F403
+from .turnctx import *  # noqa: F401,F403
 
 
 class TaskRun:
@@ -82,6 +84,12 @@ class TaskManager:
     Runs are gated by a semaphore because the model server answers one request
     at a time: firing five tasks at once just queues them inside mlx_lm with no
     way to see the queue.
+
+    When create_app hands over the shared admission controller (`gate`), a run
+    also holds one generation slot for its generations, so a scheduled run and
+    the chats it lands next to share one KV budget instead of the run being an
+    unmetered extra cache. Interactive priority is unchanged: the scheduler
+    still waits for chat_is_busy() to clear before it launches anything.
     """
 
     # Everything except tokens goes to the database.
@@ -122,6 +130,10 @@ class TaskManager:
         # while tok/s quietly collapses.
         self.last_chat_at = 0.0
         self.chat_in_flight = 0
+        # The app-wide admission controller (admission.AdmissionController or
+        # anything with GenerationGate's acquire/release). None keeps the old
+        # behaviour: runs are limited only by their own semaphore above.
+        self.gate = None
 
     def note_chat_activity(self) -> None:
         self.last_chat_at = time.time()
@@ -199,6 +211,20 @@ class TaskManager:
         runner.add_done_callback(self._runners.discard)
         return run
 
+    def _owner_role(self, owner: str) -> str:
+        """The task owner's role, for role-scoped tool policy (TOOL_APPROVAL_ROLES).
+
+        The local sentinel is the single administrator of an install without
+        auth, as auth.py treats it; an unknown owner gets the least privilege.
+        """
+        if owner == SENTINEL_LOCAL_USER:
+            return "admin"
+        try:
+            row = self.db.get_user(owner)
+        except Exception:  # noqa: BLE001 - a lookup failure must not stop the run
+            row = None
+        return str((row or {}).get("role") or "user")
+
     def _task_config(self, task: dict) -> Config:
         """A config copy scoped to one task, so its tools and step budget are its own."""
         return dataclass_replace(
@@ -250,6 +276,7 @@ class TaskManager:
         tools_used: list[str] = []
         status = "ok"
         previous_model: str | None = None
+        bound_turn = None
 
         try:
             async with self._semaphore:
@@ -270,6 +297,14 @@ class TaskManager:
                 # writes and knowledge indexing scope to that user, not 'local'.
                 owner = task.get("user_id") or SENTINEL_LOCAL_USER
                 set_acting_user(owner)
+                # A turn nobody watches: the tool policy answers "ask" with
+                # TOOL_APPROVAL_UNATTENDED instead of waiting, tracks web/MCP
+                # taint across this run's calls, and audits them under one
+                # turn id; per-turn registry state is isolated as in chat.
+                bound_turn = set_current_turn(TurnContext(
+                    turn_id=f"task-{run.run_id}", user_id=owner,
+                    conversation_id=conversation_id, role=self._owner_role(owner),
+                    interactive=False, cancel=run.cancel))
 
                 history: list[dict] = []
                 if task.get("use_history"):
@@ -278,19 +313,24 @@ class TaskManager:
                                                 user_id=owner)
                     history = [{"role": r["role"], "content": r["content"]} for r in rows]
 
-                async for event in agent.run(
-                    task["goal"], history, conversation_id, cancel=run.cancel
-                ):
-                    self._emit(run, event)
-                    if event["type"] == "final":
-                        answer = event["answer"]
-                        steps = event.get("steps", 0)
-                        tools_used = event.get("tools_used", [])
-                    elif event["type"] == "error":
-                        error = event["error"]
-                        status = "error"
-                    elif event["type"] == "cancelled":
-                        status = "cancelled"
+                ticket = await self._acquire_generation_slot(run, task, task_config, history)
+                try:
+                    async for event in agent.run(
+                        task["goal"], history, conversation_id, cancel=run.cancel
+                    ):
+                        self._emit(run, event)
+                        if event["type"] == "final":
+                            answer = event["answer"]
+                            steps = event.get("steps", 0)
+                            tools_used = event.get("tools_used", [])
+                        elif event["type"] == "error":
+                            error = event["error"]
+                            status = "error"
+                        elif event["type"] == "cancelled":
+                            status = "cancelled"
+                finally:
+                    if ticket is not None and self.gate is not None:
+                        self.gate.release(ticket)
 
                 if task.get("use_history") and answer:
                     self.db.add_message(conversation_id, "user", task["goal"], user_id=owner)
@@ -305,6 +345,8 @@ class TaskManager:
             log(f"Task {task['name']} failed: {error}", logging.ERROR)
             self._emit(run, {"type": "error", "error": error})
         finally:
+            if bound_turn is not None:
+                reset_current_turn(bound_turn)
             try:
                 await self._restore_model(previous_model)
             except Exception as exc:
@@ -334,6 +376,66 @@ class TaskManager:
             # schedules and a file.
             if status == "ok" and task.get("next_task_id") and not self._stopping:
                 await self._chain(task, answer)
+
+    async def _acquire_generation_slot(self, run: TaskRun, task: dict,
+                                       task_config: Config, history: list[dict]):
+        """Take one slot from the shared gate for this run, or None without one.
+
+        One slot covers the whole run, like a chat turn: the agent's steps run
+        one after another, so the run never holds more than one KV cache.
+
+        A full waiting room is not a failure for a run the way it is for a
+        chat: nobody is watching a 3am task, and a 503 would just lose the
+        work. It retries every few seconds instead, until it gets in or the run
+        is cancelled, and says so once in the run's event stream. The wait is
+        raced against run.cancel so Cancel works while queued.
+        """
+        gate = self.gate
+        if gate is None:
+            return None
+        cost = admission_cost_tokens(
+            [{"role": "system", "content": task_config.system_prompt},
+             *history, {"role": "user", "content": task.get("goal") or ""}],
+            task_config.max_tokens, task_config.context_size)
+
+        def on_wait(position: int, snap: dict) -> None:
+            self._emit(run, {"type": "queued", "position": position,
+                             "running": snap.get("running", 0),
+                             "limit": snap.get("limit", 0)})
+
+        noted_busy = False
+        while True:
+            if run.cancel.is_set():
+                raise asyncio.CancelledError
+            try:
+                acquire = gate.acquire(cost_tokens=cost, on_wait=on_wait)
+            except TypeError:
+                acquire = gate.acquire()       # a plain GenerationGate
+            acquiring = asyncio.ensure_future(acquire)
+            stop = asyncio.ensure_future(run.cancel.wait())
+            try:
+                await asyncio.wait({acquiring, stop}, return_when=asyncio.FIRST_COMPLETED)
+            except BaseException:
+                acquiring.cancel()
+                raise
+            finally:
+                stop.cancel()
+            if not acquiring.done():
+                # Cancelled while queued: withdraw. The controller's own cancel
+                # handling gives back a slot granted in the same instant.
+                acquiring.cancel()
+                raise asyncio.CancelledError
+            try:
+                return acquiring.result()
+            except GenerationBusy as exc:
+                if not noted_busy:
+                    noted_busy = True
+                    self._emit(run, {"type": "notice", "info": True,
+                                     "message": f"Waiting for a generation slot ({exc})."})
+                try:
+                    await asyncio.wait_for(run.cancel.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    pass
 
     async def _chain(self, task: dict, answer: str) -> None:
         follow_on = self.db.get_task(task["next_task_id"])

@@ -31,6 +31,17 @@ from .selftest import *  # noqa: F401,F403
 from .model_client import *  # noqa: F401,F403
 from .textutil import *  # noqa: F401,F403
 from .llm import *  # noqa: F401,F403
+from .nodesec import *  # noqa: F401,F403
+from .remote_access import *  # noqa: F401,F403
+from .sharding import *  # noqa: F401,F403
+from .catalog import *  # noqa: F401,F403
+from .train_methods import *  # noqa: F401,F403
+# The app's own MLX server: registers the "mlx-engine" backend and the
+# `mlx-engine` subcommand the bundled build launches it with.
+from .mlx_engine import *  # noqa: F401,F403
+# `deploy.py wire <client>`: connect coding tools to this server.
+from .wire import *  # noqa: F401,F403
+# ---- extension imports: one `from .<feature> import *` per feature, above this line ---- #
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -135,6 +146,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--print-config", action="store_true",
                         help="Print the resolved configuration (after env, flags, and clamps), then exit.")
     parser.add_argument("--export-format", choices=["jsonl", "csv"], default="jsonl")
+    # Inference backend (backends.py). Restart-only, like the model itself.
+    parser.add_argument("--backend", default=None, dest="model_backend",
+                        help="Inference engine: mlx-lm (default), mlx-lm-turbo, openai-external "
+                             "(env MODEL_BACKEND).")
+    parser.add_argument("--draft-model", default=None,
+                        help="Draft model for speculative decoding, or 'auto' (env DRAFT_MODEL).")
+    parser.add_argument("--num-draft-tokens", type=int, default=None,
+                        help="Tokens the draft model proposes per step (env NUM_DRAFT_TOKENS).")
+    # Bind interface (remote_access.py). Non-loopback needs AUTH_ENABLED=1.
+    parser.add_argument("--host", default=None, dest="web_host",
+                        help="Interface the web server binds (env WEB_HOST, default 127.0.0.1). "
+                             "Anything but loopback is refused unless AUTH_ENABLED=1.")
+    # Training method + autopilot (train_methods.py).
+    parser.add_argument("--train-method", default=None, choices=list(TRAIN_METHODS),
+                        help="Retrain method: sft (default), dpo, orpo, grpo (need mlx-lm-lora), "
+                             "kto (export only) (env TRAIN_METHOD).")
+    parser.add_argument("--train-autopilot", action="store_const", const=True, default=None,
+                        help="Size the LoRA recipe to this Mac's RAM and the corpus, refusing "
+                             "runs that will not fit (env TRAIN_AUTOPILOT=1).")
+    # ---- extension flags: default=None so config.py stays the single source of defaults; above this line ---- #
     return parser
 
 
@@ -186,13 +217,57 @@ def build_config(args) -> Config:
         "export_only": args.export_only,
         "list_feedback": args.list_feedback,
         "export_format": args.export_format,
+        "model_backend": getattr(args, "model_backend", None),
+        "draft_model": getattr(args, "draft_model", None),
+        "num_draft_tokens": getattr(args, "num_draft_tokens", None),
+        "web_host": getattr(args, "web_host", None),
+        # Model aliases (catalog.py): when --model / MODEL_ID is an alias this
+        # overrides "model" above with the resolved repo id and records the
+        # alias, so ClusterRouter.classify sees "...-32B-..." and not "large".
+        **catalog_cli_fields(args),
+        "train_method": getattr(args, "train_method", None),
+        "train_autopilot": getattr(args, "train_autopilot", None),
+        # ---- extension config flags: "field": getattr(args, "flag", None), above this line ---- #
     }
     return Config(**{k: v for k, v in supplied.items() if v is not None})
 
 
-def main() -> None:
+def subcommands() -> dict:
+    """Verbs that are not server flags: `deploy.py chat`, `deploy.py wire aider`.
+
+    Dispatched on the first argument before the server parser runs, so every
+    existing flag keeps its meaning and `build_parser().parse_args([])` (which
+    selftest relies on) is untouched. A handler takes the remaining argv and
+    returns a process exit code.
+    """
+    return {
+        # Multi-Mac cluster (sharding.py) and remote access (remote_access.py).
+        "cluster": cluster_cli,
+        "remote": remote_cli,
+        # Model catalogue and hardware benchmark (catalog.py, diagnostics.py).
+        "bench": bench_cli,
+        "recommend": recommend_cli,
+        "models": models_cli,
+        # Print the training autopilot's plan (train_methods.py).
+        "train-plan": train_plan_cli,
+        # The mlx-engine inference server (mlx_engine.py); the backend launcher
+        # uses this verb in the single-file build.
+        "mlx-engine": mlx_engine_cli,
+        # Connect Claude Code, Aider, Codex, Continue, opencode... (wire.py).
+        "wire": wire_cli,
+        # ---- extension subcommands: "name": handler, above this line ---- #
+    }
+
+
+def main(argv: list[str] | None = None) -> None:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    commands = subcommands()
+    if argv and argv[0] in commands:
+        sys.exit(commands[argv[0]](argv[1:]) or 0)
     parser = build_parser()
-    args = parser.parse_args()
+    if commands:
+        parser.epilog = "subcommands: " + ", ".join(sorted(commands))
+    args = parser.parse_args(argv)
 
     if args.selftest:
         sys.exit(selftest())
@@ -284,6 +359,10 @@ def main() -> None:
     # Upgrade the plain bootstrap logger into the structured, redacting,
     # rotating pipeline now that we have the resolved configuration.
     configure_logging(config, force=True)
+
+    # Refuse a public bind without auth BEFORE the model server starts, so a
+    # misconfigured WEB_HOST never leaves an orphaned mlx process behind.
+    web_host = bind_host_or_exit(config)
 
     config.model_port = get_free_port(config.model_port)
     config.web_port = get_free_port(config.web_port, exclude={config.model_port})
@@ -393,6 +472,15 @@ def main() -> None:
         probe_failures=config.watchdog_probe_failures,
         max_restarts=config.watchdog_max_restarts,
         restart_window=config.watchdog_restart_window,
+        backend=config.model_backend,
+        web_port=config.web_port,
+        draft_model=config.draft_model,
+        num_draft_tokens=config.num_draft_tokens,
+        backend_command=config.backend_command,
+        backend_capabilities=config.backend_capabilities,
+        backend_extra_args=config.backend_extra_args,
+        max_concurrent_generations=config.max_concurrent_generations,
+        context_size=config.context_size,
     )
     retrain_manager = RetrainManager(db, model_manager, config)
 
@@ -453,7 +541,7 @@ def main() -> None:
         guarded_thread(delayed_retrain).start()
 
     try:
-        uvicorn.run(app, host="127.0.0.1", port=config.web_port, log_level="warning", access_log=False)
+        uvicorn.run(app, host=web_host, port=config.web_port, log_level="warning", access_log=False)
     except KeyboardInterrupt:
         log("Shutting down...")
     finally:
@@ -471,4 +559,5 @@ if __name__ == "__main__":
 __all__ = [
     'build_config',
     'main',
+    'subcommands',
 ]
