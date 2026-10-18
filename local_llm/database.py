@@ -20,11 +20,28 @@ from .core import *  # noqa: F401,F403
 from .obslog import *  # noqa: F401,F403
 
 
+# Feature modules that own tables register a schema function here instead of
+# editing _init_db: `register_schema("api_tokens", _tokens_schema)`. Each one
+# receives the open connection and must be idempotent and additive, exactly like
+# _migrate_multiuser (CREATE ... IF NOT EXISTS, PRAGMA-guarded ALTER TABLE ADD
+# COLUMN with a constant default). Every registered schema runs on every start,
+# and Database.ensure_schema() lets a store apply its own on first use, so a
+# Database built before the feature module was imported still gets the table.
+SCHEMA_EXTENSIONS: dict = {}
+
+
+def register_schema(name: str, fn) -> None:
+    """Register (or replace) an idempotent schema function for a feature."""
+    SCHEMA_EXTENSIONS[name] = fn
+
+
 class Database:
     """Thread-safe SQLite manager with one connection per thread."""
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
+        self._schemas_applied: set[str] = set()
+        self._schema_lock = threading.Lock()
         self._local = threading.local()
         self._all_conns: list[sqlite3.Connection] = []
         self._conns_lock = threading.Lock()
@@ -155,7 +172,7 @@ class Database:
             try:
                 conn.execute("""
                     CREATE VIRTUAL TABLE IF NOT EXISTS doc_chunks
-                    USING fts5(path, chunk)
+                    USING fts5(path, chunk, user_id UNINDEXED)
                 """)
                 self.fts_enabled = True
                 self.search_mode = "fts5"
@@ -164,7 +181,8 @@ class Database:
                     CREATE TABLE IF NOT EXISTS doc_chunks_plain (
                         id INTEGER PRIMARY KEY,
                         path TEXT,
-                        chunk TEXT
+                        chunk TEXT,
+                        user_id TEXT NOT NULL DEFAULT 'local'
                     )
                 """)
                 conn.execute("""
@@ -316,9 +334,104 @@ class Database:
             """)
 
             self._migrate_multiuser(conn)
+            self._migrate_documents_owner(conn)
+            for name in list(SCHEMA_EXTENSIONS):
+                self._apply_schema(conn, name)
             conn.commit()
 
+    def _apply_schema(self, conn: sqlite3.Connection, name: str) -> None:
+        fn = SCHEMA_EXTENSIONS.get(name)
+        if fn is None or name in self._schemas_applied:
+            return
+        fn(conn)
+        self._schemas_applied.add(name)
+
+    def ensure_schema(self, name: str) -> None:
+        """Apply one registered feature schema now if this database lacks it."""
+        if name in self._schemas_applied:
+            return
+        with self._schema_lock:
+            with self._connection() as conn:
+                self._apply_schema(conn, name)
+                conn.commit()
+
     # ---------------------------------------------------------- migrations --
+
+    def _migrate_documents_owner(self, conn: sqlite3.Connection) -> None:
+        """Make knowledge-base documents unique per OWNER, not per path.
+
+        documents.path was globally UNIQUE and chunks were keyed by path alone,
+        so a second user indexing the same path (the same URL, or "notes.md"
+        once every user has their own workspace) deleted the first user's chunks
+        and took over their row. Two changes, both idempotent:
+
+          * documents is rebuilt with UNIQUE(user_id, path) (SQLite cannot drop
+            a column constraint in place);
+          * every chunk carries its owner, and retrieval filters chunks on THAT.
+            Filtering by "a path some document I own has" would have turned two
+            owners' identical paths into a read leak the moment both existed.
+        """
+        sentinel = SENTINEL_LOCAL_USER
+        # Chunks first, while documents.path is still unique (1:1 owner join).
+        fts_cols = {row["name"] for row in conn.execute("PRAGMA table_info(doc_chunks)")}
+        if fts_cols and "user_id" not in fts_cols:
+            conn.execute("DROP TABLE IF EXISTS doc_chunks_owner_migration")
+            conn.execute("CREATE VIRTUAL TABLE doc_chunks_owner_migration "
+                         "USING fts5(path, chunk, user_id UNINDEXED)")
+            conn.execute(
+                "INSERT INTO doc_chunks_owner_migration (path, chunk, user_id) "
+                "SELECT c.path, c.chunk, COALESCE(NULLIF(d.user_id, ''), ?) "
+                "FROM doc_chunks c LEFT JOIN documents d ON d.path = c.path", (sentinel,))
+            conn.execute("DROP TABLE doc_chunks")
+            conn.execute("ALTER TABLE doc_chunks_owner_migration RENAME TO doc_chunks")
+        self._chunk_owner_column(conn, "doc_chunks_plain")
+        doc_cols = {row["name"] for row in conn.execute("PRAGMA table_info(documents)")}
+        if not doc_cols:
+            return
+        path_unique = False
+        for index in conn.execute("PRAGMA index_list(documents)").fetchall():
+            if not index["unique"]:
+                continue
+            cols = [c["name"] for c in conn.execute(f"PRAGMA index_info('{index['name']}')")]
+            if cols == ["path"]:
+                path_unique = True
+        if not path_unique:
+            return
+        owner = "user_id" if "user_id" in doc_cols else f"'{sentinel}'"
+        conn.execute("DROP TABLE IF EXISTS documents_owner_migration")
+        conn.execute(f"""
+            CREATE TABLE documents_owner_migration (
+                id INTEGER PRIMARY KEY,
+                path TEXT,
+                title TEXT,
+                chars INTEGER,
+                chunks INTEGER,
+                indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                user_id TEXT NOT NULL DEFAULT '{sentinel}',
+                UNIQUE(user_id, path)
+            )
+        """)
+        conn.execute(
+            "INSERT INTO documents_owner_migration "
+            "(id, path, title, chars, chunks, indexed_at, user_id) "
+            f"SELECT id, path, title, chars, chunks, indexed_at, "
+            f"COALESCE(NULLIF({owner}, ''), ?) FROM documents", (sentinel,))
+        conn.execute("DROP TABLE documents")
+        conn.execute("ALTER TABLE documents_owner_migration RENAME TO documents")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_user ON documents(user_id)")
+
+    def _chunk_owner_column(self, conn: sqlite3.Connection, table: str) -> None:
+        """Give a plain chunk table its owner column (backfilled from documents)."""
+        cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if not cols or "user_id" in cols:
+            return
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id TEXT NOT NULL "
+                     f"DEFAULT '{SENTINEL_LOCAL_USER}'")
+        doc_cols = {row["name"] for row in conn.execute("PRAGMA table_info(documents)")}
+        if "user_id" in doc_cols:
+            conn.execute(
+                f"UPDATE {table} SET user_id = COALESCE((SELECT d.user_id FROM documents d "
+                f"WHERE d.path = {table}.path LIMIT 1), user_id)")
 
     def _migrate_multiuser(self, conn: sqlite3.Connection) -> None:
         """Additive, idempotent migration to the multi-user / multi-node schema.
@@ -600,7 +713,11 @@ class Database:
         """
         if not getattr(self, "fts_enabled", False):
             return 0
-        self.remove_document(path)
+        owner = user_id or SENTINEL_LOCAL_USER
+        # Re-indexing replaces only THIS owner's copy of the path; another
+        # user's document at the same path is theirs and stays.
+        self.remove_document(path, user_id=owner)
+        self._ensure_chunk_owner()
         chunks = []
         chunk_chars = max(200, int(chunk_chars or 1200))
         overlap = min(max(0, int(overlap or 0)), chunk_chars // 2)
@@ -611,33 +728,58 @@ class Database:
                 chunks.append(piece)
         table = self._chunk_table()
         for piece in chunks:
-            self.execute(f"INSERT INTO {table} (path, chunk) VALUES (?, ?)", (path, piece))
+            self.execute(f"INSERT INTO {table} (path, chunk, user_id) VALUES (?, ?, ?)",
+                         (path, piece, owner))
         self.execute(
             "INSERT OR REPLACE INTO documents (path, title, chars, chunks, user_id) "
             "VALUES (?, ?, ?, ?, ?)",
-            (path, title or Path(path).name, len(text), len(chunks),
-             user_id or SENTINEL_LOCAL_USER))
+            (path, title or Path(path).name, len(text), len(chunks), owner))
         self.commit()
         return len(chunks)
 
     def _owned_paths_clause(self, user_id: str | None) -> tuple[str, list[Any]]:
         """SQL fragment restricting chunk paths to those a user may retrieve
-        (their own documents plus shared ones). Empty when user_id is None."""
+        (their own documents plus shared ones). Empty when user_id is None.
+
+        On the chunk's own owner column: two owners may index the same path,
+        so "a path one of my documents has" would match the other's chunks."""
         if user_id is None:
             return "", []
-        return (" AND path IN (SELECT path FROM documents WHERE user_id IN (?, ?))",
-                [user_id, SHARED_OWNER])
+        return " AND user_id IN (?, ?)", [user_id, SHARED_OWNER]
+
+    def _ensure_chunk_owner(self) -> None:
+        """A plain chunk table created after startup (the selftest builds one by
+        hand) gets its owner column on first use instead of failing inserts."""
+        table = self._chunk_table()
+        done = self.__dict__.setdefault("_chunk_owner_checked", set())
+        if table in done or table == "doc_chunks":
+            return
+        with self._schema_lock:
+            with self._connection() as conn:
+                self._chunk_owner_column(conn, table)
+                conn.commit()
+        done.add(table)
 
     def _chunk_table(self) -> str:
         """Which table holds chunks: the FTS5 virtual table, or the plain
         fallback used when this Python's SQLite lacks FTS5."""
         return "doc_chunks" if getattr(self, "search_mode", "fts5") == "fts5" else "doc_chunks_plain"
 
-    def remove_document(self, path: str) -> None:
+    def remove_document(self, path: str, user_id: str | None = None) -> None:
+        """Drop a document. user_id given: only that owner's copy; None: every
+        owner's (the admin "clear", and import removal, whose paths already
+        carry the owner)."""
         if not getattr(self, "fts_enabled", False):
             return
-        self.execute(f"DELETE FROM {self._chunk_table()} WHERE path = ?", (path,))
-        self.execute("DELETE FROM documents WHERE path = ?", (path,))
+        if user_id is None:
+            self.execute(f"DELETE FROM {self._chunk_table()} WHERE path = ?", (path,))
+            self.execute("DELETE FROM documents WHERE path = ?", (path,))
+        else:
+            self._ensure_chunk_owner()
+            self.execute(f"DELETE FROM {self._chunk_table()} WHERE path = ? AND user_id = ?",
+                         (path, user_id))
+            self.execute("DELETE FROM documents WHERE path = ? AND user_id = ?",
+                         (path, user_id))
         self.commit()
 
     def search_documents(self, query: str, limit: int = 5, only: list[str] | None = None,
@@ -692,7 +834,7 @@ class Database:
             clauses.append("path IN (" + ",".join("?" for _ in only) + ")")
             params.extend(only)
         if user_id is not None:
-            clauses.append("path IN (SELECT path FROM documents WHERE user_id IN (?, ?))")
+            clauses.append("user_id IN (?, ?)")      # the chunk's own owner
             params.extend([user_id, SHARED_OWNER])
         if terms:
             like_bits = []
@@ -886,7 +1028,7 @@ class Database:
             "documents": rows("SELECT * FROM documents"),
         }
         if getattr(self, "fts_enabled", False):
-            data["doc_chunks"] = rows(f"SELECT path, chunk FROM {self._chunk_table()}")
+            data["doc_chunks"] = rows(f"SELECT path, chunk, user_id FROM {self._chunk_table()}")
         return data
 
     def import_backup(self, data: dict) -> dict:
@@ -945,14 +1087,18 @@ class Database:
                 counts["feedback"] += 1
             except Exception:
                 continue
-        by_path: dict[str, list[str]] = {}
+        # Grouped per (path, owner): two owners may hold the same path, and a
+        # backup taken before chunks carried an owner restores as the sentinel.
+        by_path: dict[tuple[str, str | None], list[str]] = {}
         for ch in section("doc_chunks"):
-            by_path.setdefault(ch.get("path", ""), []).append(ch.get("chunk", ""))
-        for path, chunks in by_path.items():
+            key = (ch.get("path", ""), ch.get("user_id") or None)
+            by_path.setdefault(key, []).append(ch.get("chunk", ""))
+        for (path, owner), chunks in by_path.items():
             if not path:
                 continue
             try:
-                self.index_document(path, "\n\n".join(chunks), Path(path).name)
+                self.index_document(path, "\n\n".join(chunks), Path(path).name,
+                                    user_id=owner)
                 counts["documents"] += 1
             except Exception:
                 continue
@@ -1948,4 +2094,6 @@ class Database:
 # helpers (leading underscore) must cross module boundaries too.
 __all__ = [
     'Database',
+    'SCHEMA_EXTENSIONS',
+    'register_schema',
 ]

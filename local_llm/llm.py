@@ -1,6 +1,10 @@
 """Prompt assembly, reasoning splitting and tool-call parsing.
 
-Split out of the original single-file deploy.py; behaviour is unchanged.
+Split out of the original single-file deploy.py. The tool-call grammar itself
+(every model family's format, JSON repair, streaming detection) and the
+reasoning-block primitives live in toolparse.py; this module keeps the
+historical entry points (parse_tool_call, strip_reasoning, ThinkSplitter) so
+every caller and test keeps its import.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ from typing import Sequence
 from .core import *  # noqa: F401,F403
 from .config import *  # noqa: F401,F403
 from .tools import *  # noqa: F401,F403
+from .toolparse import *  # noqa: F401,F403
 
 
 def note_prefix(prompt: str, lane: str = "tools") -> None:
@@ -131,12 +136,17 @@ def skills_block(registry: ToolRegistry) -> str:
 # closes, so parse_tool_call refuses it -- and the loop then hands two thousand
 # characters of half-written document to the user as though it were the answer.
 def is_truncated_tool_call(text: str, known: "set[str] | None" = None) -> bool:
-    """True when `text` is the start of a tool call that never finished."""
+    """True when `text` is the start of a tool call that never finished.
+
+    The canonical JSON rule is unchanged; the special-token formats (an
+    unclosed <tool_call>, <function=...>, [TOOL_CALLS] [...) are recognised
+    too, because a Qwen3-Coder cut off mid-<parameter> is the same failure.
+    """
     body = strip_reasoning(text or "").strip()
     if body.startswith("```"):
         body = re.sub(r"^```[a-zA-Z]*\s*", "", body)
     if not body.startswith("{"):
-        return False
+        return tool_call_unterminated(body, known)
     if body.rstrip().endswith("}") and body.count("{") == body.count("}"):
         return False                # balanced: it failed to parse for some other reason
     if not re.search(r'"(?:tool|action|name)"\s*:', body):
@@ -250,37 +260,14 @@ def extract_json_object(text: str) -> dict | None:
     """Pull the first balanced JSON object out of a model reply.
 
     Small models wrap the object in prose or a code fence at random, so scanning
-    for balanced braces beats expecting a clean response.
+    for balanced braces beats expecting a clean response. The scan is shared
+    with the tool-call parser (tool_json_candidates) so the two can never
+    disagree about which object is "the reply's JSON".
     """
     if not text:
         return None
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
-    candidates = [fenced.group(1)] if fenced else []
-    depth = 0
-    start = -1
-    in_string = False
-    escape = False
-    for index, char in enumerate(text):
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            if depth == 0:
-                start = index
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0 and start >= 0:
-                candidates.append(text[start:index + 1])
-                start = -1
-    for candidate in candidates:
+    candidates, _open = tool_json_candidates(text)
+    for _start, candidate, _fenced in candidates:
         try:
             parsed = json.loads(candidate)
         except Exception:
@@ -290,8 +277,9 @@ def extract_json_object(text: str) -> dict | None:
     return None
 
 
-THINK_BLOCK = re.compile(r"(?is)<(think|thinking|reasoning)>.*?</\1>")
-OPEN_THINK = re.compile(r"(?is)<(think|thinking|reasoning)>.*\Z")
+# THINK_BLOCK, OPEN_THINK and strip_reasoning are defined in toolparse.py (the
+# parser must strip exactly what this splitter hides) and re-exported here.
+_THINK_NOISE_ALT = "|".join(re.escape(n) for n in HARMONY_NOISE)
 
 
 class ThinkSplitter:
@@ -311,25 +299,44 @@ class ThinkSplitter:
     final event then replaced the bubble with the cleaned text -- which is
     precisely the whole-message rewrite this class exists to eliminate,
     reintroduced for every spelling but one.
+
+    The same holds for the newer spellings: <seed:think> (Seed-OSS) and the
+    gpt-oss harmony analysis channel (<|channel|>analysis<|message|> ... <|end|>),
+    whose final-channel header and <|return|> are protocol and are dropped
+    from the answer exactly as strip_reasoning drops them.
+
+    `opened=True` starts inside a reasoning block, for a caller that knows the
+    chat template opened <think> in the prompt. Without it, a bare leading
+    </think> can only be dropped: the text before it has already streamed as
+    answer, and strip_reasoning (which sees the whole reply) removes it when
+    the final event lands.
     """
 
-    TAGS = ("think", "thinking", "reasoning")
+    TAGS = REASONING_TAGS
     OPEN = "<think>"
     CLOSE = "</think>"
-    _OPEN_RE = re.compile(r"(?i)<(think|thinking|reasoning)>")
+    _OPEN_RE = re.compile(rf"(?i)<({_TP_TAG_ALT})>")
     # No complete tag is a prefix of another ("<think>" and "<thinking>" differ
     # at the 7th character), so a complete match is never ambiguous and only
     # INCOMPLETE tails have to be held back.
-    _OPEN_TAGS = tuple(f"<{t}>" for t in TAGS)
+    _OPEN_TAGS = tuple(f"<{t}>" for t in REASONING_TAGS)
+    _CLOSE_TAGS = tuple(f"</{t}>" for t in REASONING_TAGS)
+    _ANSWER_RE = re.compile(
+        rf"(?i)<(?P<tag>{_TP_TAG_ALT})>|(?P<harmony><\|channel\|>analysis<\|message\|>)"
+        rf"|(?P<noise>{_THINK_NOISE_ALT})|(?P<close></(?:{_TP_TAG_ALT})>)")
 
-    def __init__(self) -> None:
-        self.in_think = False
+    def __init__(self, opened: bool = False) -> None:
+        self.in_think = bool(opened)
         self.carry = ""
         # Which spelling opened the current block, so the close has to match it
         # exactly as THINK_BLOCK's backreference does. Closing on any of the
         # three would split "<think>x</reasoning>y" differently from
         # strip_reasoning, and the two must not disagree about the same text.
-        self.tag = ""
+        self.tag = "think" if opened else ""
+        # Whether any reasoning tag has been seen. Only the FIRST tag can be a
+        # bare close (strip_reasoning's rule); a stray close tag after that is
+        # ordinary answer text in both places.
+        self.seen = bool(opened)
 
     @staticmethod
     def _prefix_tail(data: str, tags) -> int:
@@ -350,7 +357,20 @@ class ThinkSplitter:
         return 0
 
     def _close_tag(self) -> str:
+        if self.tag == "harmony":
+            return HARMONY_END
         return f"</{self.tag or 'think'}>"
+
+    def _answer_holds(self) -> tuple:
+        holds = self._OPEN_TAGS + (HARMONY_ANALYSIS_OPEN,) + HARMONY_NOISE
+        return holds if self.seen else holds + self._CLOSE_TAGS
+
+    def _next_marker(self, data: str):
+        for m in self._ANSWER_RE.finditer(data):
+            if m.group("close") and self.seen:
+                continue            # a stray close tag is answer text
+            return m
+        return None
 
     @staticmethod
     def _find_ci(data: str, needle: str) -> int:
@@ -387,9 +407,9 @@ class ThinkSplitter:
                     self.in_think = False
                     self.tag = ""
             else:
-                m = self._OPEN_RE.search(data)
+                m = self._next_marker(data)
                 if m is None:
-                    keep = self._prefix_tail(data, self._OPEN_TAGS)
+                    keep = self._prefix_tail(data, self._answer_holds())
                     if keep:
                         self.carry = data[len(data) - keep:]
                         data = data[:len(data) - keep]
@@ -400,8 +420,17 @@ class ThinkSplitter:
                     if m.start():
                         out.append(("answer", data[:m.start()]))
                     data = data[m.end():]
-                    self.in_think = True
-                    self.tag = m.group(1).lower()
+                    if m.group("tag"):
+                        self.in_think = True
+                        self.tag = m.group("tag").lower()
+                        self.seen = True
+                    elif m.group("harmony"):
+                        self.in_think = True
+                        self.tag = "harmony"
+                        self.seen = True
+                    elif m.group("close"):
+                        self.seen = True      # bare leading close: dropped
+                    # noise (harmony final header, <|return|>): dropped
         return out
 
     def flush(self) -> list[tuple[str, str]]:
@@ -422,22 +451,6 @@ class ThinkSplitter:
         return [("think" if self.in_think else "answer", held)]
 
 
-def strip_reasoning(text: str) -> str:
-    """Remove a reasoning model's chain-of-thought block.
-
-    Qwen3.5 and later emit <think>...</think> before the answer. extract_json_object
-    scans for the first balanced JSON object anywhere in the reply, so reasoning
-    that talks through candidate arguments gets parsed as the tool call itself.
-    An unterminated block is stripped too, because mid-stream the closing tag
-    has not arrived yet and the agent tests the buffer on every token.
-    """
-    if not text or "<" not in text:
-        return text
-    text = THINK_BLOCK.sub("", text)
-    text = OPEN_THINK.sub("", text)
-    return text.strip()
-
-
 def parse_tool_call(text: str, known: set[str] | None = None) -> tuple[str, dict] | None:
     """Return (tool name, args) if the reply is a tool call, else None.
 
@@ -445,26 +458,14 @@ def parse_tool_call(text: str, known: set[str] | None = None) -> tuple[str, dict
     object whose name is not a real tool is only treated as a call if it used
     the explicit "tool" key. That stops a final answer that happens to contain
     JSON (a config snippet, a parsed record) from being executed as a tool call.
+
+    Delegates to toolparse.parse_tool_calls (every model family's format plus
+    JSON repair) and returns the first call; parse_tool_calls returns them all.
     """
-    parsed = extract_json_object(strip_reasoning(text))
-    if not parsed:
+    calls = parse_tool_calls(text, known)
+    if not calls:
         return None
-    explicit = "tool" in parsed or "tool_name" in parsed
-    name = parsed.get("tool") or parsed.get("name") or parsed.get("tool_name")
-    if not isinstance(name, str) or not name:
-        return None
-    name = name.strip()
-    if known is not None and name not in known and not explicit:
-        return None
-    args = parsed.get("args") or parsed.get("arguments") or parsed.get("parameters") or {}
-    if isinstance(args, str):
-        try:
-            args = json.loads(args)
-        except Exception:
-            args = {"query": args}
-    if not isinstance(args, dict):
-        args = {}
-    return name, args
+    return calls[0].name, calls[0].args
 
 
 # Keys that only ever belong to the tool-call protocol. A reply made up of
@@ -485,6 +486,13 @@ def is_degenerate_tool_call(text: str) -> bool:
     visible = strip_reasoning(text or "").strip()
     if not visible:
         return False
+    # The special-token spelling of the same failure: <tool_call></tool_call>,
+    # [TOOL_CALLS][] or a bare <|python_tag|>{} is a call the model never filled.
+    if is_empty_tool_wrapper(visible):
+        return True
+    wrapped = re.fullmatch(r"<tool_call>\s*(\{.*\})\s*</tool_call>", visible, re.S)
+    if wrapped:
+        visible = wrapped.group(1).strip()
     fenced = re.fullmatch(r"```(?:json)?\s*(\{.*\})\s*```", visible, re.S)
     if fenced:
         visible = fenced.group(1).strip()
@@ -520,10 +528,29 @@ class GenerationStats:
     # reply budget and was CUT OFF). Nothing read this before, so a truncated
     # answer -- a program ending mid-function -- was shown as if it were complete.
     finish_reason: str = ""
+    # Prompt tokens the server answered from its prompt cache
+    # (usage.prompt_tokens_details.cached_tokens). prompt_tokens minus this is
+    # what the step actually prefilled, which is the number that shows whether
+    # the stable-prefix work is paying off.
+    cached_tokens: int = 0
+    # Tokens the model spent reasoning (usage.completion_tokens_details, or an
+    # estimate from the reasoning text the server returned separately).
+    reasoning_tokens: int = 0
+    # Time the request waited for a generation slot before it was sent.
+    queue_ms: float = 0.0
+    # False when no first-token time exists (a non-streaming call): ttft_ms is
+    # then the whole call and total - ttft is zero, which used to report a
+    # decode rate of completion_tokens * 1000 tok/s.
+    ttft_measured: bool = True
 
     @property
     def decode_tps(self) -> float:
-        decode_ms = max(1.0, self.total_ms - self.ttft_ms)
+        if self.ttft_measured:
+            decode_ms = max(1.0, self.total_ms - self.ttft_ms)
+        else:
+            # No first token to separate prefill from decode: the whole call is
+            # the honest denominator, so this is a lower bound (estimated).
+            decode_ms = max(1.0, self.total_ms)
         return self.completion_tokens / (decode_ms / 1000.0)
 
     def as_event(self) -> dict:
@@ -534,6 +561,10 @@ class GenerationStats:
             "total_ms": round(self.total_ms, 1),
             "decode_tps": round(self.decode_tps, 2),
             "estimated": not self.from_server,
+            "cached_tokens": self.cached_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "queue_ms": round(self.queue_ms, 1),
+            "decode_tps_estimated": not self.ttft_measured,
         }
 
 
@@ -595,4 +626,13 @@ __all__ = [
     'note_prefix',
     'parse_tool_call',
     'strip_reasoning',
+    # From toolparse, re-exported so `from .llm import *` keeps reaching them.
+    'ParsedToolCall',
+    'ToolCallStreamDetector',
+    'bind_tool_call_config',
+    'looks_like_call_prefix',
+    'parse_tool_calls',
+    'repair_json',
+    'tool_call_policy',
+    '_THINK_NOISE_ALT',
 ]

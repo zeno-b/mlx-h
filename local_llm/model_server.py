@@ -1,12 +1,16 @@
-"""Supervises the mlx_lm.server subprocess (start, stop, watchdog).
+"""Supervises the model server subprocess (start, stop, watchdog).
 
-Split out of the original single-file deploy.py; behaviour is unchanged.
+Split out of the original single-file deploy.py. The engine it supervises is a
+backends.BackendSpec (mlx-lm by default): the spec builds the command line,
+names the --help to sniff, the log lines that mean the generation thread died
+and the "model" value requests must carry. The manager stays the supervisor.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -17,6 +21,7 @@ from typing import Any
 from .core import *  # noqa: F401,F403
 from .sysutil import *  # noqa: F401,F403
 from .config import *  # noqa: F401,F403
+from .backends import *  # noqa: F401,F403
 
 
 # Bytes read from the backend log per watchdog tick. Bounded so a burst of
@@ -27,10 +32,34 @@ _LOG_SCAN_CHUNK = 256 * 1024
 # HTTP server answering 200 on /v1/models and /health. There is no HTTP-visible
 # symptom at all: completions simply hang forever. The traceback goes to the
 # child's stdout/stderr, which is the log file below, and nowhere else.
-_FATAL_BACKEND_PATTERNS = (
-    re.compile(rb"Exception in thread [^\n]*\(_generate\)"),
-    re.compile(rb"Command buffer execution failed"),
-    re.compile(rb"kIOGPUCommandBufferCallbackErrorOutOfMemory"),
+# The patterns now live on the backend spec (backends.MLXLM_FATAL_PATTERNS);
+# this name is kept for anything that still imports it.
+_FATAL_BACKEND_PATTERNS = MLXLM_FATAL_PATTERNS
+
+# Every manager attribute a launcher may read. apply_config() falls back to it
+# for a spec that does not declare its own launch_inputs.
+_MSM_LAUNCH_ATTRS = (
+    "max_kv_size", "kv_bits", "kv_group_size", "quantized_kv_start", "prefill_step_size",
+    "prompt_cache_size", "prompt_cache_bytes", "decode_concurrency", "prompt_concurrency",
+    "prompt_cache_dir", "draft_model", "num_draft_tokens", "web_port", "backend_command",
+    "max_concurrent_generations", "context_size",
+)
+
+# (manager attribute, Config field) pairs apply_config() copies.
+_MSM_CONFIG_MAP = (
+    ("max_kv_size", "max_kv_size"), ("kv_bits", "kv_bits"),
+    ("kv_group_size", "kv_group_size"), ("quantized_kv_start", "quantized_kv_start"),
+    ("prompt_cache_dir", "prompt_cache_dir"), ("prefill_step_size", "prefill_step_size"),
+    ("prompt_cache_size", "prompt_cache_size"), ("prompt_cache_bytes", "prompt_cache_bytes"),
+    ("decode_concurrency", "decode_concurrency"), ("prompt_concurrency", "prompt_concurrency"),
+    ("probe_interval", "watchdog_probe_interval"), ("probe_timeout", "watchdog_probe_timeout"),
+    ("probe_failures", "watchdog_probe_failures"), ("max_restarts", "watchdog_max_restarts"),
+    ("restart_window", "watchdog_restart_window"), ("web_port", "web_port"),
+    ("draft_model", "draft_model"), ("num_draft_tokens", "num_draft_tokens"),
+    ("backend_command", "backend_command"), ("backend_capabilities", "backend_capabilities"),
+    ("backend_extra_args", "backend_extra_args"),
+    ("max_concurrent_generations", "max_concurrent_generations"),
+    ("context_size", "context_size"),
 )
 
 
@@ -63,6 +92,21 @@ class ModelServerManager:
         probe_failures: int = 3,
         max_restarts: int = 3,
         restart_window: float = 600.0,
+        # Inference engine (backends.py): a registered name or a BackendSpec.
+        # An unknown name falls back to mlx-lm with a warning.
+        backend: Any = DEFAULT_BACKEND,
+        # The web UI's port. When known, mlx-lm gets --allowed-origins for the
+        # UI's own origin instead of its default "*". 0 keeps the default.
+        web_port: int = 0,
+        draft_model: str = "",
+        num_draft_tokens: int = 0,
+        backend_command: str = "",
+        backend_capabilities: str = "",
+        backend_extra_args: str = "",
+        # Read by backends that size themselves (mlx-lm-turbo) and by the
+        # prompt-cache plan in describe(). 0 means "not told".
+        max_concurrent_generations: int = 0,
+        context_size: int = 0,
     ):
         self.kv_bits = kv_bits
         self.kv_group_size = kv_group_size
@@ -83,10 +127,21 @@ class ModelServerManager:
         self.adapter_dir = adapter_dir
         self.adapter_choice = adapter_choice
         self.max_kv_size = max_kv_size
+        self.web_port = web_port
+        self.draft_model = draft_model
+        self.num_draft_tokens = num_draft_tokens
+        self.backend_command = backend_command
+        self.backend_capabilities = backend_capabilities
+        self.backend_extra_args = backend_extra_args
+        self.max_concurrent_generations = max_concurrent_generations
+        self.context_size = context_size
+        self._set_backend(backend)
+        # Optional flags the last _build_cmd actually passed (describe()).
+        self._accepted_levers: list[str] = []
         self.proc: subprocess.Popen | None = None
         self.status = "stopped"
         self.lock = threading.RLock()
-        self._server_help = help_cmd("mlx_lm.server")
+        self._server_help = help_cmd(self.backend.help_module) if self.backend.help_module else ""
         self._log_file: Any = None
         self._watchdog_thread: threading.Thread | None = None
         self._watchdog_stop = threading.Event()
@@ -109,94 +164,79 @@ class ModelServerManager:
         self._auto_restart_disabled = False
 
     def _build_cmd(self, use_adapter: bool) -> list[str]:
-        cmd = [sys.executable, "-m", "mlx_lm.server"]
-        if not add_if_supported(cmd, self._server_help, ["--model", "--hf-path", "--mlx-path"], self.model_id):
-            cmd.extend(["--model", self.model_id])
-        if not add_if_supported(cmd, self._server_help, ["--port"], str(self.model_port)):
-            cmd.extend(["--port", str(self.model_port)])
-        if self.max_kv_size > 0:
-            # Caps the rotating KV cache. Older mlx-lm builds do not have it, so
-            # this is best-effort rather than an error.
-            if not add_if_supported(
-                cmd, self._server_help,
-                ["--max-kv-size", "--max_kv_size"], str(self.max_kv_size),
-            ):
-                log(
-                    "Installed mlx_lm.server has no --max-kv-size; the KV cache stays unbounded.",
-                    logging.WARNING,
-                )
-        adapter_path = self.adapter_path()
-        # Count the memory levers that the installed build actually accepted.
-        # Zero of them on an 8GB machine is worth saying out loud: it means the
-        # server runs with no cap on prefill peak or on resident prompt caches,
-        # which is how a marginal machine ends up with a dead generation thread.
-        accepted: list[str] = []
-        if self.kv_bits > 0:
-            # Quantized KV cache roughly halves cache memory at 8 bits, which is
-            # the difference between a usable context and swapping on 8GB.
-            # Server support is genuinely unsettled across builds, so this is
-            # best effort and the run continues without it.
-            if add_if_supported(cmd, self._server_help, ["--kv-bits"], str(self.kv_bits)):
-                accepted.append("--kv-bits")
-                add_if_supported(cmd, self._server_help, ["--kv-group-size"], str(self.kv_group_size))
-                add_if_supported(
-                    cmd, self._server_help,
-                    ["--quantized-kv-start"], str(self.quantized_kv_start),
-                )
-            else:
-                log(
-                    "Installed mlx_lm.server has no --kv-bits; the KV cache stays in fp16. "
-                    "Support for this flag varies by build.",
-                    logging.WARNING,
-                )
-        # --- mlx-lm >= 0.29 levers ----------------------------------------- #
-        # These replaced --max-kv-size/--kv-bits and are the ones that exist on
-        # a current build. --prefill-step-size is the important one: its default
-        # of 2048 makes any shorter prompt a single forward pass, and the peak
-        # of that pass is what fails the Metal command buffer on 8GB.
-        if self.prefill_step_size > 0:
-            if add_if_supported(cmd, self._server_help,
-                                ["--prefill-step-size"], str(self.prefill_step_size)):
-                accepted.append("--prefill-step-size")
-        if self.prompt_cache_size > 0:
-            if add_if_supported(cmd, self._server_help,
-                                ["--prompt-cache-size"], str(self.prompt_cache_size)):
-                accepted.append("--prompt-cache-size")
-        if self.prompt_cache_bytes > 0:
-            if add_if_supported(cmd, self._server_help,
-                                ["--prompt-cache-bytes"], str(self.prompt_cache_bytes)):
-                accepted.append("--prompt-cache-bytes")
-        if self.decode_concurrency > 0:
-            if add_if_supported(cmd, self._server_help,
-                                ["--decode-concurrency"], str(self.decode_concurrency)):
-                accepted.append("--decode-concurrency")
-        if self.prompt_concurrency > 0:
-            if add_if_supported(cmd, self._server_help,
-                                ["--prompt-concurrency"], str(self.prompt_concurrency)):
-                accepted.append("--prompt-concurrency")
-        if self.prompt_cache_dir:
-            # The agent re-sends an extending prefix every step, which is the
-            # best case for prompt caching. Worth far more here than in chat.
-            if not add_if_supported(
-                cmd, self._server_help,
-                ["--prompt-cache-dir", "--prompt-cache"], self.prompt_cache_dir,
-            ):
-                log("Installed mlx_lm.server has no prompt cache flag; ignoring PROMPT_CACHE_DIR.",
-                    logging.WARNING)
-        if use_adapter and adapter_path is not None:
-            add_if_supported(cmd, self._server_help, ["--adapter-path", "--adapter"], str(adapter_path))
-        if accepted:
-            log("Model server memory levers in effect: " + ", ".join(accepted), logging.DEBUG)
-        elif self._server_help:
-            log(
-                "Installed mlx_lm.server accepted none of the memory-limit flags this "
-                "build knows about, so prefill peak and resident prompt caches are "
-                "uncapped. On a small machine that risks a Metal out-of-memory that "
-                "kills the server's generation thread. Check `mlx_lm.server --help` "
-                "for the flag names this version uses.",
-                logging.WARNING,
-            )
+        """The child's argv, from the backend spec's launcher.
+
+        For mlx-lm this is the command line the manager has always built
+        (backends._mlxlm_command, pinned by tests/test_backends.py); the only
+        additions are opt-in (a draft model, --allowed-origins when the web
+        port is known, BACKEND_EXTRA_ARGS).
+        """
+        spec = self.backend
+        if spec.launcher is None:
+            raise RuntimeError(f"Backend {spec.name} has no launcher; it cannot start a server.")
+        self._accepted_levers = []
+        cmd = list(spec.launcher(self, use_adapter))
+        extra = self._extra_args()
+        if extra:
+            cmd.extend(extra)
+            self._accepted_levers = list(self._accepted_levers) + ["BACKEND_EXTRA_ARGS"]
         return cmd
+
+    def _extra_args(self) -> list[str]:
+        raw = str(self.backend_extra_args or "").strip()
+        if not raw:
+            return []
+        try:
+            return shlex.split(raw)
+        except ValueError as exc:
+            # An unbalanced quote must not stop the model from starting: the
+            # extra arguments are a tuning escape hatch, not a requirement.
+            log(f"BACKEND_EXTRA_ARGS does not parse ({exc}); ignoring it.", logging.WARNING)
+            return []
+
+    def request_model(self) -> str:
+        """The "model" value every probe sends (see backends.request_model_for)."""
+        return request_model_for(self)
+
+    def _probe_timeout_now(self) -> float:
+        hook = self.backend.probe_timeout
+        if hook is not None:
+            try:
+                return float(hook(self))
+            except Exception as exc:  # noqa: BLE001
+                log(f"Backend {self.backend.name}: probe timeout hook failed ({exc}).",
+                    logging.DEBUG)
+        return self.probe_timeout
+
+    def _set_backend(self, backend: Any) -> None:
+        requested = backend.name if isinstance(backend, BackendSpec) else str(backend or "")
+        self.backend_requested = (requested or DEFAULT_BACKEND).strip().lower()
+        self.backend = get_backend(backend)
+
+    def _launch_signature(self) -> tuple:
+        names = self.backend.launch_inputs or _MSM_LAUNCH_ATTRS
+        return (self.backend.name, str(self.backend_extra_args or "")) + tuple(
+            getattr(self, name, None) for name in names)
+
+    def apply_config(self, config: Any) -> bool:
+        """Adopt the launch and watchdog settings from a Config.
+
+        Returns True when the next start would launch a different command
+        (a restart is due for it to take effect); watchdog tuning applies to
+        the running server immediately and never asks for a restart. The model
+        and the adapter are not touched: swap() owns those, with validation.
+        """
+        with self.lock:
+            before = self._launch_signature()
+            old_help_module = self.backend.help_module
+            self._set_backend(getattr(config, "model_backend", self.backend.name))
+            for attr, cfg_name in _MSM_CONFIG_MAP:
+                if hasattr(config, cfg_name):
+                    setattr(self, attr, getattr(config, cfg_name))
+            if self.backend.help_module != old_help_module:
+                self._server_help = (help_cmd(self.backend.help_module)
+                                     if self.backend.help_module else "")
+            return self._launch_signature() != before
 
     def adapter_path(self) -> Path | None:
         """The adapter directory the next start will use, or None for the base model."""
@@ -219,7 +259,7 @@ class ModelServerManager:
     def describe(self) -> dict:
         selected = resolve_adapter_quietly(self.adapter_choice)
         active = self.adapter_path()
-        return {
+        info = {
             "model": self.model_id,
             "adapter": self.adapter_choice,
             "adapter_path": str(active or ""),
@@ -233,6 +273,47 @@ class ModelServerManager:
             "prompt_cache_dir": self.prompt_cache_dir,
             "status": self.status,
             "cached": model_is_cached(self.model_id),
+            **self._describe_backend(selected),
+        }
+        # "Served" means the running model answers WITH the adapter: the
+        # backend can take one AND one is active. With no adapter (none trained,
+        # or a base mismatch) the backend's ability alone read as "LoRA on".
+        info["adapter_served"] = bool(info["adapter_served"] and active is not None)
+        return info
+
+    def _describe_backend(self, selected: Path | None) -> dict:
+        """Which engine runs, what it can do, and why it was set up this way."""
+        spec = self.backend
+        decisions: list[str] = []
+        if self.backend_requested != spec.name:
+            decisions.append(f"MODEL_BACKEND {self.backend_requested!r} is not a known backend; "
+                             f"running {spec.name} instead.")
+        if spec.decide is not None:
+            try:
+                decisions.extend(str(d) for d in spec.decide(self) if d)
+            except Exception as exc:  # noqa: BLE001
+                decisions.append(f"Backend decisions unavailable: {type(exc).__name__}.")
+        served = spec.serves_adapter(self)
+        if selected is not None and not served:
+            decisions.append(f"{spec.label} is not given the LoRA adapter, so the base "
+                             "model answers.")
+        plan = None
+        if spec.cache_plan is not None:
+            try:
+                plan = spec.cache_plan(self)
+            except Exception as exc:  # noqa: BLE001
+                log(f"Backend {spec.name}: prompt-cache plan failed ({exc}).", logging.DEBUG)
+        return {
+            "backend": spec.name,
+            "backend_label": spec.label,
+            "backend_requested": self.backend_requested,
+            "capabilities": sorted(spec.caps_for(self)),
+            "accepted_levers": list(self._accepted_levers),
+            "decisions": decisions,
+            "prompt_cache": plan,
+            "adapter_served": served,
+            "draft_model": self.draft_model,
+            "request_model": self.request_model(),
         }
 
     def swap(self, model_id: str | None = None, adapter_choice: str | None = None) -> bool:
@@ -381,7 +462,7 @@ class ModelServerManager:
         # A pattern can straddle two reads, so carry a small tail across scans.
         window = self._log_scan_tail + chunk
         self._log_scan_tail = window[-512:]
-        for pattern in _FATAL_BACKEND_PATTERNS:
+        for pattern in (self.backend.fatal_patterns or ()):
             found = pattern.search(window)
             if found:
                 return True, found.group(0).decode("utf-8", "replace").strip()
@@ -400,13 +481,15 @@ class ModelServerManager:
             resp = httpx.post(
                 f"http://127.0.0.1:{self.model_port}/v1/chat/completions",
                 json={
-                    "model": self.model_id,
+                    # Not the repo id: on mlx-lm that would reload the weights
+                    # without the adapter (backends.request_model_for).
+                    "model": self.request_model(),
                     "messages": [{"role": "user", "content": "ok"}],
                     "max_tokens": 1,
                     "temperature": 0.0,
                     "stream": False,
                 },
-                timeout=self.probe_timeout,
+                timeout=self._probe_timeout_now(),
             )
         except Exception:
             return False
@@ -512,9 +595,14 @@ class ModelServerManager:
         """Internal start without lock acquisition (caller must hold lock)."""
         self._cancel.clear()
         candidates = []
-        if self.adapter_path() is not None:
-            candidates.append(self._build_cmd(True))
-        candidates.append(self._build_cmd(False))
+        try:
+            if self.backend.serves_adapter(self) and self.adapter_path() is not None:
+                candidates.append(self._build_cmd(True))
+            candidates.append(self._build_cmd(False))
+        except (ValueError, RuntimeError) as exc:
+            # A bad BACKEND_COMMAND template: nothing to launch, say why.
+            self.status = f"error: {exc}"
+            raise
 
         last_error: Exception | None = None
         for cmd in candidates:
@@ -540,7 +628,7 @@ class ModelServerManager:
                     self.status = "loading"
                     log(f"Port {self.model_port} open. Waiting for weights to load...")
                     wait_for_model_ready(
-                        self.model_id, self.model_port,
+                        self.request_model(), self.model_port,
                         timeout=900, proc=proc, cancel=self._cancel,
                     )
                     self.status = "ready"
@@ -602,7 +690,7 @@ class ModelServerManager:
                 resp = await client.post(
                     f"http://127.0.0.1:{self.model_port}/v1/chat/completions",
                     json={
-                        "model": self.model_id,
+                        "model": self.request_model(),
                         "messages": [{"role": "user", "content": "hi"}],
                         "max_tokens": 1,
                     },

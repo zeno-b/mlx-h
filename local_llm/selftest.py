@@ -35,6 +35,7 @@ from .calculator import *  # noqa: F401,F403
 from .training import *  # noqa: F401,F403
 from .model_server import *  # noqa: F401,F403
 from .diagnostics import *  # noqa: F401,F403
+from .settings_schema import *  # noqa: F401,F403
 
 
 def selftest() -> int:
@@ -90,6 +91,26 @@ def selftest() -> int:
         "textutil", "codecheck", "taskstate", "agent", "tasks", "auth", "cluster",
         "claude_import", "api", "documents",
         "diagnostics", "selftest", "cli",
+        "mcp", "skills", "checkpoints", "appctx", "settings_schema",
+        "turnctx",
+        "prefs",
+        "ui_settings", "ui_script_kit", "ui_script_admin", "ui_script_settings",
+        "admission",
+        "backends",
+        "toolparse",
+        "nodesec", "remote_access", "sharding",
+        "train_methods",
+        "catalog",
+        "mlx_engine",
+        "policy",
+        "workspaces",
+        "streams",
+        "openai_compat", "anthropic_compat",
+        "api_tokens", "wire",
+        "vision", "attachments", "audio",
+        "tools_extra", "mcp_server",
+        "ui_script_integrations", "tool_catalog",
+        # ---- extension modules: one name per feature module, above this line ---- #
     }
     _found = {p.stem for p in _pkg_dir.glob("*.py")} - {"__init__", "__main__"}
     if _missing := sorted(_expected - _found):
@@ -668,6 +689,33 @@ def selftest() -> int:
         failures.append("light theme styles are missing")
     if 'id="restoreInput"' not in _page3 or 'id="themeBtn"' not in _page3:
         failures.append("backup/theme controls are missing from the UI")
+
+    # Settings: every runtime-mutable setting is either a control in the
+    # Settings view or deliberately hidden with a reason. MUTABLE generates the
+    # POST /api/config schema and SETTINGS_FIELDS generates the panel, so a new
+    # knob can be settable over HTTP and invisible to the person who has to
+    # tune it; that is the same as not existing for anyone not writing curl.
+    _sf, _uh, _scid = SETTINGS_FIELDS, UI_HIDDEN, settings_control_id
+    _shown = {f["key"] for f in _sf if f["scope"] == "global"}
+    if _unshown := sorted(set(Config.MUTABLE) - _shown - set(_uh)):
+        failures.append("mutable settings with no Settings control (add them to "
+                        "SETTINGS_FIELDS or UI_HIDDEN): " + ", ".join(_unshown))
+    if _stale := sorted(k for k in _shown if k not in Config.MUTABLE):
+        failures.append("Settings controls for keys POST /api/config would ignore: "
+                        + ", ".join(_stale))
+    for _f in _sf:
+        _cid = _scid(_f)
+        if f'id="{_cid}"' not in _page3 or f'data-key="{_f["key"]}"' not in _page3:
+            failures.append(f"Settings field {_f['key']} has no bound control #{_cid}")
+            break
+    if _sm3:
+        for _fn in ("openSettings", "closeSettings", "toggleSettings", "loadSettings",
+                    "applySettings", "discardSettings", "loadConfig", "saveConfig",
+                    "initTheme", "uiToast", "postJSON", "showAdminSection", "wireRestoreInput"):
+            if not re.search(rf"function\s+{_fn}\s*\(", _sm3.group(1)):
+                failures.append(f"UI settings helper {_fn} is not defined")
+    if 'id="settingsView"' not in _page3 or "<!--SETTINGS_VIEW-->" in _page3:
+        failures.append("the Settings view was not rendered into the page")
 
     # Error handling: malformed input is rejected clearly instead of crashing.
     with tempfile.TemporaryDirectory() as _etmp:

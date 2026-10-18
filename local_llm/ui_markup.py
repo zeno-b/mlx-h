@@ -1,8 +1,26 @@
-"""The HTML skeleton: header, views, side panels and overlays.
+"""The HTML skeleton: header, views, side panels, overlays and the composer.
 
 Part of the embedded UI, split out of the single HTML_PAGE string for
 readability. Assembled once at import time in ui.py, so there is no
 runtime cost and no extra file I/O.
+
+The page is deliberately thin on the chat surface. The header used to carry
+six action buttons and four nav buttons (Regenerate, Search and Export each
+duplicated somewhere else, and Settings existed only for admins), so every
+option lived in two places and none of them in the place you looked. Now:
+
+  * header: brand, a segmented view switcher, one status pill, New chat,
+    Settings (every role) and the account menu;
+  * chat: a single overflow menu for conversation actions, plus Regenerate on
+    the last answer itself;
+  * composer: the message box with one toolbar (mode, prompts, context meter,
+    Stop, Send);
+  * Settings: one full view rendered by ui_settings.py in place of the
+    SETTINGS_VIEW marker below, which also holds what used to be the admin
+    "Models" view and the History > Backup panel.
+
+No inline style attributes: every look comes from the class kit in
+ui_styles.py, so a control looks the same wherever it appears.
 """
 
 from __future__ import annotations
@@ -26,608 +44,196 @@ UI_BODY = r"""</style>
 <body class="booting">
  <header>
    <div class="brand"><span class="brand-slot">{{APP_LOGO}}</span><strong>{{APP_NAME}}</strong> <span class="build" title="UI build version">build {{UI_BUILD}}</span></div>
-   <div id="status">Starting...</div>
-   <nav class="views">
-     <button id="navChat" class="active" onclick="showView('chat')" data-tip-below data-tip="Talk to the model. Ask questions, paste code or documents, run tools." title="Chat view">Chat</button>
-     <button id="navTasks" class="admin-only" onclick="showView('tasks')" data-tip-below data-tip="Scheduled or saved jobs the agent runs on demand or on a timer." title="Tasks view">Tasks</button>
-     <button id="navHistory" onclick="showView('history')" data-tip-below data-tip="Browse, search, reopen and manage past conversations." title="History view">History</button>
-     <button id="navModels" class="admin-only" onclick="showView('models')" data-tip-below data-tip="Models, knowledge base, training data, imports and system settings." title="Admin view">Models</button>
+   <nav class="seg views" id="viewSeg" aria-label="Views">
+     <button type="button" id="navChat" class="active" aria-pressed="true" onclick="showView('chat')" data-tip-below data-tip="Talk to the model. Ask questions, paste code or documents, run tools.">Chat</button>
+     <button type="button" id="navHistory" aria-pressed="false" onclick="showView('history')" data-tip-below data-tip="Browse, search, reopen and manage past conversations.">History</button>
+     <button type="button" id="navTasks" class="admin-only" aria-pressed="false" onclick="showView('tasks')" data-tip-below data-tip="Scheduled or saved jobs the agent runs on demand or on a timer.">Tasks</button>
    </nav>
+   <div id="status" class="pill status-pill muted" role="status" aria-live="polite" data-tip-below data-tip="Connecting to the server.">Starting...</div>
+   <div class="spacer"></div>
    <div class="actions">
-     <button onclick="newChat()" data-tip-below data-tip="Start a fresh conversation. Clears the current thread from view." title="New chat">New chat</button>
-     <button onclick="regenerateLast()" data-tip-below data-tip="Discard the last answer and generate a new one for the same question." title="Regenerate last answer">Regenerate</button>
-     <button onclick="showView('history')" data-tip-below data-tip="Browse and search every past conversation." title="Search conversations">Search</button>
-     <button onclick="exportChat()" data-tip-below data-tip="Download this conversation as Markdown." title="Export conversation">Export</button>
-     <button onclick="togglePrompts()" data-tip-below data-tip="Save and reuse prompts you type often." title="Prompt library">Prompts</button>
-     <button class="admin-only" onclick="toggleSettings()" data-tip-below data-tip="Model, tools, generation and memory settings you can change live." title="Open settings">Settings</button>
+     <button type="button" id="newChatBtn" class="btn-icon btn-ghost" onclick="newChat()" aria-label="New chat" data-tip-below data-tip="Start a fresh conversation. The current one stays in History."><svg class="icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.4 2.6a2 2 0 0 1 3 3L12 15l-4 1 1-4Z"/></svg></button>
+     <button type="button" id="settingsBtn" class="btn-icon btn-ghost" onclick="openSettings()" aria-label="Settings" data-tip-below data-tip="Every option in one place: appearance, generation, agent, memory and tools (plus models, performance and admin for administrators)."><svg class="icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
      <div class="acct" id="acctMenu">
-       <button class="acct-btn" onclick="toggleAcct()" data-tip-below data-tip="Your account and session." title="Account"><span id="userChip" class="user-chip"></span> <span class="caret">&#9662;</span></button>
-       <div class="acct-pop hidden" id="acctPop">
+       <button type="button" id="acctBtn" class="btn-ghost acct-btn" onclick="toggleAcct()" aria-haspopup="menu" aria-expanded="false" aria-controls="acctPop" data-tip-below data-tip="Your account and session."><span id="userChip" class="user-chip"></span> <span class="caret" aria-hidden="true">&#9662;</span></button>
+       <div class="menu acct-pop hidden" id="acctPop" role="menu">
          <div class="acct-info" id="acctInfo"></div>
-         <button id="logoutBtn" onclick="doLogout()" title="End your session and return to the login screen">Log out</button>
+         <button type="button" id="logoutBtn" role="menuitem" onclick="doLogout()">Log out</button>
        </div>
      </div>
    </div>
  </header>
 
  <div id="loginOverlay">
-   <div id="loginBox">
-     <div class="brand" style="justify-content:center;margin-bottom:4px"><span class="brand-slot">{{APP_LOGO_LOGIN}}</span><strong>{{APP_NAME}}</strong></div>
-     <div class="hint" style="text-align:center;margin-bottom:12px">Sign in to continue.</div>
-     <label style="font-size:12px;color:var(--muted)">Username</label>
-     <input id="loginUser" type="text" autocomplete="username" onkeydown="loginKey(event)" placeholder="username">
-     <label style="margin-top:8px">Password</label>
+   <div id="loginBox" class="stack">
+     <div class="brand login-brand"><span class="brand-slot">{{APP_LOGO_LOGIN}}</span><strong>{{APP_NAME}}</strong></div>
+     <p class="hint login-sub">Sign in to continue.</p>
+     <label class="field-label" for="loginUser">Username</label>
+     <input id="loginUser" class="input" type="text" autocomplete="username" onkeydown="loginKey(event)" placeholder="username">
+     <label class="field-label" for="loginPass">Password</label>
      <div class="pw-field">
-       <input id="loginPass" type="password" autocomplete="current-password" onkeydown="loginKey(event)" placeholder="password">
-       <button type="button" class="pw-reveal" onclick="togglePw('loginPass', this)" title="Show or hide the password">show</button>
+       <input id="loginPass" class="input" type="password" autocomplete="current-password" onkeydown="loginKey(event)" placeholder="password">
+       <button type="button" class="btn-ghost btn-sm pw-reveal" onclick="togglePw('loginPass', this)" aria-label="Show or hide the password">show</button>
      </div>
-     <div id="loginError" class="login-error"></div>
-     <button class="primary" style="width:100%;margin-top:12px" onclick="doLogin()">Sign in</button>
-     <button id="oidcBtn" style="width:100%;margin-top:8px;display:none" onclick="oidcLogin()">Sign in with Microsoft</button>
+     <div id="loginError" class="login-error" role="alert"></div>
+     <button type="button" id="loginBtn" class="btn-primary login-submit" onclick="doLogin()">Sign in</button>
+     <button type="button" id="oidcBtn" class="login-submit hidden" onclick="oidcLogin()">Sign in with Microsoft</button>
    </div>
  </div>
 
  <div id="main">
-   <div id="chatView" class="view"><div id="chat"></div></div>
+   <div id="chatView" class="view">
+     <button type="button" id="chatMenuBtn" class="btn-icon btn-ghost" onclick="toggleChatMenu()" aria-haspopup="menu" aria-expanded="false" aria-controls="chatMenu" aria-label="Conversation actions" data-tip-below data-tip="Export, regenerate, search history, prompt library."><svg class="icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="currentColor" stroke="none"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg></button>
+     <div id="chatMenu" class="menu hidden" role="menu" aria-label="Conversation actions">
+       <button type="button" role="menuitem" onclick="chatMenuAction('export')">Export as Markdown</button>
+       <button type="button" role="menuitem" onclick="chatMenuAction('regenerate')">Regenerate last answer</button>
+       <button type="button" role="menuitem" onclick="chatMenuAction('search')">Search history</button>
+       <button type="button" role="menuitem" onclick="chatMenuAction('prompts')">Prompts library</button>
+     </div>
+     <div id="chat" aria-live="polite"></div>
+   </div>
+
+   <div id="historyView" class="view hidden">
+     <div class="panel stack">
+       <h2 class="h2" data-tip="Every conversation stored locally. Reopen one to continue it.">Conversations</h2>
+       <div class="row">
+         <input id="historySearch" class="input grow" type="search" placeholder="Search all conversations..." aria-label="Search conversations" onkeydown="if(event.key==='Enter')runHistorySearch()">
+         <button type="button" onclick="runHistorySearch()" data-tip="Find conversations containing this text.">Search</button>
+         <button type="button" class="btn-ghost" onclick="clearHistorySearch()" data-tip="Clear the search and show all recent conversations.">Show all</button>
+       </div>
+       <div id="historyList" class="stack">loading...</div>
+     </div>
+   </div>
 
    <div id="tasksView" class="view hidden">
-     <div class="task-list">
-       <div style="display:flex;justify-content:space-between;align-items:center">
-         <strong style="font-size:13px">Tasks</strong>
-         <button onclick="toggleTaskForm()">New task</button>
+     <div class="task-list stack">
+       <div class="row">
+         <h2 class="h3 grow">Tasks</h2>
+         <button type="button" class="btn-primary btn-sm" onclick="toggleTaskForm()">New task</button>
        </div>
 
-       <div id="taskForm" class="form-grid" style="display:none;margin-top:10px">
-         <label>Name</label>
-         <input id="tfName" type="text" placeholder="Morning news sweep">
-         <label>Goal, written as an instruction to the agent</label>
-         <textarea id="tfGoal" placeholder="Search for news about MLX released in the last day and summarise anything new in three bullets."></textarea>
+       <div id="taskForm" class="card stack hidden">
+         <div class="field">
+           <label class="field-label" for="tfName">Name</label>
+           <input id="tfName" class="input" type="text" placeholder="Morning news sweep">
+         </div>
+         <div class="field">
+           <label class="field-label" for="tfGoal">Goal, written as an instruction to the agent</label>
+           <textarea id="tfGoal" class="input textarea" placeholder="Search for news about MLX released in the last day and summarise anything new in three bullets."></textarea>
+         </div>
          <div class="row">
-           <div>
-             <label>Repeat every (seconds)</label>
-             <input id="tfInterval" type="number" min="0" step="60" value="0">
+           <div class="field grow">
+             <label class="field-label" for="tfInterval">Repeat every (seconds)</label>
+             <input id="tfInterval" class="input" type="number" min="0" step="60" value="0">
            </div>
-           <div>
-             <label data-tip="Tool/reasoning steps per turn before the agent must answer. Big tasks continue past this from a summary.">Max steps</label>
-             <input id="tfSteps" type="number" min="1" max="20" value="6">
-           </div>
-         </div>
-         <label>Tools (comma separated, blank for all)</label>
-         <input id="tfTools" type="text" placeholder="web_search, fetch_url, remember">
-         <label>System prompt override (optional)</label>
-         <textarea id="tfSystem" placeholder="Leave blank to use the global system prompt."></textarea>
-         <div class="row" style="margin-top:10px">
-           <div>
-             <label>Keep conversation history</label>
-             <select id="tfHistory">
-               <option value="false">no, each run is fresh</option>
-               <option value="true">yes, runs build on each other</option>
-             </select>
+           <div class="field grow">
+             <label class="field-label" for="tfSteps" data-tip="Tool/reasoning steps per turn before the agent must answer. Big tasks continue past this from a summary.">Max steps</label>
+             <input id="tfSteps" class="input" type="number" min="1" max="20" value="6">
            </div>
          </div>
-         <div class="row" style="margin-top:12px">
-           <button class="primary" onclick="createTask()">Create</button>
-           <button onclick="toggleTaskForm()">Cancel</button>
+         <div class="field">
+           <label class="field-label" for="tfTools">Tools (comma separated, blank for all)</label>
+           <input id="tfTools" class="input" type="text" placeholder="web_search, fetch_url, remember">
          </div>
-         <div class="hint">
+         <div class="field">
+           <label class="field-label" for="tfSystem">System prompt override (optional)</label>
+           <textarea id="tfSystem" class="input textarea" placeholder="Leave blank to use the global system prompt."></textarea>
+         </div>
+         <div class="field">
+           <label class="field-label" for="tfHistory">Keep conversation history</label>
+           <select id="tfHistory" class="input select">
+             <option value="false">no, each run is fresh</option>
+             <option value="true">yes, runs build on each other</option>
+           </select>
+         </div>
+         <div class="row">
+           <button type="button" class="btn-primary" onclick="createTask()">Create</button>
+           <button type="button" class="btn-ghost" onclick="toggleTaskForm()">Cancel</button>
+         </div>
+         <p class="hint">
            Interval 0 means the task only runs when you press Run. A repeating
            task fires once as soon as it is created, so you find out quickly
            whether the goal is worded well.
-         </div>
+         </p>
        </div>
 
-       <div id="taskCards" style="margin-top:12px">loading...</div>
+       <div id="taskCards" class="stack">loading...</div>
      </div>
 
-     <div class="task-monitor">
-       <div id="monitorHeader" style="color:var(--muted);font-size:13px">
-         Select a task to watch its runs, or create one.
-       </div>
-       <div id="runControls" style="display:none;margin-top:10px">
-         <div class="row" style="max-width:520px">
-           <div>
-             <label style="font-size:12px;color:var(--muted)">Run</label>
-             <select id="runPicker" onchange="openRun(this.value)"></select>
-           </div>
-           <div style="flex:0 0 auto;display:flex;align-items:flex-end;gap:6px">
-             <button onclick="runSelectedTask()">Run now</button>
-             <button onclick="cancelSelectedTask()">Cancel</button>
-           </div>
+     <div class="task-monitor stack">
+       <div id="monitorHeader" class="muted">Select a task to watch its runs, or create one.</div>
+       <div id="runControls" class="row hidden">
+         <div class="field grow">
+           <label class="field-label" for="runPicker">Run</label>
+           <select id="runPicker" class="input select" onchange="openRun(this.value)"></select>
          </div>
+         <button type="button" onclick="runSelectedTask()">Run now</button>
+         <button type="button" class="btn-ghost" onclick="cancelSelectedTask()">Cancel run</button>
        </div>
        <div id="runFeed"></div>
      </div>
    </div>
 
-   <div id="historyView" class="view hidden">
-     <div class="panel">
-       <h3 data-tip="Every conversation stored locally. Reopen one to continue it.">Conversations</h3>
-       <div class="row">
-         <div><input id="historySearch" type="text" placeholder="search all conversations..." onkeydown="if(event.key==='Enter')runHistorySearch()"></div>
-         <div style="flex:0 0 auto"><button onclick="runHistorySearch()" data-tip="Find conversations containing this text." title="Search">Search</button></div>
-         <div style="flex:0 0 auto"><button onclick="loadHistory()" data-tip="Show all recent conversations again." title="Show all">Show all</button></div>
-       </div>
-       <div id="historyList" style="margin-top:12px">loading...</div>
-     </div>
+   <!--SETTINGS_VIEW-->
 
-     <div class="panel admin-only">
-       <h3 data-tip="Save or restore everything you have created in this app.">Backup</h3>
-       <div class="hint">
-         Downloads your conversations, prompts, feedback and indexed documents as
-         one JSON file. Restoring merges a backup back in without deleting what is
-         already here. Model weights are not included; they are re-downloadable.
-       </div>
-       <div class="row" style="margin-top:10px">
-         <button onclick="downloadBackup()" data-tip="Download everything as a JSON file." title="Download backup">Download backup</button>
-         <button onclick="document.getElementById('restoreInput').click()" data-tip="Merge a previously downloaded backup back in." title="Restore backup">Restore backup</button>
-       </div>
-       <input id="restoreInput" type="file" accept="application/json" style="display:none">
-     </div>
-   </div>
-
-   <div id="modelsView" class="view hidden">
-     <div class="subnav" id="adminTabs">
-       <button data-mg-tab="models" class="active" onclick="showAdminTab('models')">Model</button>
-       <button data-mg-tab="agents" onclick="showAdminTab('agents')">Agents</button>
-       <button data-mg-tab="knowledge" onclick="showAdminTab('knowledge')">Knowledge</button>
-       <button data-mg-tab="codebase" onclick="showAdminTab('codebase')">Codebase</button>
-       <button data-mg-tab="data" onclick="showAdminTab('data')">Training data</button>
-       <button data-mg-tab="import" onclick="showAdminTab('import')">Import</button>
-       <button data-mg-tab="users" onclick="showAdminTab('users')">Users</button>
-       <button data-mg-tab="cluster" onclick="showAdminTab('cluster')">Cluster</button>
-     </div>
-     <div id="adminPanels">
-     <div data-mg="import" class="panel">
-       <h3 data-tip="Import a chat history export (.zip) from Claude, ChatGPT, DeepSeek or xAI: conversations, projects and files.">Import chat history</h3>
-       <div class="hint">
-         Upload an &ldquo;Export data&rdquo; .zip from Claude, ChatGPT, DeepSeek or xAI.
-         Conversations become browsable
-         history, their text is indexed into your knowledge base for retrieval, and
-         project instructions are saved as reusable prompts. The archive is validated
-         and sandboxed (path-traversal, zip-bomb and size limits). Nothing is dumped
-         into every prompt &mdash; retrieval surfaces only relevant passages. Admin
-         only; imported data is private to your account.
-       </div>
-       <div class="row" style="margin-top:10px">
-         <div><input id="importFile" type="file" accept=".zip,application/zip"></div>
-         <div style="flex:0 0 auto"><button class="primary" onclick="startImport()" data-tip="Upload and process the selected chat export." title="Import">Import</button></div>
-         <div style="flex:0 0 auto"><button onclick="loadImports()" title="Refresh import list">Refresh</button></div>
-       </div>
-       <div id="importStatus" class="hint" style="margin-top:8px"></div>
-       <div id="importList" style="margin-top:10px">loading...</div>
-     </div>
-     <div data-mg="models" class="panel">
-       <h3>Current</h3>
-       <div id="modelCurrent" class="logbox" style="max-height:none">loading...</div>
-
-       <h3>Switch model</h3>
-       <table class="models"><tbody id="modelTable"></tbody></table>
-       <label style="display:block;font-size:12px;color:var(--muted);margin:12px 0 4px">
-         Or any Hugging Face repo id
-       </label>
-       <div class="row">
-         <div><input id="modelCustom" type="text" placeholder="mlx-community/Qwen2.5-7B-Instruct-4bit"></div>
-         <div style="flex:0 0 auto"><button onclick="useModel(document.getElementById('modelCustom').value.trim())" data-tip="Queue this model id (Hugging Face / mlx-community) to load." title="Use this model">Use</button></div>
-       </div>
-
-       <h3>Adapter and cache</h3>
-       <div class="row">
-         <div>
-           <label style="font-size:12px;color:var(--muted)">LoRA adapter</label>
-           <select id="adapterSelect"></select>
-         </div>
-         <div>
-           <label style="font-size:12px;color:var(--muted)">KV cache cap (0 = unbounded)</label>
-           <input id="kvSize" type="number" min="0" step="512">
-         </div>
-       </div>
-       <div class="row" style="margin-top:12px">
-         <button class="primary" onclick="applyModel()" data-tip="Load the selected model and adapter. Restarts the model server." title="Apply and restart">Apply and restart</button>
-         <button onclick="loadModels()" data-tip="Reload the list of available and cached models." title="Refresh model list">Refresh</button>
-       </div>
-       <div class="hint">
-         Switching to a model that is not cached downloads it on first use, which
-         can take minutes and several gigabytes. The log below is the model
-         server's own output, including download progress.
-       </div>
-
-       <h3>Model server log</h3>
-       <div id="modelLog" class="logbox">loading...</div>
-     </div>
-
-     <div data-mg="data" class="panel">
-       <h3 data-tip="How reusable your collected data is for training this or any future model.">Training data</h3>
-       <div id="datasetStats" class="logbox" style="max-height:none">loading...</div>
-       <div class="hint">
-         Your feedback is stored as portable data, not tied to the current model.
-         Export it to train this assistant now, or any model later. Approved
-         answers become examples to imitate; rejected ("no, wrong") answers and
-         your corrections become preference pairs for DPO-style tuning.
-       </div>
-       <label style="display:block;font-size:12px;color:var(--muted);margin:10px 0 4px">Export format</label>
-       <div class="row" style="flex-wrap:wrap;gap:6px">
-         <button onclick="exportDataset('chat')" data-tip="Chat messages WITH this assistant's system prompt. Trains a model to be this assistant. Used by the built-in LoRA loop." title="Export chat JSONL">Chat (this assistant)</button>
-         <button onclick="exportDataset('bare')" data-tip="Chat messages with NO system prompt. Model-neutral: train a different base model or persona." title="Export bare JSONL">Bare Q&amp;A (any model)</button>
-         <button onclick="exportDataset('preference')" data-tip="{prompt, chosen, rejected} pairs from corrections and good/bad answers. For DPO-style preference tuning later." title="Export preference pairs">Preference pairs (DPO)</button>
-         <button onclick="exportDataset('raw')" data-tip="Every column as JSONL. A lossless archive you can reshape into any format in the future." title="Export raw archive">Raw archive</button>
-       </div>
-       <div class="row" style="margin-top:8px">
-         <label class="agent-toggle" data-tip="Only export rows you have marked reviewed. Curated data trains better on any model."><input id="exportReviewedOnly" type="checkbox"> reviewed only</label>
-         <button onclick="loadDatasetStats()" data-tip="Refresh the dataset counts." title="Refresh stats">Refresh</button>
-         <button id="approvePendingBtn" hidden onclick="approvePendingFeedback()" data-tip="Ratings from non-admin accounts wait here. They never train the shared adapter until you approve them." title="Approve queued examples">approve queued</button>
-       </div>
-     </div>
-     <div data-mg="knowledge" class="panel">
-       <h3 data-tip="Index your own documents so answers come from your material, with sources.">Knowledge base</h3>
-       <div id="docsStats" class="logbox" style="max-height:none">loading...</div>
-       <div class="hint">
-         Indexed documents are searched on every question and the best passages are
-         added to the prompt with their source path. Uses SQLite full-text ranking,
-         so it needs no embedding model and no extra memory. PDFs, docx, notebooks,
-         spreadsheets and text are all read.
-       </div>
-       <div id="dropZone" data-tip="Drag files here, or click to choose, to add them to the knowledge base.">
-         <strong>Drop files here</strong> or click to choose &mdash; PDFs, Word docs, spreadsheets, notebooks, text.
-       </div>
-       <input id="fileInput" type="file" multiple style="display:none">
-       <label style="display:block;font-size:12px;color:var(--muted);margin:10px 0 4px">File or folder to index (relative to the project)</label>
-       <div class="row">
-         <div><input id="docsPath" type="text" placeholder="docs"></div>
-         <div style="flex:0 0 auto"><button onclick="indexDocs()" data-tip="Read and index this file or folder into the knowledge base." title="Index">Index</button></div>
-       </div>
-       <div class="row" style="margin-top:8px">
-         <div><input id="docsUrl" type="text" placeholder="https://example.com/docs"></div>
-         <div style="flex:0 0 auto"><button onclick="indexUrl()" data-tip="Fetch a web page and add it to the knowledge base so you can ask about it later without re-fetching." title="Index URL">Index URL</button></div>
-       </div>
-       <div class="row" style="margin-top:8px">
-         <div><input id="docsQuery" type="text" placeholder="test a search..."></div>
-         <div style="flex:0 0 auto"><button onclick="searchDocs()" data-tip="Preview what the model would retrieve for this question." title="Search">Search</button></div>
-         <div style="flex:0 0 auto"><button onclick="clearDocs()" data-tip="Remove every indexed document. Your files are not touched." title="Clear">Clear</button></div>
-       </div>
-       <label style="display:block;font-size:12px;color:var(--muted);margin:12px 0 4px" data-tip="Limit retrieval to specific documents, so answers come only from what you choose.">Answer only from these documents</label>
-       <div id="docScope" style="max-height:150px;overflow-y:auto"></div>
-       <div class="row" style="margin-top:8px">
-         <button onclick="applyScope()" data-tip="Restrict retrieval to the ticked documents." title="Apply scope">Apply scope</button>
-         <button onclick="clearScope()" data-tip="Search the whole knowledge base again." title="Use all documents">Use all</button>
-       </div>
-       <pre id="docsResult" class="gbody gdiff" style="display:none;margin-top:8px"></pre>
-     </div>
-     <div data-mg="codebase" class="panel">
-       <h3 data-tip="The local codebase the agent reads and edits in place. Review here before you push.">Codebase</h3>
-       <label style="display:block;font-size:12px;color:var(--muted);margin:4px 0 4px">Project directory (PROJECT_DIR)</label>
-       <div class="row">
-         <div><input id="cfgProjectDir" type="text" placeholder="/Users/you/path/to/repo"></div>
-         <div style="flex:0 0 auto"><button onclick="openBrowser()" data-tip="Browse your folders and pick the project directory." title="Browse for a folder">Browse...</button></div>
-         <div style="flex:0 0 auto"><button onclick="saveProjectDir()" data-tip="Point the file tools at this local codebase. Empty = sandbox workspace only." title="Set project directory">Set</button></div>
-       </div>
-       <div class="hint">
-         When set, the agent reads and edits files in this directory in place. It
-         never touches .git, and it can't write outside the directory. Changes are
-         yours to review with git and push manually — nothing is committed for you.
-       </div>
-       <div id="projectStatus" class="logbox" style="max-height:none;margin-top:10px">loading...</div>
-       <div class="row" style="margin-top:8px">
-         <button onclick="loadProjectStatus()" data-tip="Refresh git status and the list of files changed this session." title="Refresh">Refresh</button>
-         <button onclick="loadProjectDiff()" data-tip="Show the uncommitted git diff so you can review before pushing." title="Show diff">Show diff</button>
-         <button onclick="revertChanges()" data-tip="Undo this session's edits: restore modified files and delete files created this session. Cannot be undone." title="Revert session changes">Revert session changes</button>
-       </div>
-       <div class="hint" id="sandboxHint" style="margin-top:8px"></div>
-       <pre id="projectDiff" class="gbody gdiff" style="display:none;margin-top:8px"></pre>
-     </div>
-
-     <div data-mg="users" class="panel admin-only">
-       <h3 data-tip="Create and manage the people who can sign in, and their roles.">Users</h3>
-       <div class="hint">
-         Admins can reach every panel here and manage users; standard users get the
-         chat, their own history and knowledge base. Disabling or changing a user
-         signs them out immediately. The last remaining admin cannot be removed.
-       </div>
-       <div id="usersList" style="margin-top:10px">loading...</div>
-       <label style="display:block;font-size:12px;color:var(--muted);margin:12px 0 4px">Add a user</label>
-       <div class="row" style="flex-wrap:wrap;gap:6px">
-         <div><input id="newUserName" type="text" placeholder="username" autocomplete="off"></div>
-         <div><input id="newUserPass" type="password" placeholder="password" autocomplete="new-password"></div>
-         <div style="flex:0 0 auto">
-           <select id="newUserRole">
-             <option value="user">user</option>
-             <option value="admin">admin</option>
-           </select>
-         </div>
-         <div style="flex:0 0 auto"><button class="primary" onclick="createUser()" data-tip="Create this local user." title="Add user">Add user</button></div>
-         <div style="flex:0 0 auto"><button onclick="loadUsers()" title="Refresh user list">Refresh</button></div>
-       </div>
-     </div>
-
-     <div data-mg="agents" class="panel admin-only">
-       <h3 data-tip="Define named agents and exactly what each one is allowed to do.">Agents</h3>
-       <div class="hint">
-         An agent is a named profile that switches on capabilities. It only gets the
-         tools you enable here &mdash; file operations, running code, web &amp; APIs,
-         your knowledge base, memory, or Office&nbsp;365. Create a few specialised
-         agents, then run several together on one task below.
-       </div>
-       <div id="agentsList" style="margin-top:10px">loading...</div>
-
-       <label style="display:block;font-size:12px;color:var(--muted);margin:14px 0 4px">New agent</label>
-       <div class="row">
-         <div><input id="newAgentName" type="text" placeholder="name, e.g. Coder" autocomplete="off"></div>
-       </div>
-       <div class="row" style="margin-top:6px">
-         <div><input id="newAgentDesc" type="text" placeholder="what this agent is for (optional)" autocomplete="off"></div>
-       </div>
-       <div id="newAgentCaps" class="cap-grid" style="margin-top:8px"></div>
-       <div class="row" style="margin-top:8px">
-         <button class="primary" onclick="createAgent()" data-tip="Create this agent profile." title="Add agent">Add agent</button>
-         <button onclick="loadAgents()" title="Refresh agents">Refresh</button>
-       </div>
-
-       <label style="display:block;font-size:12px;color:var(--muted);margin:16px 0 4px">Run several agents on one task</label>
-       <div class="hint">Each selected agent works the task with only its own tools; their answers are merged into one.</div>
-       <div id="agentRunPick" class="cap-grid" style="margin-top:6px"></div>
-       <textarea id="agentRunPrompt" placeholder="describe the task for the selected agents..." style="width:100%;margin-top:6px;min-height:64px"></textarea>
-       <div class="row" style="margin-top:6px">
-         <button class="primary" onclick="runAgents()" data-tip="Run the selected agents together and merge their answers." title="Run together">Run together</button>
-       </div>
-       <div id="agentRunResult" style="margin-top:10px"></div>
-     </div>
-
-     <div data-mg="cluster" class="panel admin-only">
-       <h3 data-tip="Live health of the Mac Mini (primary) and Mac Studio (secondary), and how work was routed.">Cluster &amp; routing</h3>
-       <div class="hint">
-         Work is classified and routed automatically: the primary handles light
-         chat, heavy reasoning and large models prefer the high-memory secondary,
-         and a node that fails is skipped (with a cooldown and a half-open retry)
-         so the other keeps serving. Nothing here is a machine you pick by hand.
-       </div>
-       <div id="clusterNodes" class="logbox" style="max-height:none;margin-top:10px">loading...</div>
-       <div id="routingSummary" class="hint" style="margin-top:8px"></div>
-       <label style="display:block;font-size:12px;color:var(--muted);margin:12px 0 4px">Recent routing decisions</label>
-       <div id="routingEvents" class="logbox" style="max-height:260px">loading...</div>
-       <div class="row" style="margin-top:8px">
-         <button onclick="loadCluster()" data-tip="Refresh node health and routing history." title="Refresh cluster">Refresh</button>
-       </div>
-     </div>
-     </div>
-   </div>
-
-   <div id="browser" class="hidden">
+   <div id="browser" class="hidden" role="dialog" aria-modal="true" aria-label="Choose a project folder">
      <div id="browserBox">
-       <div id="browserPath">~</div>
+       <div id="browserPath" class="mono">~</div>
        <div id="browserList"></div>
-       <div class="row" style="padding:10px 14px;border-top:1px solid var(--border)">
-         <button onclick="chooseCurrentFolder()" data-tip="Use the folder shown above as the project directory." title="Use this folder">Use this folder</button>
-         <button onclick="closeBrowser()" title="Cancel">Cancel</button>
+       <div class="row browser-actions">
+         <button type="button" class="btn-primary" onclick="chooseCurrentFolder()" data-tip="Use the folder shown above as the project directory.">Use this folder</button>
+         <button type="button" class="btn-ghost" onclick="closeBrowser()">Cancel</button>
        </div>
      </div>
    </div>
 
-   <div id="palette" class="hidden">
+   <div id="palette" class="hidden" role="dialog" aria-modal="true" aria-label="Command palette">
      <div id="paletteBox">
-       <input id="paletteInput" type="text" placeholder="Type a command..." autocomplete="off">
-       <div id="paletteList"></div>
+       <input id="paletteInput" class="input" type="text" placeholder="Type a command..." autocomplete="off" aria-label="Command">
+       <div id="paletteList" role="listbox"></div>
      </div>
    </div>
 
-   <aside id="promptsPanel" class="hidden">
-     <h3>Prompt library</h3>
-     <div class="hint">Save prompts you type often, then insert one into the message box with a click.</div>
-     <div id="promptList" style="margin-top:10px">loading...</div>
-     <label style="display:block;font-size:12px;color:var(--muted);margin:12px 0 4px">Save the current message box as</label>
+   <aside id="promptsPanel" class="hidden stack" aria-label="Prompt library">
      <div class="row">
-       <div><input id="promptName" type="text" placeholder="name, e.g. code-review"></div>
-       <div style="flex:0 0 auto"><button onclick="savePrompt()" data-tip="Save whatever is in the message box under this name." title="Save prompt">Save</button></div>
+       <h2 class="h3 grow">Prompt library</h2>
+       <button type="button" class="btn-icon btn-ghost" onclick="togglePrompts()" aria-label="Close the prompt library">&times;</button>
      </div>
-     <div class="row" style="margin-top:10px">
-       <button onclick="togglePrompts()" title="Close">Close</button>
-     </div>
-   </aside>
-
-   <aside id="settings">
-
-     <details class="sgroup" open>
-       <summary data-tip="Theme and look of the app.">Appearance</summary>
-       <div class="sbody">
-       <label>Colour scheme</label>
+     <p class="hint">Save prompts you type often, then insert one into the message box with a click.</p>
+     <div id="promptList" class="stack">loading...</div>
+     <div class="field">
+       <label class="field-label" for="promptName">Save the current message box as</label>
        <div class="row">
-         <button id="themeBtn" onclick="toggleTheme()" data-tip="Switch between the light and dark colour scheme." title="Toggle theme">Light</button>
-       </div>
-       <div class="hint">Your choice is remembered in this browser.</div>
-       </div>
-     </details>
-     <details class="sgroup">
-       <summary data-tip="Prompt, reply length, temperature and context.">Generation</summary>
-       <div class="sbody">
-     <label>System prompt</label>
-     <textarea id="cfgSystem"></textarea>
-     <div class="row">
-       <div>
-         <label data-tip="Longest reply the model may generate, in tokens. Higher = longer answers but more memory and time.">Max tokens</label>
-         <input id="cfgMaxTokens" type="number" min="16" max="32768" step="16">
-       </div>
-       <div>
-         <label data-tip="Randomness of replies. 0 = deterministic and focused; higher = more varied and creative.">Temperature</label>
-         <input id="cfgTemperature" type="number" min="0" max="2" step="0.05">
+         <input id="promptName" class="input grow" type="text" placeholder="name, e.g. code-review">
+         <button type="button" class="btn-primary" onclick="savePrompt()" data-tip="Save whatever is in the message box under this name.">Save</button>
        </div>
      </div>
-     <div class="row">
-       <div>
-         <label data-tip="Total working window (prompt + reply). Auto-sized to your RAM; larger holds more history but uses more memory. Above ~60% of this, large prompts are chunked.">Context size (tokens)</label>
-         <input id="cfgContext" type="number" min="512" max="131072" step="512">
-       </div>
-       <div>
-         <label data-tip="How many past messages to carry into each request. Fewer = less memory, less continuity.">History turns</label>
-         <input id="cfgHistory" type="number" min="0" max="200" step="1">
-       </div>
-     </div>
-     <div class="meter"><div id="ctxBar"></div></div>
-     <div class="hint" id="ctxHint">Context usage in this conversation.</div>
-       </div>
-     </details>
-     <details class="sgroup">
-       <summary data-tip="Tool use and step behaviour.">Agent</summary>
-       <div class="sbody">
-     <div class="row">
-       <div>
-         <label data-tip="Agent mode lets the model call tools (search, fetch, files, APIs) and reason in steps. Off = a plain single reply. Takes effect on your next message; Save keeps it as the default.">Agent mode</label>
-         <label class="agent-toggle" title="Toggle agent mode"><span class="switch"><input id="agentToggle" type="checkbox"><span class="slider"></span></span> tools + step reasoning</label>
-       </div>
-       <div>
-         <label data-tip="Hard ceiling on steps in one turn. The agent stops here and salvages what it has.">Max steps</label>
-         <input id="cfgAgentSteps" type="number" min="1" max="20" step="1">
-       </div>
-     </div>
-     <div class="row">
-       <div>
-         <label data-tip="Steps the agent must take before it may settle. At 1 it answers the moment it can, which is what most turns do. At 2 or more the first reply is treated as a draft and reviewed, costing one extra generation per step but catching the answers a small model fires off without thinking.">Min steps</label>
-         <input id="cfgAgentMinSteps" type="number" min="1" max="20" step="1">
-       </div>
-       <div>
-         <label data-tip="Break a hard question into a plan and work it one step at a time, then synthesise. The most expensive path here: one model call per step plus a synthesis.">Decompose hard questions</label>
-         <label class="agent-toggle" title="Toggle incremental reasoning"><span class="switch"><input id="cfgIncrementalReasoning" type="checkbox"><span class="slider"></span></span> plan, then step through</label>
-       </div>
-     </div>
-     <div class="row">
-       <div>
-         <label data-tip="How many analytical cues (compare, trade-offs, why does, evaluate) make a question worth decomposing. 2 is the default and leaves most questions on the one-pass path; 1 decomposes anything with a single cue in it, which is much slower and much more thorough. A question with no cue at all is never decomposed.">Reasoning cues needed</label>
-         <input id="cfgReasoningSignals" type="number" min="1" max="6" step="1">
-       </div>
-       <div>
-         <label data-tip="Length at which a single cue is enough on its own. Lower it to decompose shorter questions.">Single-cue length</label>
-         <input id="cfgReasoningMinChars" type="number" min="0" max="2000" step="10">
-       </div>
-     </div>
-     <div class="row">
-       <div>
-         <label data-tip="Your model's training cutoff, as YYYY-MM (for example 2024-06). A question naming a year at or after this needs a lookup, because the weights cannot hold the answer. Leave it empty if you do not know it: unknown is treated conservatively, so any recent year counts.">Model training cutoff</label>
-         <input id="cfgModelCutoff" type="text" placeholder="YYYY-MM (leave empty if unknown)">
-       </div>
-       <div>
-         <label data-tip="Put today's date in the system prompt, next to the training cutoff. Without it the model has no anchor for judging whether its own knowledge is still current.">Tell the model the date</label>
-         <label class="agent-toggle" title="Toggle the date line"><span class="switch"><input id="cfgDateInPrompt" type="checkbox"><span class="slider"></span></span> today's date in the prompt</label>
-       </div>
-     </div>
-     <div class="row">
-       <div>
-         <label data-tip="When an answer hedges about external facts (&quot;I'm not sure&quot;, &quot;I don't have specific information about that&quot;), treat it as a knowledge gap: look it up once and answer again. Costs a search and a second generation on a turn that looked finished, so it fires at most once per turn and never against /no-search.">Look up hedged answers</label>
-         <label class="agent-toggle" title="Toggle hedge escalation"><span class="switch"><input id="cfgHedgeEscalation" type="checkbox"><span class="slider"></span></span> search when unsure</label>
-       </div>
-     </div>
-     <div class="row">
-       <div>
-         <label data-tip="The web search provider is locked to DuckDuckGo Lite. There is no other provider and it cannot be changed.">Search provider (locked)</label>
-         <select id="cfgSearchBackend" disabled title="Locked to DuckDuckGo Lite">
-           <option value="duckduckgo_lite">DuckDuckGo Lite</option>
-         </select>
-       </div>
-       <div>
-         <label data-tip="How many results the search tool returns per query.">Search results</label>
-         <input id="cfgSearchResults" type="number" min="1" max="10" step="1">
-       </div>
-     </div>
-     <label data-tip="Max characters a tool result may contribute before it is summarised or truncated.">Tool result limit (chars)</label>
-     <input id="cfgToolChars" type="number" min="200" max="40000" step="200">
-
-     <div style="margin-top:14px" class="row">
-       <button class="primary" onclick="saveConfig()" data-tip="Save these settings. Most apply immediately, no restart needed." title="Apply settings">Apply</button>
-       <button onclick="restartModel()" data-tip="Restart the local model server. Use if it becomes unresponsive." title="Restart model server">Restart model</button>
-     </div>
-     <div class="hint">
-       Context size takes effect on the next message. The KV cache size passed to
-       the model server only changes on restart.
-     </div>
-       </div>
-     </details>
-     <details class="sgroup">
-       <summary data-tip="Model, adapter and fine-tuning.">Models &amp; training</summary>
-       <div class="sbody">
-       <div class="hint">
-         Switching model, adapters, the knowledge base and the training set all
-         live in the admin area; these open it at the right section.
-       </div>
-       <div class="row" style="margin-top:8px;flex-wrap:wrap;gap:6px">
-         <button onclick="showAdminSection('models')" data-tip="Choose the model and LoRA adapter." title="Model manager">Model &amp; adapter</button>
-         <button onclick="showAdminSection('data')" data-tip="Your collected training examples and exports." title="Training data">Training data</button>
-         <button onclick="showAdminSection('knowledge')" data-tip="Index your own documents for retrieval." title="Knowledge base">Knowledge base</button>
-       </div>
-       <label style="margin-top:12px">Retraining</label>
-       <div class="row">
-         <button onclick="retrain()" data-tip="Fine-tune the model on your thumbs-up/down feedback so far (LoRA)." title="Retrain on feedback">Retrain on feedback</button>
-       </div>
-       <div class="hint">Runs a LoRA fine-tune from your approved answers.</div>
-       <div class="hint" id="retrainRecipe">&nbsp;</div>
-       </div>
-     </details>
-     <details class="sgroup">
-       <summary data-tip="Speed, caching and prefill.">Performance</summary>
-       <div class="sbody">
-     <div class="row">
-       <div>
-         <label data-tip="How much of a tool result is fed back to the model as context.">Tool result into context (chars)</label>
-         <input id="cfgToolChars2" type="number" min="200" max="40000" step="100">
-       </div>
-       <div>
-         <label data-tip="Temperature used only when the model is choosing a tool. 0 keeps tool-calls deterministic.">Tool step temperature</label>
-         <input id="cfgToolTemp" type="number" min="0" max="2" step="0.05">
-       </div>
-     </div>
-     <label class="agent-toggle" style="margin-top:8px" data-tip="Skip the model's hidden &lt;think&gt; phase. Faster replies; may reduce reasoning quality on hard questions.">
-       <input id="cfgThinking" type="checkbox"> disable thinking mode
-     </label>
-     <label class="agent-toggle" data-tip="Route obvious requests (a URL, arithmetic) directly to a tool without a model call. Faster and cheaper.">
-       <input id="cfgFastPath" type="checkbox"> deterministic fast path
-     </label>
-     <label class="agent-toggle" data-tip="Keep the prompt prefix stable between steps so the model server can reuse its cache. Faster, uses a bit more memory.">
-       <input id="cfgStablePrefix" type="checkbox"> stable prefix (cache friendly)
-     </label>
-     <label class="agent-toggle" data-tip="Condense oversized tool results before feeding them back, to save context on smaller machines.">
-       <input id="cfgSummarise" type="checkbox"> summarise long tool results
-     </label>
-     <div class="row" style="margin-top:10px">
-       <button onclick="saveConfig()">Apply</button>
-       <button onclick="loadPerf()">Refresh stats</button>
-     </div>
-     <div class="tools-list" id="perfStats" style="margin-top:8px">no samples yet</div>
-     <div id="prefillCurve" style="margin-top:10px"></div>
-     <div class="hint">
-       Prompt tokens climbing step over step within one run is re-prefill cost.
-       Flat means the prefix is being reused.
-     </div>
-     <div class="hint" id="prefixWarn" style="display:none"></div>
-       </div>
-     </details>
-     <details class="sgroup">
-       <summary data-tip="Notes the assistant keeps.">Memory</summary>
-       <div class="sbody">
-     <div class="row">
-       <div><input id="memKey" type="text" placeholder="key"></div>
-       <div><input id="memValue" type="text" placeholder="value"></div>
-     </div>
-     <div class="row" style="margin-top:8px">
-       <button onclick="saveMemory()">Store</button>
-       <button onclick="loadMemory()">Refresh</button>
-     </div>
-     <div class="tools-list" id="memoryList" style="margin-top:8px">loading...</div>
-     <div class="hint">
-       Notes the agent stores with the remember tool, and anything you add here.
-       They persist across restarts.
-     </div>
-       </div>
-     </details>
-     <details class="sgroup">
-       <summary data-tip="Tools currently available.">Tools</summary>
-       <div class="sbody">
-     <div class="tools-list" id="toolsList">loading...</div>
-
-       </div>
-     </details>
    </aside>
  </div>
 
  <footer id="composer">
-   <textarea id="input" placeholder="Send a message. Shift+Enter for a new line." rows="1" data-tip="Type here. Enter sends, Shift+Enter adds a line. Paste large files freely; they are processed in chunks." title="Message input"></textarea>
-   <button id="stopBtn" onclick="stopStream()" disabled data-tip="Stop the current response. Keeps whatever streamed so far." title="Stop generating">Stop</button>
-   <button id="sendBtn" class="primary" onclick="send()" data-tip="Send your message (or press Enter)." title="Send message">Send</button>
+   <div class="composer-box">
+     <textarea id="input" class="input textarea" rows="1" placeholder="Send a message. Enter sends, Shift+Enter adds a line." aria-label="Message"></textarea>
+     <div class="composer-toolbar">
+       <div class="seg" id="modeSeg" role="radiogroup" aria-label="Mode">
+         <button type="button" data-value="auto" aria-pressed="true" class="active" data-tip="Auto: the server decides when a turn needs tools (the installation default).">Auto</button>
+         <button type="button" data-value="chat" aria-pressed="false" data-tip="Chat: one plain reply, no tools.">Chat</button>
+         <button type="button" data-value="agent" aria-pressed="false" data-tip="Agent: tools (search, files, code) and step-by-step reasoning.">Agent</button>
+       </div>
+       <button type="button" id="promptsBtn" class="btn-ghost btn-sm" onclick="togglePrompts()" data-tip="Insert a saved prompt, or save the message box as one.">Prompts</button>
+       <div id="ctxMeter" class="ctx-meter" data-tip="Context usage in this conversation.">
+         <div class="meter"><div id="ctxBar"></div></div>
+         <span id="ctxHint" class="hint mono">0 / 4096</span>
+       </div>
+       <span id="composerMeta" class="composer-meta muted mono"></span>
+       <div class="spacer"></div>
+       <button type="button" id="stopBtn" onclick="stopStream()" disabled data-tip="Stop the current response. Keeps whatever streamed so far.">Stop</button>
+       <button type="button" id="sendBtn" class="btn-primary" onclick="send()" data-tip="Send your message.">Send</button>
+     </div>
+   </div>
  </footer>
+
+ <div id="toastHost" class="toast-host" aria-live="polite"></div>
 
  <script>"""
 

@@ -182,9 +182,16 @@ _KV_SECRET = re.compile(
 # Well-known token shapes, redacted wherever they appear.
 _TOKEN_SHAPES = [
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]+"),
+    # Anthropic keys (sk-ant-api03-..., sk-ant-admin01-...): the dash after
+    # "ant" stopped the OpenAI shape below from matching them at all.
+    re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{16,}"),
     re.compile(r"\bsk-[A-Za-z0-9]{16,}"),            # OpenAI-style
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),   # Slack
     re.compile(r"\bghp_[A-Za-z0-9]{20,}"),           # GitHub PAT
+    # This app's own API tokens (api_tokens.py: llm_<8 char prefix>_<secret>).
+    # No leading \b: in "ANTHROPIC_API_KEY_llm_..." the underscore is a word
+    # character, so \b would let a pasted env line through unredacted.
+    re.compile(r"(?<![A-Za-z0-9])llm_[a-z0-9]{8}_[A-Za-z0-9]{20,}"),
     re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{4,}"),  # JWT
     re.compile(r"(?i)\baws_secret_access_key\b\S*"),
 ]
@@ -338,6 +345,161 @@ class TextFormatter(logging.Formatter):
 
 
 # --------------------------------------------------------------------------- #
+# In-memory event sink (admin dashboards)                                      #
+# --------------------------------------------------------------------------- #
+# The admin dashboards read structured events, but the console and app.log
+# handlers share ONE formatter chosen by LOG_FORMAT: with LOG_FORMAT=text every
+# field of every log_event is discarded on the way out, so a dashboard built on
+# app.log would silently go blank on a text-logging install. This handler keeps
+# its own always-structured copy in memory instead: a bounded ring of recent
+# records, a separate ring for warnings and errors (so a burst of INFO traffic
+# cannot push the last error out of view), and cumulative counters keyed by
+# event name and by level. Bounded on purpose: it is a live view, not storage;
+# history lives in SQLite and app.log.
+_SINK_STR_CAP = 600           # per string field: a dashboard row, not a dump
+_SINK_FIELDS_CAP = 24         # extra fields kept per record
+
+
+class EventSink(logging.Handler):
+    """Ring buffer + counters of structured log records, independent of LOG_FORMAT."""
+
+    def __init__(self, capacity: int = 1000, problem_capacity: int = 300) -> None:
+        super().__init__(level=logging.NOTSET)
+        import collections
+        import threading
+        self._lock_sink = threading.Lock()
+        self._recent: Any = collections.deque(maxlen=max(10, int(capacity)))
+        self._problems: Any = collections.deque(maxlen=max(10, int(problem_capacity)))
+        self._event_counts: dict[str, int] = {}
+        self._level_counts: dict[str, int] = {}
+        self._event_levels: dict[str, dict[str, int]] = {}
+        self.started_at = time.time()
+        self.addFilter(RedactionFilter())
+        self.addFilter(ContextFilter())
+
+    @staticmethod
+    def _clip(value: Any) -> Any:
+        if isinstance(value, str):
+            return value if len(value) <= _SINK_STR_CAP else value[:_SINK_STR_CAP] + "..."
+        if isinstance(value, (int, float, bool)) or value is None:
+            return value
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            text = str(value)
+        return text if len(text) <= _SINK_STR_CAP else text[:_SINK_STR_CAP] + "..."
+
+    def _payload(self, record: logging.LogRecord) -> dict:
+        try:
+            message = record.getMessage()
+        except Exception:
+            message = str(record.msg)
+        item: dict[str, Any] = {
+            "ts": datetime.fromtimestamp(record.created, timezone.utc).isoformat(),
+            "epoch": round(record.created, 3),
+            "level": record.levelname,
+            "logger": record.name,
+            "event": getattr(record, "event", None),
+            # Scrubbed again here: the RedactionFilter covers msg/args, but a
+            # pre-formatted message can arrive through a path that skipped it.
+            "msg": self._clip(redact_text(message)),
+        }
+        cid = getattr(record, "correlation_id", None)
+        if cid:
+            item["correlation_id"] = cid
+        fields: dict[str, Any] = {}
+        for source in (getattr(record, "context", None) or {}, record.__dict__):
+            for key, value in source.items():
+                if (key in _RESERVED or key.startswith("_") or key in item
+                        or key in fields or key in ("args", "msg", "exc_info",
+                                                    "exc_text", "stack_info")):
+                    continue
+                if len(fields) >= _SINK_FIELDS_CAP:
+                    break
+                fields[key] = self._clip(value)
+        user_id = getattr(record, "user_id", None) or fields.get("user_id")
+        if user_id:
+            fields["user_id"] = user_id
+        # log_event already redacted its own fields; context values (bound by
+        # middleware and dependencies) were not, so scrub the merged set once.
+        item["fields"] = redact_obj(fields)
+        if record.exc_info:
+            try:
+                item["exc"] = self._clip(redact_text(
+                    logging.Formatter().formatException(record.exc_info)))
+            except Exception:
+                item["exc"] = "(unformattable)"
+        return item
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            item = self._payload(record)
+            level = item["level"]
+            event = item.get("event")
+            with self._lock_sink:
+                self._recent.append(item)
+                if record.levelno >= logging.WARNING:
+                    self._problems.append(item)
+                self._level_counts[level] = self._level_counts.get(level, 0) + 1
+                if event:
+                    self._event_counts[event] = self._event_counts.get(event, 0) + 1
+                    per = self._event_levels.setdefault(event, {})
+                    per[level] = per.get(level, 0) + 1
+        except Exception:
+            # A dashboard feed must never break logging itself.
+            pass
+
+    def records(self, *, level: str | None = None, limit: int = 100,
+                event: str | None = None, since: float | None = None) -> list[dict]:
+        """Newest-first copies. `level` is a floor (WARNING = warnings and errors)."""
+        floor = level_from_name(level, logging.NOTSET) if level else logging.NOTSET
+        with self._lock_sink:
+            pool = list(self._problems if floor >= logging.WARNING else self._recent)
+        out: list[dict] = []
+        for item in reversed(pool):
+            if floor and level_from_name(item["level"], logging.NOTSET) < floor:
+                continue
+            if event and item.get("event") != event and not str(
+                    item.get("event") or "").startswith(event.rstrip("*")):
+                continue
+            if since is not None and item["epoch"] < since:
+                continue
+            out.append(dict(item))
+            if len(out) >= max(1, int(limit)):
+                break
+        return out
+
+    def counts(self) -> dict:
+        with self._lock_sink:
+            return {
+                "events": dict(self._event_counts),
+                "levels": dict(self._level_counts),
+                "event_levels": {k: dict(v) for k, v in self._event_levels.items()},
+                "since": datetime.fromtimestamp(self.started_at, timezone.utc).isoformat(),
+                "buffered": len(self._recent),
+                "buffered_problems": len(self._problems),
+            }
+
+    def clear(self) -> None:
+        with self._lock_sink:
+            self._recent.clear()
+            self._problems.clear()
+            self._event_counts.clear()
+            self._level_counts.clear()
+            self._event_levels.clear()
+            self.started_at = time.time()
+
+
+# One per process: configure_logging(force=True) re-attaches the same sink, so
+# a reconfigure (tests, settings change) keeps the counters it has gathered.
+EVENT_SINK = EventSink()
+
+
+def event_sink() -> EventSink:
+    return EVENT_SINK
+
+
+# --------------------------------------------------------------------------- #
 # Configuration                                                                #
 # --------------------------------------------------------------------------- #
 _CONFIGURED = {"done": False, "chat_content": "metadata", "level": logging.INFO}
@@ -423,6 +585,10 @@ def configure_logging(config: Any = None, *, force: bool = False) -> None:
         root.addHandler(file_handler)
     except Exception as exc:  # pragma: no cover - disk/perm issues are non-fatal
         root.warning("could not open app.log for rotation: %s", exc)
+
+    # The dashboards' structured feed, attached whatever LOG_FORMAT says (the
+    # handler loop above removed it along with the others on a reconfigure).
+    root.addHandler(EVENT_SINK)
 
     # Quiet chatty third-party loggers that would otherwise emit an INFO line
     # per outbound call (httpx logs every request; hpack/httpcore are verbose at
@@ -526,6 +692,11 @@ def _fingerprint(text: str) -> str:
 
 __all__ = [
     "TRACE",
+    "EventSink",
+    "EVENT_SINK",
+    "event_sink",
+    "_SINK_STR_CAP",
+    "_SINK_FIELDS_CAP",
     "JsonFormatter",
     "TextFormatter",
     "RedactionFilter",

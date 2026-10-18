@@ -13,8 +13,13 @@ without scrolling a single enormous file:
       ui_script_chat    state, helpers, markdown, streaming trace
       ui_script_views   view switching
       ui_script_tasks   the tasks view
-      ui_script_models  models, dataset, knowledge base, codebase
-      ui_script_panels  history, prompts, palette, theme, backup, boot
+      ui_settings       the Settings view, rendered from settings_schema
+      ui_script_kit     shared JS helpers: toasts, postJSON, seg, range, download
+      ui_script_models  dataset, knowledge base, codebase, chat export
+      ui_script_admin   Settings sub-tab loaders: model, users, agents, cluster
+      ui_script_settings  Settings navigation, search, load/apply, theme
+      ui_script_panels  history, prompts, palette, boot
+    settings_schema settings metadata: sections, fields, user preferences
     config          every setting and its clamps
     model_server    the mlx_lm.server subprocess supervisor
     training        LoRA retraining from feedback

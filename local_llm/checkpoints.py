@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .core import *  # noqa: F401,F403
+from .obslog import *  # noqa: F401,F403
 
 
 @dataclass
@@ -42,6 +43,10 @@ class Checkpoint:
     created_at: str
     conversation_id: str | None
     entries: list[dict]
+    # Who the turn ran for. Checkpoints written before this field existed (and
+    # those from the CLI or a task with no owner) have None and are visible to
+    # administrators only.
+    user_id: str | None = None
 
     @property
     def files(self) -> list[str]:
@@ -53,6 +58,7 @@ class Checkpoint:
             "root": self.root,
             "created_at": self.created_at,
             "conversation_id": self.conversation_id,
+            "user_id": self.user_id,
             "files": self.files,
             "created": [e["path"] for e in self.entries if not e.get("existed")],
             "modified": [e["path"] for e in self.entries if e.get("existed")],
@@ -97,7 +103,7 @@ class CheckpointStore:
         return f"{int(time.time() * 1000)}-{stem}"
 
     def capture(self, checkpoint_id: str, project_root: Path, target: Path,
-                conversation_id: str | None = None) -> None:
+                conversation_id: str | None = None, user_id: str | None = None) -> None:
         """Record `target`'s current state, once per checkpoint.
 
         Called BEFORE the write. Idempotent per file: the first capture in a
@@ -105,7 +111,13 @@ class CheckpointStore:
         started from. Never raises -- a failed capture must not stop the edit
         the user asked for, it just means that file is not covered, and the
         manifest says so.
+
+        The owner defaults to the acting user: the checkpoint store is one
+        directory for the whole installation, and listing or rolling back has to
+        know whose turn wrote it.
         """
+        if user_id is None:
+            user_id = get_acting_user()
         directory = self._dir(checkpoint_id)
         if directory is None:
             return
@@ -120,6 +132,7 @@ class CheckpointStore:
                 "root": str(project_root.resolve()),
                 "created_at": iso(utc_now()),
                 "conversation_id": conversation_id,
+                "user_id": user_id,
                 "entries": [],
             }
             if any(entry["path"] == rel for entry in manifest["entries"]):
@@ -172,11 +185,14 @@ class CheckpointStore:
             created_at=str(manifest.get("created_at") or ""),
             conversation_id=manifest.get("conversation_id"),
             entries=list(manifest.get("entries") or []),
+            user_id=manifest.get("user_id"),
         )
 
-    def list(self, limit: int = 20) -> list[Checkpoint]:
+    def list(self, limit: int = 20, user_id: str | None = None) -> list[Checkpoint]:
         """Newest first. Ids start with a millisecond timestamp, so name order
-        is time order without reading a single manifest to sort."""
+        is time order without reading a single manifest to sort.
+
+        user_id given: only that user's checkpoints (None = all, for admins)."""
         if not self.root.exists():
             return []
         out: list[Checkpoint] = []
@@ -184,7 +200,7 @@ class CheckpointStore:
             if not entry.is_dir():
                 continue
             found = self.get(entry.name)
-            if found is not None:
+            if found is not None and (user_id is None or found.user_id == user_id):
                 out.append(found)
             if len(out) >= max(1, limit):
                 break

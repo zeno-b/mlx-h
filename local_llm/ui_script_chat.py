@@ -1,8 +1,15 @@
-"""Front-end: shared state, helpers, markdown rendering and the streaming chat trace.
+"""Front-end: shared state, helpers, markdown rendering, the composer and the streaming chat trace.
 
 Part of the embedded UI, split out of the single HTML_PAGE string for
 readability. Assembled once at import time in ui.py, so there is no
 runtime cost and no extra file I/O.
+
+This part runs first, so it owns the globals every later part reads (chat,
+input, conversationId, busy, contextSize, fetchJSON, downloadFile, addSystem,
+renderMarkdown, stopStream). Settings load/save moved to ui_script_settings.py;
+what stays here is the chat surface itself: the composer (mode switch, Enter
+handling, context meter), the per-user display preferences it honours, the
+overflow menu, the glass-box trace and the health pill.
 """
 
 from __future__ import annotations
@@ -13,15 +20,40 @@ UI_JS_CHAT = r"""
    var sendBtn = document.getElementById("sendBtn");
    var stopBtn = document.getElementById("stopBtn");
    var statusEl = document.getElementById("status");
-   var agentToggle = document.getElementById("agentToggle");
-   var settingsEl = document.getElementById("settings");
+   var modeSeg = document.getElementById("modeSeg");
 
-   var conversationId = localStorage.getItem("llm_conversation") || randomId();
-   localStorage.setItem("llm_conversation", conversationId);
+   // localStorage can throw (Safari private mode, a sandboxed iframe, storage
+   // disabled by policy). An uncaught throw on the very first line that
+   // touches it used to stop this whole script, which is every button on the
+   // page, so every read and write goes through these two.
+   function safeStorageGet(key) {
+     try { return window.localStorage.getItem(key); } catch (err) { return null; }
+   }
+   function safeStorageSet(key, value) {
+     try { window.localStorage.setItem(key, value); } catch (err) { /* private mode */ }
+   }
+
+   var conversationId = safeStorageGet("llm_conversation") || randomId();
+   safeStorageSet("llm_conversation", conversationId);
    var contextSize = 4096;
    var usedTokens = 0;
    var busy = false;
    var controller = null;
+
+   // Per-user display preferences (GET /api/me/preferences). The defaults are
+   // the behaviour this page had before preferences existed, so an older
+   // server without the route renders exactly as it used to.
+   var chatPrefs = {
+     enter_to_send: true,
+     code_wrap: false,
+     reasoning_display: "collapsed",
+     show_metrics: true,
+     default_mode: "auto"
+   };
+   var _chatPrefsMode = null;
+   // The composer's mode switch: "auto" lets the server decide (and honours
+   // AGENT_ENABLED), "chat" forces a plain reply, "agent" forces the tool loop.
+   var chatMode = "auto";
 
    function randomId() {
      return Math.random().toString(36).slice(2, 12);
@@ -31,20 +63,99 @@ UI_JS_CHAT = r"""
      return Math.max(1, Math.ceil((text || "").length / 4));
    }
 
+   function roleIsAdmin() {
+     return document.body.dataset.role === "admin";
+   }
+
    input.addEventListener("keydown", function(e) {
-     if (e.key === "Enter" && !e.shiftKey) {
+     if (e.key !== "Enter") return;
+     // An IME (Japanese, Chinese, Korean input) uses Enter to CONFIRM the
+     // candidate being composed. Treating that Enter as send posted half-typed
+     // messages; keyCode 229 covers browsers that do not set isComposing.
+     if (e.isComposing || e.keyCode === 229) return;
+     var modified = e.metaKey || e.ctrlKey;
+     var sends = chatPrefs.enter_to_send ? (!e.shiftKey && !e.altKey) : modified;
+     if (sends) {
        e.preventDefault();
        send();
      }
    });
 
    input.addEventListener("input", function() {
+     // Auto-grow is geometry measured from the content, not a look, so it is
+     // the one style this element gets from script.
      input.style.height = "auto";
      input.style.height = Math.min(200, input.scrollHeight) + "px";
    });
 
    function stopStream() {
      if (controller) controller.abort();
+   }
+
+   // ------------------------------------------------------- composer ---
+
+   function setChatMode(mode) {
+     if (["auto", "chat", "agent"].indexOf(mode) < 0) mode = "auto";
+     chatMode = mode;
+     if (!modeSeg) return;
+     Array.prototype.forEach.call(modeSeg.querySelectorAll("button[data-value]"), function(b) {
+       var on = b.getAttribute("data-value") === mode;
+       b.setAttribute("aria-pressed", on ? "true" : "false");
+       b.classList.toggle("active", on);
+     });
+   }
+
+   // What send() puts in the request's `agent` field. null is not "off": it
+   // tells the server to use its own default (config.agent_enabled plus the
+   // automatic promotions), which is what every non-admin silently lost when
+   // this was the admin-only checkbox and they always sent false.
+   function modeAgentFlag() {
+     if (chatMode === "agent") return true;
+     if (chatMode === "chat") return false;
+     return null;
+   }
+
+   if (modeSeg) modeSeg.addEventListener("click", function(e) {
+     var b = e.target.closest ? e.target.closest("button[data-value]") : null;
+     if (!b) return;
+     setChatMode(b.getAttribute("data-value"));
+     input.focus();
+   });
+
+   function applyChatPrefs(prefs) {
+     if (prefs) {
+       ["enter_to_send", "code_wrap", "reasoning_display", "show_metrics", "default_mode"]
+         .forEach(function(k) {
+           if (prefs[k] !== undefined && prefs[k] !== null) chatPrefs[k] = prefs[k];
+         });
+     }
+     document.body.classList.toggle("code-wrap", !!chatPrefs.code_wrap);
+     document.body.classList.toggle("hide-metrics", !chatPrefs.show_metrics);
+     document.body.setAttribute("data-reasoning", chatPrefs.reasoning_display || "collapsed");
+     input.placeholder = chatPrefs.enter_to_send
+       ? "Send a message. Enter sends, Shift+Enter adds a line."
+       : "Send a message. Ctrl/Cmd+Enter sends, Enter adds a line.";
+     var tip = chatPrefs.enter_to_send ? "Send your message (or press Enter)."
+                                       : "Send your message (or press Ctrl/Cmd+Enter).";
+     sendBtn.setAttribute("data-tip", tip);
+     // The default mode seeds the switch once, and again only when the
+     // preference itself changes. Re-applying it on every reload of the
+     // preferences would undo the switch the user just flipped for this chat.
+     if (chatPrefs.default_mode !== _chatPrefsMode) {
+       _chatPrefsMode = chatPrefs.default_mode;
+       setChatMode(chatPrefs.default_mode);
+     }
+   }
+
+   async function loadChatPrefs() {
+     try {
+       var out = await fetchJSON("/api/me/preferences");
+       applyChatPrefs((out.data || {}).preferences || {});
+     } catch (err) {
+       // A server without per-user preferences, or a transient failure: keep
+       // the current values. The chat must never depend on this request.
+       applyChatPrefs(null);
+     }
    }
 
    // Scrolling used to be one forced layout per token. `chat.scrollTop =
@@ -78,11 +189,71 @@ UI_JS_CHAT = r"""
      });
    }
 
+   // --------------------------------------------------- small helpers ---
+
+   // One factory for every button script builds, so a JS-made button carries
+   // the same kit classes as one written in the markup.
+   function makeBtn(label, title, onclick, extra) {
+     var b = document.createElement("button");
+     b.type = "button";
+     b.className = "btn btn-sm btn-ghost" + (extra ? " " + extra : "");
+     b.textContent = label;
+     if (title) b.title = title;
+     if (onclick) b.onclick = onclick;
+     return b;
+   }
+
+   // navigator.clipboard only exists on secure origins (https or localhost).
+   // Opened over plain http on a LAN or Tailscale address it is undefined, and
+   // every Copy button threw a TypeError before its error handler could run,
+   // so copying silently did nothing. Fall back to a selected text area.
+   function copyText(text) {
+     if (navigator.clipboard && window.isSecureContext) {
+       return navigator.clipboard.writeText(text);
+     }
+     return new Promise(function(resolve, reject) {
+       var prev = document.activeElement;
+       var ta = document.createElement("textarea");
+       ta.value = text;
+       ta.setAttribute("readonly", "");
+       ta.setAttribute("aria-hidden", "true");
+       ta.className = "clip-buffer";
+       document.body.appendChild(ta);
+       try { ta.focus({ preventScroll: true }); } catch (e) { ta.focus(); }
+       ta.select();
+       var ok = false;
+       try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+       ta.remove();
+       if (prev && prev.focus) { try { prev.focus({ preventScroll: true }); } catch (e) { /* gone */ } }
+       if (ok) resolve(); else reject(new Error("copy refused"));
+     });
+   }
+
+   function copyWithFeedback(button, text) {
+     copyText(text).then(function() {
+       button.textContent = "Copied";
+       setTimeout(function() { button.textContent = "Copy"; }, 1200);
+     }, function() {
+       uiToast("Could not copy. Select the text and copy it by hand.", "warn");
+     });
+   }
+
+   // Only these link targets are rendered as live links. Model output can carry
+   // prompt-injected web content, and a markdown link to `javascript:...`
+   // (or `data:`) used to become a real anchor one click away from running.
+   // Same-origin document downloads are the one relative target the app emits.
+   function safeHref(raw) {
+     var href = String(raw || "").trim();
+     if (/^(https?:\/\/|mailto:)/i.test(href)) return href;
+     if (/^\/api\/files\/download\?/.test(href)) return href;
+     return "";
+   }
+
    // ------------------------------------------------------- markdown ---
    // Builds DOM nodes rather than assigning innerHTML, so model output can never
    // inject markup or scripts into the page. Handles fenced code (with a copy
    // button and language label), headings, lists, blockquotes, inline code,
-   // bold/italic and links.
+   // bold/italic and links (scheme-checked by safeHref).
 
    function renderInline(text, host) {
      // Order matters: code spans first so their contents are never re-parsed.
@@ -104,12 +275,18 @@ UI_JS_CHAT = r"""
          host.appendChild(b);
        } else if (tok[0] === "[") {
          var close = tok.indexOf("](");
-         var a = document.createElement("a");
-         a.textContent = tok.slice(1, close);
-         a.href = tok.slice(close + 2, -1);
-         a.target = "_blank";
-         a.rel = "noopener noreferrer";
-         host.appendChild(a);
+         var href = safeHref(tok.slice(close + 2, -1));
+         if (href) {
+           var a = document.createElement("a");
+           a.textContent = tok.slice(1, close);
+           a.href = href;
+           a.target = "_blank";
+           a.rel = "noopener noreferrer";
+           host.appendChild(a);
+         } else {
+           // Not a scheme we open: show what the model wrote, inert.
+           host.appendChild(document.createTextNode(tok));
+         }
        } else {
          var i = document.createElement("em");
          i.textContent = tok.slice(1, -1);
@@ -200,15 +377,8 @@ UI_JS_CHAT = r"""
      bar.className = "codebar";
      var label = document.createElement("span");
      label.textContent = lang || "code";
-     var copy = document.createElement("button");
-     copy.textContent = "Copy";
-     copy.title = "Copy this code";
-     copy.onclick = function() {
-       navigator.clipboard.writeText(code).then(function() {
-         copy.textContent = "Copied";
-         setTimeout(function() { copy.textContent = "Copy"; }, 1200);
-       }, function() { alert("Could not copy."); });
-     };
+     var copy = makeBtn("Copy", "Copy this code", null);
+     copy.onclick = function() { copyWithFeedback(copy, code); };
      bar.appendChild(label);
      bar.appendChild(copy);
      var pre = document.createElement("pre");
@@ -327,11 +497,29 @@ UI_JS_CHAT = r"""
      return host;
    }
 
+   // ------------------------------------------------------- messages ---
+
+   // An empty conversation shows one quiet line instead of a blank pane.
+   function showChatEmpty() {
+     if (chat.querySelector(".chat-empty")) return;
+     var empty = document.createElement("div");
+     empty.className = "empty chat-empty";
+     empty.textContent = "Ask anything. Paste code or documents freely; long input is processed in chunks.";
+     chat.appendChild(empty);
+   }
+
+   function clearChatEmpty() {
+     var empty = chat.querySelector(".chat-empty");
+     if (empty) empty.remove();
+   }
+
    function addMessage(role, text) {
+     clearChatEmpty();
      var div = document.createElement("div");
      div.className = "msg " + role;
      if (role === "assistant") {
        var body = document.createElement("div");
+       body.className = "msg-body";
        renderMarkdown(text, body);
        div.appendChild(body);
      } else {
@@ -347,33 +535,41 @@ UI_JS_CHAT = r"""
    function addMessageActions(div, role, text) {
      var bar = document.createElement("div");
      bar.className = "msg-actions";
-     var copy = document.createElement("button");
-     copy.textContent = "Copy";
-     copy.title = "Copy this message to the clipboard";
+     var copy = makeBtn("Copy", "Copy this message to the clipboard", null);
      copy.onclick = function() {
-       var payload = div.dataset.raw || text || div.textContent || "";
-       navigator.clipboard.writeText(payload).then(function() {
-         copy.textContent = "Copied";
-         setTimeout(function() { copy.textContent = "Copy"; }, 1200);
-       }, function() { alert("Could not copy."); });
+       copyWithFeedback(copy, div.dataset.raw || text || div.textContent || "");
      };
      bar.appendChild(copy);
      if (role === "user") {
-       var edit = document.createElement("button");
-       edit.textContent = "Edit & resend";
-       edit.title = "Put this question back in the box to change and ask again";
-       edit.onclick = function() {
-         input.value = div.dataset.raw || text || div.textContent || "";
-         input.focus();
-         showView("chat");
-       };
-       bar.appendChild(edit);
+       bar.appendChild(makeBtn("Edit & resend", "Put this question back in the box to change and ask again",
+         function() {
+           input.value = div.dataset.raw || text || div.textContent || "";
+           input.focus();
+           showView("chat");
+         }));
      }
      div.dataset.raw = text || "";
      div.appendChild(bar);
+     return bar;
+   }
+
+   // Regenerate lives on the LAST answer only (it used to be a header button
+   // that acted on whatever happened to be last). The server drops the final
+   // exchange, so offering it anywhere else would regenerate a different
+   // answer than the one the button sits under.
+   function clearRegenerate() {
+     Array.prototype.forEach.call(chat.querySelectorAll(".regen-btn"), function(b) { b.remove(); });
+   }
+
+   function setRegenerateTarget(bar) {
+     clearRegenerate();
+     if (!bar) return;
+     bar.appendChild(makeBtn("Regenerate", "Discard this answer and generate a new one for the same question",
+       function() { regenerateLast(); }, "regen-btn"));
    }
 
    function addSystem(text) {
+     clearChatEmpty();
      var div = document.createElement("div");
      div.className = "system-msg";
      div.textContent = text;
@@ -384,6 +580,7 @@ UI_JS_CHAT = r"""
 
    // --- Glass box: build one trace timeline per assistant turn. ---
    function startTrace() {
+     clearChatEmpty();
      var turn = document.createElement("div");
      turn.className = "turn";
      var trace = document.createElement("div");
@@ -394,7 +591,7 @@ UI_JS_CHAT = r"""
      var activity = document.createElement("div");
      activity.className = "gactivity";
      var spin = document.createElement("span"); spin.className = "gspin";
-     var label = document.createElement("span"); label.className = "glabel"; label.textContent = "starting\u2026";
+     var label = document.createElement("span"); label.className = "glabel"; label.textContent = "starting…";
      var elapsed = document.createElement("span"); elapsed.className = "gelapsed";
      activity.appendChild(spin); activity.appendChild(label); activity.appendChild(elapsed);
      turn.appendChild(activity);
@@ -434,7 +631,7 @@ UI_JS_CHAT = r"""
      // snapped it back on the next event -- 50px of the page moving under
      // text the user was reading, twice per step.
      var next = String(text || "").split("\n")[0].slice(0, 72);
-     next = t.stepLabel ? (t.stepLabel + " \u00b7 " + next) : next;
+     next = t.stepLabel ? (t.stepLabel + " · " + next) : next;
      // The token handler calls this on every token. Assigning the same string
      // 30 times a second is 30 needless style recalculations.
      if (t.label.textContent !== next) t.label.textContent = next;
@@ -470,7 +667,7 @@ UI_JS_CHAT = r"""
      var head = document.createElement("div");
      head.className = "ghead";
      var loc = args && (args.location || args.query);
-     head.textContent = "router \u2192 " + name + (loc ? " (" + String(loc).slice(0, 60) + ")" : "");
+     head.textContent = "router → " + name + (loc ? " (" + String(loc).slice(0, 60) + ")" : "");
      node.appendChild(head);
      t.trace.appendChild(node);
      scrollDown();
@@ -489,7 +686,7 @@ UI_JS_CHAT = r"""
      pill.textContent = "running";
      var caret = document.createElement("span");
      caret.className = "gcaret";
-     caret.textContent = "\u25b8";
+     caret.textContent = "▸";
      head.appendChild(label);
      head.appendChild(pill);
      head.appendChild(caret);
@@ -519,7 +716,7 @@ UI_JS_CHAT = r"""
      tag.textContent = "thinking";
      var caret = document.createElement("span");
      caret.className = "gcaret";
-     caret.textContent = "\u25b8";
+     caret.textContent = "▸";
      head.appendChild(tag);
      head.appendChild(caret);
      var body = document.createElement("pre");
@@ -543,7 +740,7 @@ UI_JS_CHAT = r"""
      tag.className = "gtool";
      tag.textContent = "reasoning " + step + "/" + total;
      var lab = document.createElement("span");
-     lab.style.color = "#9aa0a6";
+     lab.className = "glabel muted";
      lab.textContent = label || "";
      var caret = document.createElement("span");
      caret.className = "gcaret";
@@ -634,26 +831,47 @@ UI_JS_CHAT = r"""
    function addFeedbackBar(userText, botText) {
      var bar = document.createElement("div");
      bar.className = "feedback";
-
-     var up = document.createElement("button");
-     up.textContent = "yes";
-     up.title = "Good answer";
-     var down = document.createElement("button");
-     down.textContent = "no";
-     down.title = "Bad answer";
-     var correct = document.createElement("button");
-     correct.textContent = "edit";
-     correct.title = "Provide a corrected answer";
-
-     up.onclick = function() { vote(userText, botText, 1); up.disabled = true; down.disabled = true; };
-     down.onclick = function() { vote(userText, botText, -1); up.disabled = true; down.disabled = true; };
+     var up = makeBtn("Good", "Good answer: keep it as an example to learn from", null);
+     var down = makeBtn("Bad", "Bad answer: learn to avoid it", null);
+     var correct = makeBtn("Correct it", "Provide a corrected answer", null);
+     function rated(btn) {
+       up.disabled = true; down.disabled = true;
+       btn.classList.add("active");
+       btn.setAttribute("aria-pressed", "true");
+     }
+     up.onclick = function() { vote(userText, botText, 1); rated(up); };
+     down.onclick = function() { vote(userText, botText, -1); rated(down); };
      correct.onclick = function() { correctAnswer(userText, botText); };
-
      bar.appendChild(up);
      bar.appendChild(down);
      bar.appendChild(correct);
      chat.appendChild(bar);
      scrollDown();
+     return bar;
+   }
+
+   // ---------------------------------------------------- http helpers ---
+
+   // A readable message out of an error body. FastAPI validation errors are a
+   // `detail` ARRAY of {loc, msg} objects, which used to reach the user as
+   // "[object Object]".
+   function httpErrorText(data, status) {
+     if (data && data.error) {
+       if (typeof data.error === "string") return data.error;
+       return data.error.message || JSON.stringify(data.error);
+     }
+     var detail = data && data.detail;
+     if (Array.isArray(detail)) {
+       return detail.map(function(item) {
+         if (!item || typeof item !== "object") return String(item);
+         var loc = (item.loc || []).filter(function(p) {
+           return p !== "body" && p !== "query" && p !== "path";
+         }).join(".");
+         return (loc ? loc + ": " : "") + (item.msg || JSON.stringify(item));
+       }).join("; ");
+     }
+     if (detail) return typeof detail === "string" ? detail : JSON.stringify(detail);
+     return "HTTP " + status;
    }
 
    async function fetchJSON(url, options) {
@@ -678,39 +896,72 @@ UI_JS_CHAT = r"""
      // (a 403/400/500/503) instead of silently reading fields off an error body
      // and rendering an empty, healthy-looking state.
      if (!res.ok) {
-       throw new Error((data && (data.error || data.detail)) || ("HTTP " + res.status));
+       var e = new Error(httpErrorText(data, res.status));
+       e.status = res.status;
+       throw e;
      }
      return { res: res, data: data };
    }
 
    // Download a URL as a file via fetch+blob (not window.location), so a
    // 401/403/404/500 shows a message instead of replacing the whole app tab.
+   // It used to read the body as TEXT and re-wrap it as text/plain, which is
+   // fine for Markdown and silently corrupts a .docx, .pdf or .xlsx. The kit's
+   // uiDownload is the one implementation; the fallback below is the same
+   // thing for a page assembled without the kit.
    async function downloadFile(url, filename) {
+     if (typeof uiDownload === "function") return uiDownload(url, filename);
      try {
        var resp = await fetch(url);
        if (resp.status === 401 && typeof onUnauthorized === "function") { onUnauthorized(); return; }
        if (!resp.ok) {
-         var e = {}; try { e = await resp.json(); } catch (x) {}
-         addSystem("Download failed: " + (e.error || e.detail || ("HTTP " + resp.status)));
+         var e = {}; try { e = await resp.json(); } catch (x) { e = {}; }
+         uiToast("Download failed: " + httpErrorText(e, resp.status), "error");
          return;
        }
-       var text = await resp.text();
+       var blob = await resp.blob();
        var a = document.createElement("a");
-       a.href = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
+       a.href = URL.createObjectURL(blob);
        a.download = filename;
        document.body.appendChild(a); a.click(); a.remove();
-       URL.revokeObjectURL(a.href);
+       // Revoking in the same tick can cancel the download in some browsers.
+       setTimeout(function() { URL.revokeObjectURL(a.href); }, 1500);
      } catch (err) {
-       addSystem("Download failed: " + err.message);
+       uiToast("Download failed: " + err.message, "error");
      }
    }
 
+   function compactTokens(n) {
+     n = Number(n) || 0;
+     if (n >= 10000) return Math.round(n / 1000) + "k";
+     if (n >= 1000) return (n / 1000).toFixed(1) + "k";
+     return String(n);
+   }
+
    function updateContextMeter(delta) {
-     usedTokens += delta;
-     var pct = Math.min(100, Math.round((usedTokens / contextSize) * 100));
-     document.getElementById("ctxBar").style.width = pct + "%";
-     document.getElementById("ctxHint").textContent =
-       "About " + usedTokens + " of " + contextSize + " tokens used. Oldest turns drop out automatically.";
+     usedTokens = Math.max(0, usedTokens + (delta || 0));
+     var size = contextSize > 0 ? contextSize : 1;
+     var pct = Math.min(100, Math.round((usedTokens / size) * 100));
+     var bar = document.getElementById("ctxBar");
+     if (bar) {
+       // The fill is data, not a look: the width is the one value a class
+       // cannot carry. --fill is the same number for a stylesheet that draws
+       // the track with a gradient instead.
+       bar.style.width = pct + "%";
+       bar.style.setProperty("--fill", pct + "%");
+       if (bar.parentNode) {
+         bar.parentNode.classList.toggle("warn", pct >= 75 && pct < 95);
+         bar.parentNode.classList.toggle("error", pct >= 95);
+       }
+     }
+     var hint = document.getElementById("ctxHint");
+     if (hint) hint.textContent = compactTokens(usedTokens) + " / " + compactTokens(contextSize);
+     var meter = document.getElementById("ctxMeter");
+     if (meter) {
+       meter.setAttribute("data-tip", "About " + usedTokens + " of " + contextSize
+         + " tokens of context used in this conversation (" + pct + "%). "
+         + "The oldest turns drop out automatically.");
+     }
    }
 
    async function send() {
@@ -724,6 +975,7 @@ UI_JS_CHAT = r"""
      sendBtn.disabled = true;
      stopBtn.disabled = false;
      controller = new AbortController();
+     clearRegenerate();
      addMessage("user", message);
      updateContextMeter(estimateTokens(message));
 
@@ -739,10 +991,13 @@ UI_JS_CHAT = r"""
          method: "POST",
          headers: { "Content-Type": "application/json" },
          signal: controller.signal,
+         // max_tokens and temperature are deliberately absent: the server
+         // fills them from this user's preferences, so the web UI, the CLI
+         // and API clients all get the same per-user defaults.
          body: JSON.stringify({
            message: message,
            conversation_id: conversationId,
-           agent: agentToggle.checked
+           agent: modeAgentFlag()
          })
        });
 
@@ -755,7 +1010,7 @@ UI_JS_CHAT = r"""
          }
          // Show the clean message, not the raw {"error": ...} JSON envelope.
          var msg = text;
-         try { var j = JSON.parse(text); msg = j.error || j.detail || text; } catch (e) {}
+         try { msg = httpErrorText(JSON.parse(text), res.status); } catch (e) { msg = text || ("HTTP " + res.status); }
          var a0 = traceAnswer(trace);
          a0.text.textContent = "Error: " + String(msg).slice(0, 400);
          a0.node.classList.remove("pending");
@@ -793,17 +1048,17 @@ UI_JS_CHAT = r"""
        function handleEvent(event) {
          if (event.type === "start") {
            conversationId = event.conversation_id || conversationId;
-           localStorage.setItem("llm_conversation", conversationId);
+           safeStorageSet("llm_conversation", conversationId);
          } else if (event.type === "detail") {
            traceDetail(trace, event.message || "");
            bumpActivity(trace);
          } else if (event.type === "phase") {
-           setActivity(trace, event.label || "working\u2026");
+           setActivity(trace, event.label || "working…");
            bumpActivity(trace);
          } else if (event.type === "reason_step") {
            trace.reason = traceReasonStep(trace, event.step, event.total, event.label);
            bumpActivity(trace);
-           setActivity(trace, "reasoning " + event.step + "/" + event.total + "\u2026");
+           setActivity(trace, "reasoning " + event.step + "/" + event.total + "…");
          } else if (event.type === "reason_token") {
            if (trace.reason) {
              trace.reason.body.textContent += event.token;
@@ -844,7 +1099,7 @@ UI_JS_CHAT = r"""
            trace.stepLabel = event.step > 1
              ? "step " + event.step + (event.max_steps ? "/" + event.max_steps : "")
              : "";
-           setActivity(trace, "thinking\u2026");
+           setActivity(trace, "thinking…");
            // A new step supersedes whatever streamed during the last one: a
            // draft about to be revised, or a tool call the model printed
            // before deciding. Remove the bubble rather than emptying it --
@@ -856,34 +1111,39 @@ UI_JS_CHAT = r"""
              dropAnswer(trace);
            }
          } else if (event.type === "think_token") {
-           traceThinking(trace).body.textContent += event.token;
-           bumpActivity(trace);
-           setActivity(trace, "thinking\u2026");
+           // reasoning_display "hidden": no reasoning pane at all, only the
+           // activity line says the model is thinking.
+           if (chatPrefs.reasoning_display !== "hidden") {
+             traceThinking(trace).body.textContent += event.token;
+             bumpActivity(trace);
+           }
+           setActivity(trace, "thinking…");
            scrollDown();
          } else if (event.type === "token") {
            // First answer token: the thinking phase is over, collapse it so the
-           // answer is the focus but the reasoning stays one click away.
+           // answer is the focus but the reasoning stays one click away
+           // (unless the user asked for reasoning to stay expanded).
            if (trace.thinking && !trace.thinking.done) {
              trace.thinking.done = true;
-             trace.thinking.node.classList.remove("open");
+             if (chatPrefs.reasoning_display !== "expanded") trace.thinking.node.classList.remove("open");
            }
            var ansNode = traceAnswer(trace);
            ansNode.raw = (ansNode.raw || "") + event.token;
            // Only write the growing raw text while markdown has not rendered yet
            // (or a code fence is open). Once rendered, leave the formatted DOM in
-           // place and let the debounced renderMarkdown update it — writing raw
+           // place and let the debounced renderMarkdown update it: writing raw
            // text every token here is what made the answer flicker.
            if (!ansNode.rendered) ansNode.text.textContent = ansNode.raw;
            scheduleMarkdown(ansNode);
            bumpActivity(trace);
-           setActivity(trace, "generating\u2026");
+           setActivity(trace, "generating…");
            scrollDown();
          } else if (event.type === "tool_call") {
            if (firstTool) { traceRouter(trace, event.name, event.args); firstTool = false; }
            trace.tool = traceTool(trace, event.name, event.args);
            trace.tool.node.classList.add("running");
            bumpActivity(trace);
-           setActivity(trace, "running " + event.name + "\u2026");
+           setActivity(trace, "running " + event.name + "…");
          } else if (event.type === "tool_result") {
            if (trace.tool) {
              trace.tool.node.classList.remove("running");
@@ -899,11 +1159,11 @@ UI_JS_CHAT = r"""
            }
            dropAnswer(trace);
            trace.thinking = null;
-           setActivity(trace, "thinking\u2026");
+           setActivity(trace, "thinking…");
          } else if (event.type === "notice") {
            traceNotice(trace, event.message || "", !!event.info);
            bumpActivity(trace);
-           setActivity(trace, event.message || "working\u2026");
+           setActivity(trace, event.message || "working…");
          } else if (event.type === "final") {
            var ans = traceAnswer(trace);
            if (ans.mdTimer) { clearTimeout(ans.mdTimer); ans.mdTimer = null; }
@@ -931,29 +1191,33 @@ UI_JS_CHAT = r"""
            ans.node.classList.remove("pending");
            answered = true;
            updateContextMeter(estimateTokens(event.answer || ""));
-           var meta = document.createElement("div");
-           meta.className = "gmeta";
            var bits = [];
            if (event.tools_used && event.tools_used.length) bits.push(event.tools_used.join(", "));
-           bits.push((event.steps || 1) + " step" + ((event.steps || 1) === 1 ? "" : "s"));
-           // Cost of the turn, in the shape a local runner prints it:
-           // "2048 tok - 100.4s - 20 tok/s". tok is what the model generated
-           // across every step, and the rate is against wall-clock, so on an
-           // agent turn it includes the time tools took -- which is the number
-           // you actually waited, not the decode speed of one step (that is in
-           // the usage rows under Performance).
-           var secs = (event.elapsed_ms || 0) / 1000;
-           var tok = event.completion_tokens || 0;
-           if (tok) bits.push(tok + " tok");
-           bits.push(secs.toFixed(1) + "s");
-           if (tok && secs > 0) {
-             var tps = tok / secs;
-             bits.push((tps >= 10 ? Math.round(tps) : tps.toFixed(1)) + " tok/s");
+           if (chatPrefs.show_metrics) {
+             bits.push((event.steps || 1) + " step" + ((event.steps || 1) === 1 ? "" : "s"));
+             // Cost of the turn, in the shape a local runner prints it:
+             // "2048 tok - 100.4s - 20 tok/s". tok is what the model generated
+             // across every step, and the rate is against wall-clock, so on an
+             // agent turn it includes the time tools took -- which is the
+             // number you actually waited, not the decode speed of one step
+             // (that is in the usage rows under Performance).
+             var secs = (event.elapsed_ms || 0) / 1000;
+             var tok = event.completion_tokens || 0;
+             if (tok) bits.push(tok + " tok");
+             bits.push(secs.toFixed(1) + "s");
+             if (tok && secs > 0) {
+               var tps = tok / secs;
+               bits.push((tps >= 10 ? Math.round(tps) : tps.toFixed(1)) + " tok/s");
+             }
            }
            if (event.truncated) bits.push("continued from summary");
-           meta.textContent = bits.join(" \u00b7 ");
            stopActivity(trace);
-           trace.turn.appendChild(meta);
+           if (bits.length) {
+             var meta = document.createElement("div");
+             meta.className = "gmeta";
+             meta.textContent = bits.join(" · ");
+             trace.turn.appendChild(meta);
+           }
            if (event.documents && event.documents.length) {
              // A generated document is the deliverable, not a diff to review, so
              // it gets its own row of download links above the changed-files
@@ -962,12 +1226,16 @@ UI_JS_CHAT = r"""
              var docs = document.createElement("div");
              docs.className = "docrow";
              event.documents.forEach(function(rel) {
+               var name = rel.split("/").pop();
                var a = document.createElement("a");
                a.className = "docdl";
                a.href = "/api/files/download?path=" + encodeURIComponent(rel);
-               a.setAttribute("download", rel.split("/").pop());
-               a.textContent = "\u2b07\ufe0e  " + rel.split("/").pop();
+               a.setAttribute("download", name);
+               a.textContent = "⬇︎  " + name;
                a.title = "Download " + rel;
+               // Fetched, not navigated: an expired session or a moved file
+               // shows a toast instead of replacing the app with an error body.
+               a.onclick = function(e) { e.preventDefault(); downloadFile(a.href, name); };
                docs.appendChild(a);
              });
              trace.turn.appendChild(docs);
@@ -989,20 +1257,24 @@ UI_JS_CHAT = r"""
                + (changed.length === 1 ? "" : "s") + " (review before push)";
              var caret = document.createElement("span");
              caret.className = "gcaret";
-             caret.textContent = "\u25b8";
+             caret.textContent = "▸";
              head.appendChild(tag); head.appendChild(caret);
              var body = document.createElement("pre");
              body.className = "gbody gdiff";
              body.textContent = event.diff && event.diff.trim()
                ? event.diff
-               : (changed.join("\n") + "\n\n(new files — not yet tracked by git)");
+               : (changed.join("\n") + "\n\n(new files, not yet tracked by git)");
              head.onclick = function() { wrap.classList.toggle("open"); };
              wrap.appendChild(head); wrap.appendChild(body);
              trace.turn.appendChild(wrap);
            }
-           addFeedbackBar(message, event.answer || "");
-           loadRunCurve(conversationId);
-           loadPerf();
+           setRegenerateTarget(addFeedbackBar(message, event.answer || ""));
+           // Both routes are ADMIN. Every non-admin answer used to fire two
+           // requests that could only ever come back 403.
+           if (roleIsAdmin()) {
+             loadRunCurve(conversationId);
+             loadPerf();
+           }
          } else if (event.type === "cancelled") {
            // settleAnswer, not a bare notice. This branch and the one below
            // it were both `event.type === "cancelled"`, so the second was
@@ -1068,8 +1340,53 @@ UI_JS_CHAT = r"""
      }
    }
 
+   // ------------------------------------------------- chat overflow menu ---
+
+   function toggleChatMenu(force) {
+     var menu = document.getElementById("chatMenu");
+     var btn = document.getElementById("chatMenuBtn");
+     if (!menu) return;
+     var open = (typeof force === "boolean") ? force : menu.classList.contains("hidden");
+     menu.classList.toggle("hidden", !open);
+     if (btn) btn.setAttribute("aria-expanded", open ? "true" : "false");
+     if (open) {
+       var first = menu.querySelector("button");
+       if (first) first.focus();
+     }
+   }
+
+   function closeChatMenu() { toggleChatMenu(false); }
+
+   function chatMenuAction(action) {
+     closeChatMenu();
+     if (action === "export") exportChat();
+     else if (action === "regenerate") regenerateLast();
+     else if (action === "search") openHistorySearch();
+     else if (action === "prompts") togglePrompts();
+   }
+
+   // Close the menus on an outside click or Escape.
+   document.addEventListener("click", function(e) {
+     var menu = document.getElementById("chatMenu");
+     if (!menu || menu.classList.contains("hidden")) return;
+     if (e.target.closest && e.target.closest("#chatMenu, #chatMenuBtn")) return;
+     closeChatMenu();
+   });
+   document.addEventListener("keydown", function(e) {
+     if (e.key !== "Escape") return;
+     var menu = document.getElementById("chatMenu");
+     if (menu && !menu.classList.contains("hidden")) {
+       closeChatMenu();
+       var btn = document.getElementById("chatMenuBtn");
+       if (btn) btn.focus();
+     }
+   });
+
+   // ----------------------------------------------------------- memory ---
+
    async function loadMemory() {
      var list = document.getElementById("memoryList");
+     if (!list) return;
      try {
        var out = await fetchJSON("/api/memory?limit=50");
        var items = out.data.memories || [];
@@ -1080,16 +1397,13 @@ UI_JS_CHAT = r"""
        }
        items.forEach(function(item) {
          var row = document.createElement("div");
-         var del = document.createElement("button");
-         del.textContent = "x";
-         del.title = "Forget this note";
-         del.style.marginRight = "6px";
-         del.style.padding = "0 6px";
-         del.onclick = function() { forgetMemory(item.key); };
+         row.className = "row memory-item";
          var label = document.createElement("span");
+         label.className = "grow mono";
          label.textContent = item.key + ": " + item.value;
-         row.appendChild(del);
          row.appendChild(label);
+         row.appendChild(makeBtn("Forget", "Forget this note", function() { forgetMemory(item.key); },
+                                 "btn-danger"));
          list.appendChild(row);
        });
      } catch (err) {
@@ -1098,20 +1412,24 @@ UI_JS_CHAT = r"""
    }
 
    async function saveMemory() {
-     var key = document.getElementById("memKey").value.trim();
-     var value = document.getElementById("memValue").value.trim();
-     if (!key || !value) return;
+     var keyEl = document.getElementById("memKey");
+     var valueEl = document.getElementById("memValue");
+     if (!keyEl || !valueEl) return;
+     var key = keyEl.value.trim();
+     var value = valueEl.value.trim();
+     if (!key || !value) { uiToast("Enter both a key and a value.", "warn"); return; }
      try {
        await fetchJSON("/api/memory", {
          method: "POST",
          headers: { "Content-Type": "application/json" },
          body: JSON.stringify({ key: key, value: value })
        });
-       document.getElementById("memKey").value = "";
-       document.getElementById("memValue").value = "";
+       keyEl.value = "";
+       valueEl.value = "";
+       uiToast("Stored " + key + ".", "ok");
        loadMemory();
      } catch (err) {
-       addSystem("Memory error: " + err.message);
+       uiToast("Memory error: " + err.message, "error");
      }
    }
 
@@ -1120,9 +1438,11 @@ UI_JS_CHAT = r"""
        await fetchJSON("/api/memory/" + encodeURIComponent(key), { method: "DELETE" });
        loadMemory();
      } catch (err) {
-       addSystem("Memory error: " + err.message);
+       uiToast("Memory error: " + err.message, "error");
      }
    }
+
+   // ---------------------------------------------- feedback and training ---
 
    function reportLearning(learning) {
      // Skill authoring happens in the background AFTER this response, so this
@@ -1130,9 +1450,9 @@ UI_JS_CHAT = r"""
      // used, and any that were retired for a bad track record.
      if (!learning) return;
      var used = learning.skills_used || [];
-     if (used.length) addSystem("Credited skill(s): " + used.join(", "));
+     if (used.length) uiToast("Credited skill(s): " + used.join(", "), "info");
      var gone = learning.retired || [];
-     if (gone.length) addSystem("Retired skill(s) for a poor record: " + gone.join(", "));
+     if (gone.length) uiToast("Retired skill(s) for a poor record: " + gone.join(", "), "warn");
    }
 
    async function vote(userPrompt, assistantResponse, rating) {
@@ -1149,10 +1469,10 @@ UI_JS_CHAT = r"""
            conversation_id: conversationId
          })
        });
-       addSystem(out.data.status || "Feedback saved.");
+       uiToast(out.data.status || "Feedback saved.", "ok");
        reportLearning(out.data.learning);
      } catch (err) {
-       addSystem("Feedback error: " + err.message);
+       uiToast("Feedback error: " + err.message, "error");
      }
    }
 
@@ -1171,20 +1491,20 @@ UI_JS_CHAT = r"""
            conversation_id: conversationId
          })
        });
-       addSystem(out.data.status || "Correction saved.");
+       uiToast(out.data.status || "Correction saved.", "ok");
        reportLearning(out.data.learning);
      } catch (err) {
-       addSystem("Correction error: " + err.message);
+       uiToast("Correction error: " + err.message, "error");
      }
    }
 
    async function retrain() {
-     if (!window.confirm("Start retraining? The model server will be stopped temporarily.")) return;
+     if (!(await uiConfirm("Start retraining? The model server will be stopped temporarily."))) return;
      try {
        var out = await fetchJSON("/api/retrain", { method: "POST" });
-       addSystem(out.data.status || JSON.stringify(out.data));
+       uiToast(out.data.status || "Retraining started.", "ok");
      } catch (err) {
-       addSystem("Retrain error: " + err.message);
+       uiToast("Retrain error: " + err.message, "error");
      }
    }
 
@@ -1195,133 +1515,76 @@ UI_JS_CHAT = r"""
      // broken, the final event appends a feedback bar into the cleared chat
      // with nothing above it, and that answer's tokens are charged to the new
      // conversation's context meter, which newChat has just reset to zero.
+     //
+     // Switch to the chat first: leaving Settings with unsaved changes asks
+     // for confirmation, and a "stay" answer must not cost the user the
+     // conversation they had open.
+     if (currentView !== "chat") {
+       showView("chat");
+       if (currentView !== "chat") return;
+     }
      stopStream();
+     closeChatMenu();
      conversationId = randomId();
-     localStorage.setItem("llm_conversation", conversationId);
+     safeStorageSet("llm_conversation", conversationId);
      chat.innerHTML = "";
      usedTokens = 0;
      updateContextMeter(0);
-     addSystem("New conversation started.");
-   }
-
-   function toggleSettings() {
-     settingsEl.classList.toggle("open");
+     showChatEmpty();
+     input.focus();
    }
 
    async function restartModel() {
      try {
        var out = await fetchJSON("/api/model/restart", { method: "POST" });
-       addSystem("Model server restarting. KV cache: " + out.data.max_kv_size);
+       uiToast("Model server restarting. KV cache: " + out.data.max_kv_size, "ok");
      } catch (err) {
-       addSystem("Restart error: " + err.message);
+       uiToast("Restart error: " + err.message, "error");
      }
    }
 
-   async function loadConfig() {
-     try {
-       var out = await fetchJSON("/api/config");
-       var cfg = out.data.config;
-       contextSize = cfg.context_size;
-       document.getElementById("cfgSystem").value = cfg.system_prompt;
-       document.getElementById("cfgMaxTokens").value = cfg.max_tokens;
-       document.getElementById("cfgTemperature").value = cfg.temperature;
-       document.getElementById("cfgContext").value = cfg.context_size;
-       document.getElementById("cfgHistory").value = cfg.history_turns;
-       document.getElementById("cfgAgentSteps").value = cfg.agent_max_steps;
-       document.getElementById("cfgAgentMinSteps").value = cfg.agent_min_steps;
-       document.getElementById("cfgIncrementalReasoning").checked = !!cfg.incremental_reasoning;
-       document.getElementById("cfgReasoningSignals").value = cfg.reasoning_signals;
-       document.getElementById("cfgReasoningMinChars").value = cfg.reasoning_min_chars;
-       document.getElementById("cfgModelCutoff").value = cfg.model_cutoff || "";
-       document.getElementById("cfgDateInPrompt").checked = !!cfg.date_in_prompt;
-       document.getElementById("cfgHedgeEscalation").checked = !!cfg.hedge_escalation;
-       document.getElementById("cfgSearchBackend").value = cfg.search_backend;
-       document.getElementById("cfgSearchResults").value = cfg.search_results;
-       document.getElementById("cfgToolChars").value = cfg.tool_result_chars;
-       document.getElementById("cfgToolChars2").value = cfg.tool_result_chars;
-       document.getElementById("cfgToolTemp").value = cfg.tool_temperature;
-       document.getElementById("cfgThinking").checked = !!cfg.disable_thinking;
-       document.getElementById("cfgFastPath").checked = !!cfg.fast_path;
-       document.getElementById("cfgStablePrefix").checked = !!cfg.stable_prefix;
-       document.getElementById("cfgSummarise").checked = !!cfg.summarise_tool_results;
-       agentToggle.checked = cfg.agent_enabled;
-       var names = out.data.tools.map(function(t) { return t.name; });
-       document.getElementById("toolsList").textContent = names.join("\n");
-       updateContextMeter(0);
-     } catch (err) {
-       addSystem("Could not load settings: " + err.message);
-     }
-   }
+   // ----------------------------------------------------- status pill ---
 
-   async function saveConfig() {
-     var body = {
-       system_prompt: document.getElementById("cfgSystem").value,
-       max_tokens: Number(document.getElementById("cfgMaxTokens").value),
-       temperature: Number(document.getElementById("cfgTemperature").value),
-       context_size: Number(document.getElementById("cfgContext").value),
-       history_turns: Number(document.getElementById("cfgHistory").value),
-       agent_enabled: agentToggle.checked,
-       agent_max_steps: Number(document.getElementById("cfgAgentSteps").value),
-       agent_min_steps: Number(document.getElementById("cfgAgentMinSteps").value),
-       incremental_reasoning: document.getElementById("cfgIncrementalReasoning").checked,
-       reasoning_signals: Number(document.getElementById("cfgReasoningSignals").value),
-       reasoning_min_chars: Number(document.getElementById("cfgReasoningMinChars").value),
-       // Sent as typed. The server drops anything that is not YYYY or YYYY-MM
-       // rather than half-parsing it, so a typo clears the cutoff instead of
-       // silently making every year look recent.
-       model_cutoff: document.getElementById("cfgModelCutoff").value.trim(),
-       date_in_prompt: document.getElementById("cfgDateInPrompt").checked,
-       hedge_escalation: document.getElementById("cfgHedgeEscalation").checked,
-       search_results: Number(document.getElementById("cfgSearchResults").value),
-       tool_result_chars: Number(document.getElementById("cfgToolChars2").value ||
-                                 document.getElementById("cfgToolChars").value),
-       tool_temperature: Number(document.getElementById("cfgToolTemp").value),
-       disable_thinking: document.getElementById("cfgThinking").checked,
-       fast_path: document.getElementById("cfgFastPath").checked,
-       stable_prefix: document.getElementById("cfgStablePrefix").checked,
-       summarise_tool_results: document.getElementById("cfgSummarise").checked
-     };
-     try {
-       var out = await fetchJSON("/api/config", {
-         method: "POST",
-         headers: { "Content-Type": "application/json" },
-         body: JSON.stringify(body)
-       });
-       contextSize = out.data.config.context_size;
-       updateContextMeter(0);
-       addSystem(out.data.changed.length
-         ? "Updated: " + out.data.changed.join(", ")
-         : "No settings changed.");
-       if (out.data.ignored && out.data.ignored.length)
-         addSystem("Ignored invalid value(s): " + out.data.ignored.join(", "));
-     } catch (err) {
-       addSystem("Settings error: " + err.message);
+   function healthState(status) {
+     status = String(status || "unknown");
+     if (status === "ready") return { word: "Ready", cls: "ok" };
+     if (status === "starting" || status === "loading" || status === "restarting") {
+       return { word: status.charAt(0).toUpperCase() + status.slice(1) + "…", cls: "warn" };
      }
+     if (status.indexOf("error") === 0) return { word: "Model error", cls: "error" };
+     if (status === "stopped") return { word: "Model stopped", cls: "warn" };
+     return { word: status, cls: "muted" };
    }
 
    async function refreshHealth() {
      try {
        var out = await fetchJSON("/api/health");
        var data = out.data;
-       // Non-admins never call loadConfig(), so take the context size (used by
-       // the context meter) from health instead.
-       if (typeof data.context_size === "number") contextSize = data.context_size;
-       // The header line stays short enough to read at a glance; everything
-       // else goes to the tooltip, which has room to wrap.
-       var brief = ["Model: " + (data.model_status || "unknown")];
+       // Health carries the context size for every role, so the composer's
+       // meter is right for non-admins too.
+       if (typeof data.context_size === "number" && data.context_size !== contextSize) {
+         contextSize = data.context_size;
+         updateContextMeter(0);
+       }
+       // The pill says one thing at a glance; everything else goes to the
+       // tooltip, which has room to wrap.
+       var state = healthState(data.model_status);
+       var brief = [state.word];
+       var cls = state.cls;
        var detail = [];
        var stale = data.ui_build && data.ui_build !== "{{UI_BUILD}}";
        if (stale) {
-         brief = ["STALE PAGE \u2014 hard-reload"];
+         brief = ["Stale page: reload"];
+         cls = "error";
          detail.push("Server is build " + data.ui_build + ", this tab is {{UI_BUILD}}.");
        }
-       brief.push("agent " + (data.agent_enabled ? "on" : "off"));
-       brief.push("ctx " + data.context_size);
+       detail.push("Model status: " + (data.model_status || "unknown"));
+       detail.push("agent " + (data.agent_enabled ? "on" : "off") + " by default");
        detail.push("Max reply " + data.max_tokens + " tokens");
        detail.push((data.tools ? data.tools.length : 0) + " tools");
        var retrain = (data.retrain && data.retrain.message) || "idle";
-       if (retrain !== "idle") brief.push("retrain: " + retrain);
-       else detail.push("Retrain idle");
+       if (retrain !== "idle") { brief.push("retrain: " + retrain); if (cls === "ok") cls = "running"; }
+       else if (data.retrain) detail.push("Retrain idle");
        // What the live adapter was actually trained on, and whether the run
        // improved the held-out loss. Without this a bad adapter is invisible.
        var recipe = document.getElementById("retrainRecipe");
@@ -1330,65 +1593,63 @@ UI_JS_CHAT = r"""
          if (meta && meta.trained_at) {
            var c = meta.counts || {};
            var line = "Live adapter: " + (c.feedback || 0) + " feedback, "
-                    + (c.tool || 0) + " tool, " + (c.replay || 0) + " rehearsal \u2014 "
+                    + (c.tool || 0) + " tool, " + (c.replay || 0) + " rehearsal, "
                     + ((meta.plan && meta.plan.iters) || "?") + " iterations, "
                     + meta.trained_at.slice(0, 10) + ".";
            if (meta.val_loss_baseline != null && meta.val_loss_final != null) {
              line += " Held-out loss " + meta.val_loss_baseline.toFixed(3)
-                   + " \u2192 " + meta.val_loss_final.toFixed(3) + ".";
+                   + " → " + meta.val_loss_final.toFixed(3) + ".";
            }
            recipe.textContent = line;
-         } else {
-           recipe.textContent = "No trained adapter yet \u2014 the base model is live.";
+         } else if (data.retrain) {
+           recipe.textContent = "No trained adapter yet: the base model is live.";
          }
        }
        if (data.stats) {
-         brief.push(data.stats.untrained + " untrained");
          detail.push("Feedback: " + data.stats.total + " total, "
                      + data.stats.approved + " approved, "
                      + data.stats.untrained + " untrained");
-         if (data.stats.pending) {
-           brief.push(data.stats.pending + " awaiting approval");
-         }
+         if (data.stats.pending) detail.push(data.stats.pending + " awaiting approval");
        }
        if (typeof data.memories === "number") {
          detail.push(data.memories + " memory notes");
        }
        var warn = document.getElementById("prefixWarn");
-       if (data.prefix && data.prefix.generation > 1) {
-         warn.style.display = "";
-         warn.textContent = "Prompt prefix changed " + (data.prefix.generation - 1) +
-           " time(s) this session (last " + (data.prefix.changed_at || "") +
-           "). Each change invalidates any cached prefix.";
-       } else if (warn) {
-         warn.style.display = "none";
+       if (warn) {
+         var churn = !!(data.prefix && data.prefix.generation > 1);
+         warn.classList.toggle("hidden", !churn);
+         warn.hidden = !churn;
+         if (churn) {
+           warn.textContent = "Prompt prefix changed " + (data.prefix.generation - 1) +
+             " time(s) this session (last " + (data.prefix.changed_at || "") +
+             "). Each change invalidates any cached prefix.";
+         }
        }
        if (data.tasks) {
          var running = data.tasks.running || [];
          if (running.length) {
-           brief.push(running.length + " task" + (running.length > 1 ? "s" : "") + " running");
+           brief.push(running.length + " task" + (running.length > 1 ? "s" : ""));
+           if (cls === "ok") cls = "running";
            detail.push("Running: " + running.map(function(item) {
              return "step " + item.step + "/" + item.max_steps;
            }).join(", "));
          }
          detail.push(data.tasks.total + " tasks defined");
        }
-       statusEl.textContent = brief.join("  \u00b7  ");
-       statusEl.className = "";
+       var text = brief.join(" · ");
+       if (statusEl.textContent !== text) statusEl.textContent = text;
+       var pillClass = "pill status-pill " + cls;
+       if (statusEl.className !== pillClass) statusEl.className = pillClass;
        statusEl.setAttribute("data-tip-below", "");
        statusEl.setAttribute("data-tip",
          "Model " + (data.model || "?")
-         + " \u00b7 context " + (data.context_size || contextSize) + " tokens"
-         + (data.ram_gb ? " \u00b7 " + data.ram_gb + "GB RAM" : "")
-         + (detail.length ? " \u00b7 " + detail.join(" \u00b7 ") : ""));
-       if (stale || (data.model_status && data.model_status.indexOf("error") === 0)) {
-         statusEl.className = "error";
-       } else if (data.model_status === "starting" || data.model_status === "loading") {
-         statusEl.className = "warn";
-       }
+         + " · context " + (data.context_size || contextSize) + " tokens"
+         + (data.ram_gb ? " · " + data.ram_gb + "GB RAM" : "")
+         + (detail.length ? " · " + detail.join(" · ") : ""));
      } catch (err) {
-       statusEl.textContent = "Status unavailable: " + err.message;
-       statusEl.className = "error";
+       statusEl.textContent = "Offline";
+       statusEl.className = "pill status-pill error";
+       statusEl.setAttribute("data-tip", "Status unavailable: " + err.message);
      }
    }
 """

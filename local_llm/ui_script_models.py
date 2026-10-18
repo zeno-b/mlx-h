@@ -1,8 +1,13 @@
-"""Front-end: the models view (catalogue, adapters, dataset, knowledge base, codebase).
+"""Front-end: training data, knowledge base, codebase and chat-export helpers.
 
 Part of the embedded UI, split out of the single HTML_PAGE string for
 readability. Assembled once at import time in ui.py, so there is no
 runtime cost and no extra file I/O.
+
+The panels these functions fill now live in Settings (Models & Training >
+Training / Knowledge, Admin > Codebase; markup in ui_settings.py, lazy loading
+in ui_script_admin.py). Results and failures are toasts (uiToast from the
+kit), not alert(): a blocking dialog for a routine "Indexed." froze the tab.
 """
 
 from __future__ import annotations
@@ -50,9 +55,9 @@ UI_JS_MODELS = r"""   // -------------------------------------------------------
      if (btn) btn.disabled = true;
      try {
        var out = (await fetchJSON("/api/feedback/approve-pending", { method: "POST" })).data;
-       alert("Approved " + out.approved + " example(s) for training.");
+       uiToast("Approved " + out.approved + " example(s) for training.", "ok");
      } catch (err) {
-       alert("Could not approve: " + err.message);
+       uiToast("Could not approve: " + err.message, "error");
      } finally {
        if (btn) btn.disabled = false;
        loadDatasetStats();
@@ -63,20 +68,26 @@ UI_JS_MODELS = r"""   // -------------------------------------------------------
      var reviewed = document.getElementById("exportReviewedOnly");
      var url = "/api/dataset/export?format=" + encodeURIComponent(format)
        + "&reviewed_only=" + (reviewed && reviewed.checked ? "true" : "false");
+     // Not uiDownload: the example count comes back in a response header.
      try {
        var resp = await fetch(url);
-       if (!resp.ok) throw new Error("HTTP " + resp.status);
+       if (resp.status === 401 && typeof onUnauthorized === "function") { onUnauthorized(); return; }
+       if (!resp.ok) {
+         var e = {};
+         try { e = await resp.json(); } catch (x) { e = {}; }
+         throw new Error(typeof httpErrorText === "function" ? httpErrorText(e, resp.status)
+                                                             : ("HTTP " + resp.status));
+       }
        var count = resp.headers.get("X-Example-Count") || "?";
-       var text = await resp.text();
-       var blob = new Blob([text], { type: "application/x-ndjson" });
+       var blob = await resp.blob();
        var a = document.createElement("a");
        a.href = URL.createObjectURL(blob);
        a.download = "dataset_" + format + ".jsonl";
        document.body.appendChild(a); a.click(); a.remove();
-       URL.revokeObjectURL(a.href);
-       alert(count + " examples exported as " + format + " (also saved to data/exports/).");
+       setTimeout(function() { URL.revokeObjectURL(a.href); }, 1500);
+       uiToast(count + " examples exported as " + format + " (also saved to data/exports/).", "ok");
      } catch (err) {
-       alert("Export failed: " + err.message);
+       uiToast("Export failed: " + err.message, "error");
      }
    }
 
@@ -86,7 +97,7 @@ UI_JS_MODELS = r"""   // -------------------------------------------------------
      try {
        var s = (await fetchJSON("/api/project/status")).data;
        if (!s.project_dir) {
-         box.textContent = "No project set — file tools use the sandbox workspace.\n"
+         box.textContent = "No project set: file tools use the sandbox workspace.\n"
            + "Set a project directory above to work on a local codebase.";
          var inp = document.getElementById("cfgProjectDir");
          if (inp && !inp.value) inp.value = "";
@@ -95,7 +106,7 @@ UI_JS_MODELS = r"""   // -------------------------------------------------------
        var lines = [];
        lines.push("Directory: " + s.root);
        lines.push("Git repo:  " + (s.is_git_repo ? ("yes (branch " + (s.branch || "?") + ")")
-         : "NO — you will have no easy way to review or revert edits"));
+         : "NO: you will have no easy way to review or revert edits"));
        var changed = s.changed_this_session || [];
        lines.push("Changed this session: " + (changed.length ? changed.join(", ") : "none"));
        if (s.is_git_repo) {
@@ -113,7 +124,7 @@ UI_JS_MODELS = r"""   // -------------------------------------------------------
            hint.textContent = "Execution enabled (" + exec.join(" + ")
              + "), confined to this directory with a timeout. The agent can run "
              + (s.test_command ? ("tests (" + s.test_command + "), ") : "")
-             + "read the output, and fix the code. Not a security sandbox — it runs "
+             + "read the output, and fix the code. Not a security sandbox: it runs "
              + "with your privileges, so use it only on code you trust and review.";
          } else {
            hint.textContent = "Execution disabled. Start the app with --allow-shell "
@@ -133,27 +144,23 @@ UI_JS_MODELS = r"""   // -------------------------------------------------------
      if (!pre) return;
      try {
        var d = (await fetchJSON("/api/project/diff")).data;
-       pre.style.display = "block";
+       modelsShow(pre);
        if (!d.project_dir) {
-         pre.textContent = "No project set — nothing to diff. Set a project directory above.";
+         pre.textContent = "No project set, so nothing to diff. Set a project directory above.";
          return;
        }
-       if (!d.is_git_repo) { pre.textContent = "Not a git repository — no diff available."; return; }
-       pre.style.display = "block";
+       if (!d.is_git_repo) { pre.textContent = "Not a git repository: no diff available."; return; }
        pre.textContent = (d.diff && d.diff.trim()) ? d.diff : "No uncommitted changes.";
      } catch (err) {
-       pre.style.display = "block"; pre.textContent = "Could not load diff: " + err.message;
+       modelsShow(pre);
+       pre.textContent = "Could not load diff: " + err.message;
      }
    }
 
    async function saveProjectDir() {
      var val = (document.getElementById("cfgProjectDir").value || "").trim();
      try {
-       var out = await fetchJSON("/api/config", {
-         method: "POST",
-         headers: { "Content-Type": "application/json" },
-         body: JSON.stringify({ project_dir: val })
-       });
+       var out = await postJSON("/api/config", { project_dir: val });
        // Confirm the server actually took it. This used to alert success
        // unconditionally, which hid the fact that the field was being dropped.
        var d = out.data || {};
@@ -162,30 +169,31 @@ UI_JS_MODELS = r"""   // -------------------------------------------------------
        // equality: the server resolves ~ and symlinks, so /var/... legitimately
        // comes back as /private/var/... .
        if (val && !applied) {
-         alert("The server did not apply that project directory. It reported: "
-               + (applied || "(none)"));
+         uiToast("The server did not apply that project directory. It reported: "
+                 + (applied || "(none)"), "error");
        } else {
-         alert(val ? ("Project set to " + applied)
-                   : "Project cleared — using sandbox workspace.");
+         uiToast(val ? ("Project set to " + applied)
+                     : "Project cleared: using the sandbox workspace.", "ok");
        }
        loadProjectStatus();
      } catch (err) {
-       alert("Could not set project directory: " + err.message);
+       uiToast("Could not set project directory: " + err.message, "error");
      }
    }
 
    async function revertChanges() {
-     if (!confirm("Undo this session's edits? Modified files are restored to the "
+     if (!uiConfirm("Undo this session's edits? Modified files are restored to the "
        + "last commit and files created this session are deleted. This cannot be undone.")) return;
      try {
        var r = await fetchJSON("/api/project/revert", { method: "POST" });
-       if (r.data && r.data.error) { alert(r.data.error); return; }
+       if (r.data && r.data.error) { uiToast(r.data.error, "error"); return; }
        var d = r.data || r;
-       alert("Restored " + (d.restored || []).length + ", removed " + (d.removed || []).length
-         + (d.failed && d.failed.length ? (", failed " + d.failed.length) : "") + ".");
+       uiToast("Restored " + (d.restored || []).length + ", removed " + (d.removed || []).length
+         + (d.failed && d.failed.length ? (", failed " + d.failed.length) : "") + ".",
+         d.failed && d.failed.length ? "warn" : "ok");
        loadProjectStatus();
      } catch (err) {
-       alert("Revert failed: " + err.message);
+       uiToast("Revert failed: " + err.message, "error");
      }
    }
 
@@ -211,7 +219,7 @@ UI_JS_MODELS = r"""   // -------------------------------------------------------
          if (total > 15) lines.push("  ... and " + (total - 15) + " more");
        } else {
          lines.push("");
-         lines.push("Nothing indexed yet — answers use the model's own knowledge.");
+         lines.push("Nothing indexed yet: answers use the model's own knowledge.");
        }
        box.textContent = lines.join("\n");
        renderScope(s.items || []);
@@ -232,15 +240,18 @@ UI_JS_MODELS = r"""   // -------------------------------------------------------
      if (!items.length) { host.textContent = "Nothing indexed yet."; return; }
      host.innerHTML = "";
      items.forEach(function(it) {
+       // The kit's checkbox row (.check), same as the capability grid.
        var row = document.createElement("label");
-       row.className = "agent-toggle";
-       row.style.display = "block";
+       row.className = "check";
        var cb = document.createElement("input");
        cb.type = "checkbox";
        cb.value = it.path;
        cb.checked = current.indexOf(it.path) >= 0;
+       var text = document.createElement("span");
+       text.className = "mono";
+       text.textContent = it.path;
        row.appendChild(cb);
-       row.appendChild(document.createTextNode(" " + it.path));
+       row.appendChild(text);
        host.appendChild(row);
      });
    }
@@ -252,11 +263,11 @@ UI_JS_MODELS = r"""   // -------------------------------------------------------
      try {
        await fetchJSON("/api/docs/scope?paths=" + encodeURIComponent(picked.join(",")),
                        { method: "POST" });
-       alert(picked.length
+       uiToast(picked.length
          ? ("Answers will use only these " + picked.length + " document(s).")
-         : "No documents ticked — using the whole knowledge base.");
+         : "No documents ticked: using the whole knowledge base.", "ok");
      } catch (err) {
-       alert("Could not set scope: " + err.message);
+       uiToast("Could not set scope: " + err.message, "error");
      }
    }
 
@@ -264,75 +275,75 @@ UI_JS_MODELS = r"""   // -------------------------------------------------------
      try {
        await fetchJSON("/api/docs/scope?paths=", { method: "POST" });
        loadDocsStats();
-       alert("Using the whole knowledge base.");
+       uiToast("Using the whole knowledge base.", "ok");
      } catch (err) {
-       alert("Could not clear scope: " + err.message);
+       uiToast("Could not clear scope: " + err.message, "error");
      }
    }
 
    async function indexDocs() {
      var path = (document.getElementById("docsPath").value || "").trim();
-     if (!path) { alert("Enter a file or folder path relative to the project."); return; }
+     if (!path) { uiToast("Enter a file or folder path relative to the project.", "warn"); return; }
      try {
        var r = await fetchJSON("/api/docs/index?path=" + encodeURIComponent(path), { method: "POST" });
        var d = r.data || r;
-       if (d.error) { alert(d.error); return; }
-       alert(d.result || "Indexed.");
+       if (d.error) { uiToast(d.error, "error"); return; }
+       uiToast(d.result || "Indexed.", "ok");
        loadDocsStats();
      } catch (err) {
-       alert("Indexing failed: " + err.message);
+       uiToast("Indexing failed: " + err.message, "error");
      }
    }
 
    async function searchDocs() {
      var q = (document.getElementById("docsQuery").value || "").trim();
      var pre = document.getElementById("docsResult");
-     if (!q) { alert("Type a question to test retrieval."); return; }
+     if (!q) { uiToast("Type a question to test retrieval.", "warn"); return; }
      try {
        var r = await fetchJSON("/api/docs/search?q=" + encodeURIComponent(q));
        var hits = (r.data || r).hits || [];
-       pre.style.display = "block";
+       modelsShow(pre);
        pre.textContent = hits.length
          ? hits.map(function(h) { return "[" + h.path + "]\n" + h.chunk; }).join("\n\n")
          : "No matching passages.";
      } catch (err) {
-       pre.style.display = "block";
+       modelsShow(pre);
        pre.textContent = "Search failed: " + err.message;
      }
    }
 
    async function clearDocs() {
-     if (!confirm("Remove every indexed document? Your actual files are not touched.")) return;
+     if (!uiConfirm("Remove every indexed document? Your actual files are not touched.")) return;
      try {
        var r = await fetchJSON("/api/docs/clear", { method: "POST" });
-       alert("Cleared " + ((r.data || r).cleared || 0) + " document(s).");
+       uiToast("Cleared " + ((r.data || r).cleared || 0) + " document(s).", "ok");
        loadDocsStats();
      } catch (err) {
-       alert("Clear failed: " + err.message);
+       uiToast("Clear failed: " + err.message, "error");
      }
    }
 
    async function indexUrl() {
      var url = (document.getElementById("docsUrl").value || "").trim();
-     if (!url) { alert("Enter a URL to fetch and index."); return; }
+     if (!url) { uiToast("Enter a URL to fetch and index.", "warn"); return; }
      try {
        var r = await fetchJSON("/api/docs/index_url?url=" + encodeURIComponent(url), { method: "POST" });
        var d = r.data || r;
-       if (d.error) { alert(d.error); return; }
-       alert(d.result || "Indexed.");
+       if (d.error) { uiToast(d.error, "error"); return; }
+       uiToast(d.result || "Indexed.", "ok");
        loadDocsStats();
      } catch (err) {
-       alert("Indexing failed: " + err.message);
+       uiToast("Indexing failed: " + err.message, "error");
      }
    }
 
    async function regenerateLast() {
-     if (busy) { alert("Wait for the current answer to finish."); return; }
+     if (busy) { uiToast("Wait for the current answer to finish.", "warn"); return; }
      try {
        var r = await fetchJSON("/api/conversation/" + encodeURIComponent(conversationId) + "/regenerate",
                                { method: "POST" });
        var d = r.data || r;
-       if (d.error) { alert(d.error); return; }
+       if (d.error) { uiToast(d.error, "error"); return; }
        // The server's regenerate drops BOTH sides of the exchange, so the page
        // must too: removing only the answer left the old question on screen and
        // send() then rendered it a second time (plus a stranded feedback bar).
@@ -350,8 +361,16 @@ UI_JS_MODELS = r"""   // -------------------------------------------------------
        input.value = d.prompt;
        send();
      } catch (err) {
-       alert("Could not regenerate: " + err.message);
+       uiToast("Could not regenerate: " + err.message, "error");
      }
+   }
+
+   // Reveal a result box that ships hidden (class + attribute, so neither a
+   // stylesheet rule nor the UA default can keep it hidden).
+   function modelsShow(el) {
+     if (!el) return;
+     el.classList.remove("hidden");
+     el.hidden = false;
    }
 
    function exportChat() {

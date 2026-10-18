@@ -3461,28 +3461,6 @@ def test_an_oversized_artifact_is_cut_in_the_middle_and_says_so():
     db.close()
 
 
-# Standalone runner (no pytest required).
-# --------------------------------------------------------------------------- #
-def _run_standalone():
-    tests = [(n, f) for n, f in sorted(globals().items())
-             if n.startswith("test_") and callable(f)]
-    passed = failed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"PASS  {name}")
-            passed += 1
-        except Exception as exc:  # noqa: BLE001
-            import traceback
-            print(f"FAIL  {name}: {exc}")
-            traceback.print_exc()
-            failed += 1
-    print(f"\n{passed} passed, {failed} failed")
-    return 1 if failed else 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(_run_standalone())
 
 
 # --------------------------------------------------------------------------- #
@@ -5652,17 +5630,28 @@ def test_the_new_routing_settings_are_reachable_and_shown():
     """A setting in MUTABLE is reachable over HTTP; a setting in the Settings
     PANEL is reachable by the person who has to tune it.
 
-    The two are wired separately -- MUTABLE generates the request schema, the
-    panel is hand-written -- so a new knob can be perfectly settable over the
-    API and invisible in the UI, which is the same as not existing for anyone
-    who is not writing curl by hand.
+    The two are wired separately -- MUTABLE generates the request schema,
+    SETTINGS_FIELDS generates the panel -- so a new knob can be perfectly
+    settable over the API and invisible in the UI, which is the same as not
+    existing for anyone who is not writing curl by hand.
     """
+    from local_llm.config import Config
+    from local_llm.settings_schema import SETTINGS_FIELDS, UI_HIDDEN, settings_control_id
     from local_llm.ui import render_ui
     page = render_ui()
     for element in ("cfgModelCutoff", "cfgDateInPrompt", "cfgHedgeEscalation"):
-        assert element in page, f"{element} is not in the Settings panel"
-    # Present in the reader AND the writer: a control that loads but never
-    # saves looks like it works and silently does nothing.
+        assert f'id="{element}"' in page, f"{element} is not in the Settings panel"
+    # Every mutable key is a control or hidden on purpose (with a reason).
+    shown = {f["key"] for f in SETTINGS_FIELDS if f["scope"] == "global"}
+    assert set(Config.MUTABLE) - shown - set(UI_HIDDEN) == set()
+    # Present in the reader AND the writer. The loader and the saver no longer
+    # name controls one by one: both bind by data-key/data-scope, so a control
+    # carrying its key is wired both ways. Its label and hint point at it too.
+    for field in SETTINGS_FIELDS:
+        if field["scope"] != "global":
+            continue
+        cid = settings_control_id(field)
+        assert f'id="{cid}" data-key="{field["key"]}" data-scope="global"' in page, cid
     assert page.count("cfgModelCutoff") >= 3, "model_cutoff is not wired both ways"
 
     app, _, _ = build_app()
@@ -6137,3 +6126,27 @@ def test_the_per_kind_hint_yields_to_a_task_brief():
     assert "RULES FOR THIS REPLY" in prompt, "the brief should be in front of the model"
     assert "steps in order" not in prompt, "the hint contradicted the brief"
     db.close()
+
+
+# Standalone runner (no pytest required).
+# --------------------------------------------------------------------------- #
+def _run_standalone():
+    tests = [(n, f) for n, f in sorted(globals().items())
+             if n.startswith("test_") and callable(f)]
+    passed = failed = 0
+    for name, fn in tests:
+        try:
+            fn()
+            print(f"PASS  {name}")
+            passed += 1
+        except Exception as exc:  # noqa: BLE001
+            import traceback
+            print(f"FAIL  {name}: {exc}")
+            traceback.print_exc()
+            failed += 1
+    print(f"\n{passed} passed, {failed} failed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_run_standalone())

@@ -28,6 +28,7 @@ splitting it into bounded steps, slowing down rather than crashing.
 - [Office 365 (Microsoft Graph)](#office-365-microsoft-graph)
 - [Multi-turn task continuity](#multi-turn-task-continuity)
 - [Performance and resource limits](#performance-and-resource-limits)
+- [OpenAI and Anthropic compatible API](#openai-and-anthropic-compatible-api)
 - [Logging and debugging](#logging-and-debugging)
 - [Automatic Mac Mini / Mac Studio routing](#automatic-mac-mini--mac-studio-routing)
 - [Mac Mini deployment (primary)](#mac-mini-deployment-primary)
@@ -190,7 +191,13 @@ every variable with placeholders. Highlights:
 | Entra/OIDC | `OIDC_ENABLED`, `OIDC_TENANT_ID`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI`, `OIDC_ADMIN_EMAILS`, `OIDC_ADMIN_GROUPS`, `OIDC_ADMIN_ROLES`, `OIDC_DEFAULT_ROLE` |
 | Office 365 | `O365_TENANT_ID`, `O365_CLIENT_ID`, `O365_CLIENT_SECRET`, `O365_SCOPES` |
 | Cluster/routing | `NODE_ROLE`, `NODE_NAME`, `STUDIO_NODE_URL`, `NODE_TOKEN`, `ROUTE_MAX_ACTIVE`, `ROUTE_QUEUE_DEPTH`, `ROUTE_CPU_PCT`, `ROUTE_LOAD_RATIO`, `ROUTE_MEM_PCT`, `ROUTE_SLA_MS`, `ROUTE_COOLDOWN_S`, `LARGE_MODEL_MARKERS`, `HEARTBEAT_INTERVAL`, `HEARTBEAT_TIMEOUT`, `NODE_PROBE_TIMEOUT` |
-| Admission control | `MAX_CONCURRENT_GENERATIONS`, `GENERATION_QUEUE_DEPTH`, `MAX_CONCURRENT_TASKS`, `AGENT_RUN_TIMEOUT` |
+| Admission control | `MAX_CONCURRENT_GENERATIONS`, `GENERATION_QUEUE_DEPTH`, `ADMISSION_MEMORY_AWARE`, `ADMISSION_MIN_FREE_MB`, `MAX_CONCURRENT_TASKS`, `AGENT_RUN_TIMEOUT` |
+| Inference backend | `MODEL_BACKEND`, `DRAFT_MODEL`, `NUM_DRAFT_TOKENS`, `BACKEND_COMMAND`, `BACKEND_CAPABILITIES`, `BACKEND_EXTRA_ARGS` (see [Inference backends](#inference-backends)) |
+| Model catalogue | `MODEL_ALIASES`, `BENCH_MIN_DECODE_TPS`, `BENCH_HEADROOM_GB` (see [Model catalogue](#model-catalogue-aliases-and-the-benchmark-sweep)) |
+| Multi-node / remote | `CLUSTER_NODES`, `CLUSTER_HOSTFILE`, `CLUSTER_PYTHON`, `WEB_HOST`, `TRUSTED_PROXIES`, `PUBLIC_BASE_URL`, `NODE_CA_FILE`, `NODE_CLIENT_CERT`, `NODE_CLIENT_KEY`, `NODE_ALLOW_PLAINTEXT`, `NODE_E2E_KEY` |
+| Tool-call parsing | `TOOL_CALL_FORMAT`, `TOOL_CALL_REPAIR` (see [Tool-call formats](#tool-call-formats)) |
+| Tool approvals | `TOOL_APPROVAL_MODE`, `TOOL_APPROVAL_UNATTENDED`, `TOOL_APPROVAL_TIMEOUT_S`, `TOOL_APPROVAL_TAINT`, `TOOL_APPROVAL_ROLES` (see [Tool approvals and audit](#tool-approvals-and-audit)) |
+| OpenAI / Anthropic API | `V1_DEFAULT_MODE`, `V1_RAW_ENABLED` (see [OpenAI and Anthropic compatible API](#openai-and-anthropic-compatible-api)) |
 | Agent/tools | `AGENT_ENABLED`, `AGENT_ESCALATION`, `AUTO_CONTINUE`, `AUTO_CONTINUE_MAX`, `AGENT_MIN_STEPS`, `AGENT_MAX_STEPS`, `AGENT_TOOLS`, `CODE_MAX_TOKENS`, `PROJECT_DIR`, `ALLOW_SHELL`, `ALLOW_PYTHON` |
 | Sandbox | `EXEC_BACKEND`, `DOCKER_IMAGE`, `EXEC_ENV_PASSTHROUGH`, `EXEC_MEMORY_MB`, `EXEC_MAX_FILE_MB`, `EXEC_PIDS_LIMIT`, `EXEC_GUARDRAIL`, `TOOL_TIMEOUT`, `TEST_TIMEOUT`, `TEST_COMMAND` (see [Sandboxed execution](#sandboxed-execution)) |
 | Task continuity | `TASK_STATE_ENABLED`, `TASK_ARTIFACT_CHARS`, `DRIFT_CHECK_ENABLED`, `ARTIFACT_REPLY_HEADROOM`, `DEBUG_PROMPTS` (see [Multi-turn task continuity](#multi-turn-task-continuity)) |
@@ -715,6 +722,59 @@ through a config file rather than flags. Every optional flag is probed against
 `mlx_lm.lora --help` first; if that cannot be read at all the run is **refused**
 rather than silently falling back to `mlx-lm`'s own defaults.
 
+### Preference methods (DPO, ORPO, KTO, GRPO)
+
+`TRAIN_METHOD=sft` (default) is the loop above, with a byte-identical command.
+`dpo`, `orpo` and `grpo` train through the optional
+[mlx-lm-lora](https://pypi.org/project/mlx-lm-lora/) package
+(`python -m mlx_lm_lora.train --train-mode <method>`); without it a run is
+refused with a message, never silently run as SFT. `kto` is export-only, because
+mlx-lm-lora (5.8.6) has no KTO mode.
+
+The sets are built from approved feedback only, on both sides of a pair: a
+correction gives chosen = corrected, rejected = original; an approved thumbs-up
+and an approved thumbs-down on the same prompt give a second kind of pair. A
+non-admin's queued thumbs-down and an implicit rejection enter only after an
+admin approves them. Targets are stripped of reasoning blocks, and the held-out
+split is by prompt, so no feedback row is in both files. Files land in
+`data/pref/<method>/` in the trainer's format: `{system, prompt, chosen,
+rejected}` for DPO/ORPO, `{system, prompt, completion, label}` for KTO,
+`{system, prompt, answer, type}` for GRPO. `POST /api/train/export?method=`
+writes them without training; `GET /api/train/methods` says which methods can
+run here and why not.
+
+DPO and GRPO load a second, frozen copy of the model as the reference
+(`TRAIN_REFERENCE_ADAPTER` empty = the base model; a path must be a full model
+directory, so fuse an adapter first). ORPO needs none, which is why it is the
+preference method that fits on 8 GB. `TRAIN_BETA` (0.1) sets the preference
+strength. The generated `trainer_config.yaml` always sets `fuse: false`:
+mlx-lm-lora fuses by default and would otherwise write a de-quantized model over
+`adapters/latest`.
+
+DPO and ORPO runs are gated like SFT (first validation loss vs. best/final,
+`TRAIN_VAL_TOLERANCE`, best-checkpoint promotion). GRPO (experimental) optimises
+`TRAIN_GRPO_REWARDS` (`tool_call`: the reply parses as the expected tool call via
+the agent's own parser; `format`: no broken structured output; `length`: close to
+the approved answer), and its validation loss is a policy-gradient surrogate, so
+a GRPO run, or any preference run with fewer than two validation points, is
+rolled back unless `TRAIN_PROMOTE_UNGATED=1`.
+
+### Training autopilot
+
+`TRAIN_AUTOPILOT=1` sizes each run from this Mac's RAM, the model's
+`config.json` and weights in the Hugging Face cache (never downloaded or
+loaded) and the corpus: `max_seq_length` from the 95th-percentile example
+(plus margin, with `TRAIN_SEQ_LEN` as the ceiling), then batch, layers and
+rank shrink in that order until the estimated peak fits ~70% of RAM; gradient
+checkpointing is dropped only when the run fits comfortably without it. A run
+that cannot fit is refused with the knob to turn (`MODEL`, `TRAIN_METHOD`,
+`TRAIN_SEQ_LEN`). The plan applies to that run only and is recorded in
+`adapters/latest/training_meta.json` with the method. Preview it with
+`GET /api/train/plan?method=` or `python deploy.py train-plan --method orpo`.
+The estimate is a heuristic that errs high, not a measurement. Layer streaming
+is not supported: neither `mlx_lm.lora` nor `mlx_lm_lora.train` has a
+layer-streaming or offload option.
+
 ---
 
 ## Agent profiles and capabilities
@@ -860,7 +920,20 @@ the model, the KV cache and the web process compete for the same RAM.
   `503` with `Retry-After` instead of a request that quietly times out minutes
   later. Every in-flight generation holds its own KV cache, so this is a memory
   limit as much as a fairness one. Chat, streaming chat and each agent in a
-  fan-out all draw from the same pool.
+  fan-out all draw from the same pool, as do scheduled task runs. Waiters are
+  served first in, first out. A streaming chat that has to wait sends
+  `{"type": "queued", "position", "running", "limit"}` events (repeated every
+  15 seconds while nothing moves, so a proxy does not cut the idle stream), and
+  `GET /api/health` carries a `queue` object (running, waiting, limit; admins
+  also see reserved memory and wait-time percentiles). Two settings make the
+  gate memory-aware, both off or neutral by default: with
+  `ADMISSION_MEMORY_AWARE=1` a request reserves its prompt plus reply budget
+  times the model's KV bytes per token (read from its `config.json`, scaled by
+  `KV_BITS`) and waits while free memory minus what running requests reserved
+  would drop below `ADMISSION_MIN_FREE_MB` (384 MB on 8 GB, 768 MB up to
+  24 GB, 1.5 GB above). A request is always admitted when nothing else runs,
+  and when free memory cannot be measured the check switches itself off. All
+  four admission settings apply at runtime from Settings > Performance.
 - **One pooled HTTP client.** All generations share a single keep-alive
   connection pool to the model backend rather than opening a fresh TCP
   connection per request, which matters most on multi-step agent runs.
@@ -879,6 +952,211 @@ the model, the KV cache and the web process compete for the same RAM.
   abbreviated tail is kept with an explicit marker rather than silently dropped.
   Replies that hit the token ceiling are labelled in the answer instead of just
   stopping mid-sentence.
+
+### Inference backends
+
+`MODEL_BACKEND` picks the engine the app launches and supervises (restart-only;
+`--backend` on the command line). Left unset it is `mlx-lm`, and the
+`mlx_lm.server` command line is exactly what it was before backends existed.
+
+- **`mlx-lm`**: the stock server with the memory levers from the environment.
+- **`mlx-lm-turbo`**: the same server, sized for this Mac. Decode concurrency
+  becomes `MAX_CONCURRENT_GENERATIONS` plus one (so the watchdog probe is batched
+  beside a long answer), capped per RAM tier; prompt concurrency stays 1 below
+  16GB. The prompt cache holds one entry per system-prompt lane (router, triage,
+  tools, tool subset, prose, reasoning; two per lane on hybrid models whose cache
+  cannot be trimmed) plus one per concurrent generation and two for the probes,
+  so lanes stop evicting each other's prefix.
+- **`openai-external`**: any OpenAI-compatible MLX engine, started from
+  `BACKEND_COMMAND` with `{python} {model} {port} {host} {adapter} {draft_model}`
+  placeholders (`{model}` and `{port}` are required; a flag whose optional
+  placeholder is empty is dropped). `BACKEND_CAPABILITIES` declares what it can
+  do. The LoRA adapter is served only when the template has `{adapter}`.
+- **`mlx-engine`**: this app's own OpenAI-compatible MLX server
+  (`local_llm/mlx_engine.py`, also `python -m local_llm.mlx_engine` or
+  `deploy.py mlx-engine`). One generation thread runs mlx-lm's `BatchGenerator`
+  for continuous batching; a lone request decodes speculatively when
+  `DRAFT_MODEL` is set and folds into the batch when a second one arrives. The
+  prefix cache is bounded by bytes (`PROMPT_CACHE_BYTES`, optionally spilled to
+  `PROMPT_CACHE_DIR`) and keeps state snapshots at the system prompt and each
+  assistant turn for hybrid models whose cache cannot be trimmed. `KV_BITS`
+  serves one request at a time, as on mlx-lm. Admission is memory-aware inside
+  the engine, a full queue answers 503 with `Retry-After`, and
+  `GET /v1/engine/stats` on the model port reports batch, queue, prefix-cache
+  hits, decode rate and TTFT percentiles.
+
+`DRAFT_MODEL` (a repo id, or `auto` to ask the model catalogue) turns on
+speculative decoding, with `NUM_DRAFT_TOKENS` per step. On mlx-lm 0.32 a loaded
+draft model, `KV_BITS`, a request `seed` or image input each make the server
+serve one request at a time, so `auto` skips the draft whenever more than one
+generation may run at once. `BACKEND_EXTRA_ARGS` is appended to any backend's
+command line for flags the app does not model.
+
+`GET /api/backends` (admin) lists every engine, whether it can run here, and for
+the live one its capabilities, the optional flags the installed build accepted,
+the prompt-cache plan, and a plain-language reason for each decision. The model
+server also gets `--allowed-origins` set to the web UI's own origin instead of
+`*` when the installed build supports it.
+
+Every request to an mlx-lm server carries `"model": "default_model"`. mlx-lm
+maps only that name onto its command-line `--adapter-path`; a request naming the
+repo id made the server reload the base weights without the feedback adapter.
+
+### Model catalogue, aliases and the benchmark sweep
+
+`MODEL_ID`, `--model` and the model switcher accept an alias as well as a repo
+id: `tiny`, `fast`, `balanced`, `coder`, `reasoning`, `vision` and `large` are
+built in, and `MODEL_ALIASES` (JSON `{"name": "repo-id"}`) adds or overrides
+them. `deploy.py models [--json]` lists the catalogue with each entry's aliases,
+metadata, whether it fits in this Mac's RAM and which one is recommended.
+
+`deploy.py bench --sweep [--models ... --contexts ... --backends ...]` measures
+decode rate, time to first token and peak memory for every model, context and
+backend cell that fits and is downloaded (it records why it skipped the rest),
+and refuses while a model server is running. `deploy.py recommend [--apply]`
+picks the best model that decodes at least `BENCH_MIN_DECODE_TPS` tokens/s with
+`BENCH_HEADROOM_GB` to spare and writes `DATA_DIR/recommendation.json`, which is
+used only when `MODEL_ID` (and, for its context, `CONTEXT_SIZE`) is unset and
+only on a Mac with the same RAM. `deploy.py --bench` still works. Admins get the
+same through `GET /api/bench/results`, `GET /api/bench/recommendation`,
+`GET /api/bench/status` and `POST /api/bench/run` (`{"confirm": true}`; 409
+while anything is generating or training); `GET /api/models/aliases` is open to
+every signed-in user.
+
+### Tool-call formats
+
+The agent asks every model for `{"tool": NAME, "args": {...}}`, but a model
+often falls back on the format its chat template was trained on.
+`local_llm/toolparse.py` reads all of them and normalises each to that one
+shape: plain or fenced JSON, OpenAI `tool_calls`, Hermes `<tool_call>`,
+Qwen3-Coder `<function=...>`, GLM, Llama 3 `<|python_tag|>`, Mistral
+`[TOOL_CALLS]`, pythonic `[f(x=1)]`, Gemma, DeepSeek, Kimi and gpt-oss harmony.
+Reasoning blocks (`<think>`, `<seed:think>`, the harmony analysis channel) are
+split off first. Native `tool_calls` from the server, streamed or not, become
+the same canonical text, so a reply mlx-lm already parsed no longer reaches the
+agent empty.
+
+- `TOOL_CALL_FORMAT` (default `auto`) pins one format when a model's output is
+  ambiguous; an unknown name falls back to `auto`.
+- `TOOL_CALL_REPAIR` (default `1`) lets the parser fix near-miss JSON (trailing
+  commas, single quotes, unbalanced brackets at the end of a finished reply).
+  A string cut off mid-value is never completed. Each repair is recorded on
+  the parsed call.
+
+Both apply to the next reply when changed in Settings > Tools. Callers that
+want structure use `ModelClient.stream_events()`, which yields `content`,
+`reasoning`, `tool_call_delta`, `finish` and `usage` events instead of text.
+
+### Tool approvals and audit
+
+Every tool has a risk class: `read` (read_file, search, fetch_url, recall_*),
+`write` (write_file, edit_file, create_document, remember, save_skill, index_*),
+`exec` (run_shell, run_python, run_tests, execute_code) or `external` (o365_mail
+send, a non-GET HTTP call, unknown tools; MCP tools use the server's
+readOnlyHint/destructiveHint annotations, otherwise external).
+
+- `TOOL_APPROVAL_MODE` (default `off`): `off` runs every call as before;
+  `risky` asks the user before write, exec and external calls; `all` asks before
+  every call. An unknown value means `risky`.
+- Overrides refine it, later layers winning: global rows, the agent profile
+  (`agents.tool_policy` or profile rows), `TOOL_APPROVAL_ROLES` (JSON, e.g.
+  `{"user": {"risk:exec": "deny"}}`), the user's own rows, the conversation's
+  rows, then a one-shot approval. Rule keys are a tool name, `cap:<capability>`,
+  `risk:<class>` or `*`. An administrator deny (global, profile, role) is final.
+  Explicit rules apply even with the mode off.
+- `TOOL_APPROVAL_TAINT` (default `1`): after a turn reads a web page, an MCP
+  result or Office 365 content, its write/exec/external calls need a fresh
+  approval even where a rule said allow, because the request may have come from
+  that content (prompt injection). Applies when the mode is not off.
+- `TOOL_APPROVAL_UNATTENDED` (default `deny`): what "ask" becomes when nobody
+  can answer (scheduled tasks, `/api/tools/call`, the execute_code bridge).
+- `TOOL_APPROVAL_TIMEOUT_S` (default `120`): an unanswered prompt is a refusal.
+
+A prompt can be answered for this call (`once`), the conversation, or the tool
+(`tool`, all of the user's conversations); the last two save an override.
+`ToolRegistry.call` enforces the policy itself and fails closed. Every decision
+other than today's silent allow is appended to `tool_decisions`, which is
+append-only and survives conversation deletion. Routes:
+`GET /api/approvals/pending`, `GET/POST /api/tool-policies`,
+`DELETE /api/tool-policies/{id}`, `GET /api/audit/tool-decisions` (users see
+their own rows; admins manage global and profile rules and see every row).
+
+---
+
+## OpenAI and Anthropic compatible API
+
+`/v1/models`, `/v1/chat/completions`, `/v1/responses` (stateless subset:
+`previous_response_id` is refused, send the whole conversation in `input`),
+`/v1/messages` and `/v1/messages/count_tokens` accept OpenAI and Anthropic SDK
+requests, streaming or not. Authenticate with a session token as
+`Authorization: Bearer <token>` (Anthropic clients may send it as `x-api-key`).
+Errors come back in the provider's own shape, so SDK retries work.
+
+The model name picks what runs:
+
+| Model name | Runs |
+| --- | --- |
+| `raw/<alias or repo id>` | The served model with the **client's** tools. Tool calls come back as `tool_calls` / `tool_use` blocks and nothing executes on the server. For Claude Code, Codex, Aider, Continue, OpenCode. Only a model that resolves to one served here is accepted (map a client's model name with `MODEL_ALIASES`). |
+| `agent` | This app's agent with its server-side tools, unattended (an approval prompt gets the `TOOL_APPROVAL_UNATTENDED` answer). |
+| `agent/<profile>` | The agent as that profile (id or name), capability-gated by the caller's role; non-admins only see enabled profiles. |
+| anything else, or none | `V1_DEFAULT_MODE` (`agent` by default, the original `/v1/chat/completions` behaviour). |
+
+In raw mode a backend with native tool parsing gets the tools in the request;
+any other gets them in the system prompt in the agent's JSON protocol and the
+calls are parsed back out of the text. `stop`, `temperature`, `top_p`, `seed`,
+`max_tokens`, `response_format` (best effort: an instruction plus JSON repair)
+and reasoning (`reasoning_content`, Anthropic `thinking` blocks when the
+request enables thinking) are supported. Agent mode adds `x_tools_used` and,
+with `"x_include_trace": true`, the tool calls and results as `x_trace`.
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:8000 ANTHROPIC_AUTH_TOKEN=<token> \
+  ANTHROPIC_MODEL=raw/balanced ANTHROPIC_SMALL_FAST_MODEL=raw/balanced claude
+```
+
+Coding clients send more than one model name (Claude Code also uses a small
+model for background work): point each at a `raw/` name, or map the names
+they send onto the served model with `MODEL_ALIASES` and set
+`V1_DEFAULT_MODE=raw`.
+
+### API tokens and connecting coding tools
+
+Terminal clients use personal API tokens instead of a browser session:
+`llm_<prefix>_<secret>`, stored only as a hash, shown once, redacted from logs.
+Create one with `POST /api/auth/tokens` `{"name", "scopes", "ttl_days"}`, list
+with `GET /api/auth/tokens` (admins: `?all=1`), revoke with
+`DELETE /api/auth/tokens/<id>`. A token is accepted as `Authorization: Bearer`
+or `x-api-key` (a browser cookie still wins). Scopes: `chat` (default: chat,
+conversations, `/v1`), `status` (health and metrics reads), `control` (model
+restart/select, task run/cancel; administrators only), `admin` (everything the
+user's role allows; never more than the role). Tokens expire after
+`API_TOKEN_DEFAULT_TTL_DAYS` (default 90, also the longest a request may ask
+for; 0 = never) and are revoked when their user is disabled, deleted, has a
+password reset or changes role.
+
+From a terminal, `POST /api/auth/cli/login` `{"username", "password", "name"}`
+returns a token (throttled together with the web login), and with
+`OIDC_CLI_CLIENT_ID` set (an Entra app with public client flows enabled)
+`POST /api/auth/device/start` then `/api/auth/device/poll` `{"device_code"}`
+signs in with Microsoft by device code.
+
+`deploy.py wire <client>` prints the settings for `claude-code`, `aider`,
+`codex`, `continue`, `opencode`, `hermes` or `generic`; `--write` merges them
+into the client's own config file (timestamped `.bak-` backup first, unrelated
+keys kept, token-bearing files 0600). The token comes from `--token`,
+`--login`, `--device` or `$LLM_API_TOKEN`; `--url` defaults to
+`$LLM_BASE_URL` or `http://127.0.0.1:$WEB_PORT`, `--model` to the server's
+first `raw/` model.
+
+```bash
+python deploy.py wire claude-code --url https://llm.example.com --login --write
+python deploy.py wire codex --token "$LLM_API_TOKEN" --print
+```
+
+Hermes Agent gets environment-variable instructions only: its config file
+format could not be confirmed offline, so `--write` refuses for it. The UI can
+show the same text from `GET /api/integrations/snippets?client=<client>` (the
+token is always a placeholder there).
 
 ---
 
@@ -1105,6 +1383,148 @@ Then set `AUTH_ENABLED=1`, `AUTH_COOKIE_SECURE=1`,
   their sessions), rotating `NODE_TOKEN`, or removing the tunnel/Access policy.
 
 ---
+
+## Multi-Mac cluster (N nodes, pairing, layer sharding)
+
+### More than one peer
+
+`CLUSTER_NODES` lists every peer the primary may route to, as a JSON list or
+comma-separated URLs (restart-only):
+
+```bash
+CLUSTER_NODES='[{"name": "studio", "url": "https://studio.tail1234.ts.net", "ram_gb": 128},
+                "https://mini-2.local:8000"]'
+```
+
+`STUDIO_NODE_URL` still works and is merged in as the node `mac-studio`. A
+peer's capabilities come from its RAM: the configured `ram_gb`, then the RAM
+the peer reports in its heartbeat (`large_model`, `high_memory` and
+`reasoning` from 32 GB up). A `STUDIO_NODE_URL` peer keeps the high-memory capabilities it always had
+until it reports otherwise.
+
+The heartbeat (`/api/node/health`, protocol 2, header `X-Node-Protocol: 2`)
+reports `ram_gb`, `free_ram_gb`, `machine`, `cores`, `load_ratio`, `backend`,
+`model`, `queue` and `shard_capable`. A peer whose status is unknown or
+`error: ...` is now DEGRADED (it used to count as healthy). `ROUTE_QUEUE_DEPTH`
+marks a node overloaded once that many requests wait in its admission queue,
+and a peer with no successful heartbeat for `HEARTBEAT_TIMEOUT` seconds is
+skipped. `deploy.py cluster status` probes every node from the command line.
+
+A peer's `/api/node/generate` waits in that peer's own admission queue (503
+with `Retry-After` when it is full), forwards reasoning and the real
+`finish_reason`, and reports a failure as an error frame (stream) or a 502
+(non-stream) instead of answer text. The primary fails over to the next node
+when a peer fails before its first token. Older peers keep working with a
+newer primary.
+
+The first release with a second node configured crashed every generation
+(`ClusterRouter` lacked `begin`/`end`); that is fixed and covered by an
+in-process two-node test (`tests/test_cluster_nodes.py`).
+
+### Pairing a node
+
+Instead of copying a shared secret by hand:
+
+1. On the primary, as an admin: `POST /api/cluster/pairing` returns
+   `{code, expires_at}`. The code is single use, stored only as a hash, and
+   expires (10 minutes by default, `ttl_s` up to an hour).
+2. On the new node:
+   `python deploy.py cluster join https://primary.example --code ABCDE-FGHJK --url https://this-node.example --env-file .env`
+   The primary answers with a token for that node; `--env-file` writes it into
+   `NODE_TOKEN` (comma-separated, so an existing token keeps working).
+3. Restart the node, then the primary. Paired nodes live in
+   `DATA_DIR/cluster_nodes.json` (mode 0600) and are read at startup only when
+   `CLUSTER_NODES` is unset. `GET /api/cluster/paired` lists them and
+   `DELETE /api/cluster/paired/<name>` removes one.
+
+`POST /api/cluster/join` needs no login (the code is the credential), so failed
+attempts are rate limited per client and in total.
+
+### Layer sharding (`MODEL_BACKEND=mlx-distributed`)
+
+Routing sends a request to one machine that holds the whole model. To serve a
+model no single Mac can hold, `mlx-distributed` runs `mlx_lm.server --pipeline`
+on every host of an mlx hostfile through `mlx.launch`, with this machine as
+rank 0 serving HTTP on `127.0.0.1:MODEL_PORT`.
+
+```bash
+python deploy.py cluster plan --model mlx-community/SomeLarge-4bit --host mini=40 --host studio=90
+python deploy.py cluster hostfile --host 127.0.0.1=192.168.1.10@64 --host studio.local=192.168.1.11@128
+MODEL_BACKEND=mlx-distributed python deploy.py
+```
+
+What the installed mlx-lm (0.32) does, and therefore what this app assumes:
+
+- The split is even: each rank gets `layers // hosts` layers, the low ranks one
+  extra, and rank 0 holds the last layers. Every rank also keeps the
+  embeddings, final norm and head. `cluster plan` reads the exact per-layer
+  sizes from the safetensors headers, adds KV headroom for `--context` tokens
+  and a reserve, and refuses (exit code 1) when any host's free memory falls
+  short, when the model class has no pipeline support, or when the checkpoint
+  lacks `model.safetensors.index.json`.
+- Every host needs passwordless SSH from the primary, the same Python path
+  (`CLUSTER_PYTHON` overrides it), mlx-lm and the model files. The ring backend
+  connects by IP, so each hostfile entry needs one.
+- mlx-lm refuses adapters and draft models in distributed mode. The feedback
+  LoRA is therefore either not served (base weights only) or fused first:
+  `python -m mlx_lm.fuse --model <base> --adapter-path adapters --save-path fused`,
+  then `MODEL_ID=fused` on every host.
+
+**Not verified here:** this was built on one Mac. The planner, hostfile writer,
+launch command and backend wiring are tested offline against the installed
+mlx sources; no multi-host launch or sharded generation has been run.
+
+## Remote access and node security
+
+### Publishing the app
+
+`deploy.py remote` prints the exact commands for each option and runs them
+only with `--apply`:
+
+```bash
+python deploy.py remote status       # bind, proxies, node security, installed tools
+python deploy.py remote tailscale    # Tailscale Serve: your tailnet only
+python deploy.py remote funnel       # Tailscale Funnel: the public internet
+python deploy.py remote cloudflare --hostname llm.example.com
+python deploy.py remote gen-key      # fresh NODE_TOKEN and NODE_E2E_KEY
+```
+
+Each prints the `.env` lines to set and notes on the identity layer: Tailscale
+Serve identity headers are not treated as a login, Funnel requests carry no
+identity at all, and Cloudflare Access in front of the tunnel stops strangers
+before the login page. The app's own login stays on in every case.
+
+The app binds `127.0.0.1` by default. `--host` / `WEB_HOST` with any other
+address is refused unless `AUTH_ENABLED=1`, and warns unless
+`AUTH_COOKIE_SECURE=1`. Behind a proxy or tunnel set:
+
+- `TRUSTED_PROXIES`: proxy IPs or CIDRs (for Tailscale and cloudflared,
+  `127.0.0.1,::1`). Only then is `X-Forwarded-For` read, walked from the right,
+  so the login throttle and the join limiter key on the real client instead
+  of treating every user as the proxy.
+- `PUBLIC_BASE_URL`: the origin browsers use. The Entra ID redirect URI is
+  derived from it unless `OIDC_REDIRECT_URI` is set.
+
+### Traffic between nodes
+
+- **Tokens:** `NODE_TOKEN` accepts a comma list, so rotation has no gap: add
+  the new token on every receiver, switch the senders (the first entry is
+  sent), then drop the old one.
+- **TLS:** every peer client verifies HTTPS. `NODE_CA_FILE` replaces the public
+  roots with your own CA; `NODE_CLIENT_CERT` and `NODE_CLIENT_KEY` add a client
+  certificate for mutual TLS. A missing file is an error, never a silent
+  fallback.
+- **Plain HTTP:** `http://` is allowed only to loopback, private (RFC 1918,
+  `.local`, `.lan`) and tailnet (`100.64.0.0/10`, `*.ts.net`) peers. Anything
+  else is refused unless `NODE_ALLOW_PLAINTEXT=1`.
+- **End-to-end sealing (optional):** with the same `NODE_E2E_KEY` on every node,
+  each request body and every response frame (each SSE event separately) is
+  sealed with ChaCha20-Poly1305 under a random nonce. Request AAD binds method,
+  path, timestamp and nonce; requests more than 60 s off the receiver's clock or
+  seen before are refused. This needs the optional `cryptography` package
+  (`pip install cryptography`, not installed by default). With the key set and
+  the package missing, node traffic is refused with a clear error; it is never
+  sent unsealed. A node with the key also refuses unsealed requests.
 
 ## Search provider
 

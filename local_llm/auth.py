@@ -43,6 +43,9 @@ from .core import *  # noqa: F401,F403
 from .obslog import *  # noqa: F401,F403
 from .config import *  # noqa: F401,F403
 from .database import *  # noqa: F401,F403
+# Personal API tokens: resolve_token falls back to them, require_user gates
+# them by scope (api_tokens.py owns the table and the route table).
+from .api_tokens import *  # noqa: F401,F403
 
 # FastAPI is a hard dependency of the server, but keep the module importable
 # (for --selftest on a bare machine) if it is not installed yet.
@@ -118,6 +121,11 @@ class Auth:
         self._oidc_lock = threading.Lock()
         self._oidc_discovery: dict | None = None
         self._oidc_discovery_at = 0.0
+        # Device-code sign-ins this server started, keyed by SHA-256 of the
+        # device code: {"expires", "interval", "next_poll", "ip"}. Only codes in
+        # here are ever forwarded to Entra, so /api/auth/device/poll cannot be
+        # used to redeem a device code some other client obtained.
+        self._device_pending: dict[str, dict] = {}
 
     # ---- basic properties ------------------------------------------------- #
     @property
@@ -213,11 +221,16 @@ class Auth:
         return token
 
     def resolve_token(self, token: str | None) -> dict | None:
+        """The user a session or API token acts as, or None.
+
+        Sessions first (the browser's cookie and every existing client), then
+        personal API tokens, whose user dict carries ``token_scopes``.
+        """
         if not token:
             return None
         row = self.db.get_session(self._hash_token(token))
         if not row:
-            return None
+            return resolve_api_token(self.db, token)
         # Expiry check (ISO strings compare lexicographically in UTC).
         if row.get("expires_at") and str(row["expires_at"]) < iso(utc_now()):
             self.db.delete_session(row["token_hash"])
@@ -230,6 +243,8 @@ class Auth:
     def logout(self, token: str | None) -> None:
         if token:
             self.db.delete_session(self._hash_token(token))
+            # A terminal "logout" sends its API token: retire it for good.
+            revoke_api_token_value(self.db, token, reason="logout")
 
     def set_cookie(self, response: Any, token: str) -> None:
         response.set_cookie(
@@ -255,6 +270,13 @@ class Auth:
 
     # ---- request -> user -------------------------------------------------- #
     def _token_from_request(self, request: Any) -> str | None:
+        """The credential a request carries: cookie, Bearer, then x-api-key.
+
+        The cookie wins so a browser that also sends an Authorization header (an
+        extension, a proxy) stays the signed-in user. ``x-api-key`` is what the
+        Anthropic SDK and Claude Code with ANTHROPIC_API_KEY send; only an API
+        token is taken from it (ANTHROPIC_AUTH_TOKEN arrives as Bearer).
+        """
         try:
             cookie = request.cookies.get(self.config.auth_cookie_name)
         except Exception:
@@ -267,6 +289,12 @@ class Auth:
             authz = ""
         if authz.lower().startswith("bearer "):
             return authz[7:].strip()
+        try:
+            api_key = (request.headers.get("x-api-key") or "").strip()
+        except Exception:
+            api_key = ""
+        if api_key and looks_like_api_token(api_key):
+            return api_key
         return None
 
     def user_for_request(self, request: Any) -> dict | None:
@@ -280,6 +308,23 @@ class Auth:
         user = self.user_for_request(request)
         if not user:
             raise HTTPException(status_code=401, detail="authentication required")
+        # An API token reaches only the routes its scopes cover (api_tokens.py
+        # route table); the route's own role check still applies afterwards.
+        scopes = user.get("token_scopes")
+        if scopes is not None:
+            method = str(getattr(request, "method", "GET") or "GET")
+            try:
+                path = request.scope.get("path") or request.url.path
+            except Exception:
+                path = ""
+            if not token_allows_route(scopes, method, path):
+                log_event(_auth_log, 30, "auth.token_scope_denied", route=path,
+                          method=method, user_id=user["id"],
+                          token_id=user.get("token_id"), scopes=",".join(scopes))
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"this API token's scopes ({', '.join(scopes)}) do not "
+                           f"allow {method} {path}")
         # Bind identity for structured logging AND for request-scoped data
         # isolation (RAG retrieval, memory tools read the acting user).
         bind_context(user_id=user["id"], username=user.get("username"),
@@ -297,18 +342,60 @@ class Auth:
             raise HTTPException(status_code=403, detail="administrator access required")
         return user
 
+    def require_scope(self, *scopes: str):
+        """Dependency factory: `Depends(auth.require_scope("chat"))`.
+
+        Passes when the caller holds ANY of `scopes` (admin implies all,
+        control implies status). Sessions and auth-off callers hold every
+        scope. "control" alone also needs the admin role, whatever the
+        credential, because it is the scope for administrator levers.
+        """
+        wanted = tuple(str(s).strip().lower() for s in scopes if str(s).strip()) \
+            or DEFAULT_API_TOKEN_SCOPES
+        unknown = [s for s in wanted if s not in API_TOKEN_SCOPES]
+        if unknown:
+            raise ValueError(f"unknown scope(s): {', '.join(unknown)}")
+
+        async def _scope_dependency(request: Request) -> dict:
+            user = await self.require_user(request)
+            held = user.get("token_scopes")
+            satisfied = set(wanted) if held is None else set(wanted) & effective_scopes(held)
+            if not satisfied:
+                log_event(_auth_log, 30, "auth.token_scope_denied",
+                          route=str(getattr(request, "url", "")), user_id=user["id"],
+                          token_id=user.get("token_id"), scopes=",".join(held or []))
+                raise HTTPException(
+                    status_code=403,
+                    detail="this API token lacks the " + " or ".join(wanted) + " scope")
+            if satisfied == {"control"} and user.get("role") != "admin":
+                raise HTTPException(status_code=403, detail="administrator access required")
+            return user
+
+        return _scope_dependency
+
     # ---- inter-node token ------------------------------------------------- #
     def check_node_token(self, request: Any) -> bool:
-        """True if the request carries the shared inter-node bearer token."""
-        expected = self.config.node_token
-        if not expected:
+        """True if the request carries an accepted inter-node bearer token.
+
+        NODE_TOKEN may be a comma list so a token can be rotated with no window
+        where the peers disagree: accept new,old; switch the sender; drop old.
+        Every candidate is compared (no early exit) so timing does not reveal
+        which entry matched.
+        """
+        accepted = [t.strip() for t in str(self.config.node_token or "").split(",") if t.strip()]
+        if not accepted:
             return False
         try:
             authz = request.headers.get("authorization") or ""
         except Exception:
             return False
         supplied = authz[7:].strip() if authz.lower().startswith("bearer ") else ""
-        return bool(supplied) and hmac.compare_digest(supplied, expected)
+        if not supplied:
+            return False
+        matched = False
+        for expected in accepted:
+            matched = hmac.compare_digest(supplied.encode(), expected.encode()) or matched
+        return matched
 
     # ---- OIDC / Entra ID -------------------------------------------------- #
     @property
@@ -389,14 +476,18 @@ class Auth:
         claims = self._verify_id_token(id_token, nonce, disc)
         return self.oidc_upsert_user(claims)
 
-    def _verify_id_token(self, id_token: str, nonce: str, disc: dict) -> dict:
+    def _verify_id_token(self, id_token: str, nonce: str, disc: dict,
+                         audience: str | None = None) -> dict:
+        """Validate an ID token. `audience` defaults to the web client; the
+        device flow passes its public CLI client (the token is minted for it)."""
+        audience = audience or self.config.oidc_client_id
         parts = id_token.split(".")
         if len(parts) != 3:
             raise ValueError("malformed id_token")
         claims = _b64url_json(parts[1])
         # Audience must be this client.
         aud = claims.get("aud")
-        if aud != self.config.oidc_client_id and self.config.oidc_client_id not in (
+        if aud != audience and audience not in (
                 aud if isinstance(aud, list) else [aud]):
             raise ValueError("id_token audience mismatch")
         # Issuer must match discovery.
@@ -411,10 +502,11 @@ class Auth:
         if nonce and claims.get("nonce") != nonce:
             raise ValueError("id_token nonce missing or mismatched")
         # Optional signature verification if cryptography is available.
-        self._maybe_verify_signature(id_token, disc)
+        self._maybe_verify_signature(id_token, disc, audience)
         return claims
 
-    def _maybe_verify_signature(self, id_token: str, disc: dict) -> None:
+    def _maybe_verify_signature(self, id_token: str, disc: dict,
+                                audience: str | None = None) -> None:
         """Best-effort JWKS signature check; skipped if libraries absent.
 
         The token was fetched directly from the TLS-protected token endpoint of a
@@ -432,7 +524,8 @@ class Auth:
                 return
             signing_key = PyJWKClient(jwks_uri).get_signing_key_from_jwt(id_token)
             jwt.decode(id_token, signing_key.key,
-                       algorithms=["RS256"], audience=self.config.oidc_client_id,
+                       algorithms=["RS256"],
+                       audience=audience or self.config.oidc_client_id,
                        options={"verify_exp": True})
         except Exception as exc:
             raise ValueError(f"id_token signature verification failed: {exc}")
@@ -472,9 +565,14 @@ class Auth:
         role = self.role_for_oidc(claims)
         existing = self.db.get_user_by_oidc(subject)
         if existing:
-            # Refresh role/profile from the IdP each login (IdP is source of truth).
+            # Refresh role/profile from the IdP each login (IdP is source of
+            # truth for those). Not `disabled`: it used to be reset to 0 here,
+            # so an account an admin disabled locally came back on the user's
+            # next Microsoft sign-in (web or the terminal device flow, which
+            # mints a long-lived API token). Entra blocks its own disabled
+            # users before a token is ever issued.
             self.db.update_user(existing["id"], role=role, email=email,
-                                display_name=name, disabled=0)
+                                display_name=name)
             return self.db.get_user(existing["id"]) or existing
         username = (email or f"entra-{subject[:8]}")
         # Avoid a username collision with a local account.
@@ -484,6 +582,137 @@ class Auth:
                                    source="oidc", email=email, display_name=name,
                                    oidc_subject=subject)
 
+    # ---- OIDC device code (terminal sign-in) ------------------------------ #
+    @property
+    def device_flow_enabled(self) -> bool:
+        """Entra sign-in from a terminal: needs auth, Entra, and a PUBLIC client.
+
+        The web app registration is a confidential client (it holds a secret);
+        Entra only issues device codes to an app with public client flows on,
+        hence the separate OIDC_CLI_CLIENT_ID.
+        """
+        return bool(self.enabled and self.config.oidc_enabled
+                    and self.config.oidc_cli_client_id
+                    and (self.config.oidc_tenant_id or self.config.oidc_authority))
+
+    _DEVICE_MAX_PENDING = 200
+    _DEVICE_MAX_PER_IP = 5
+
+    def _device_sweep(self, now: float) -> None:
+        for key in [k for k, v in self._device_pending.items() if v["expires"] <= now]:
+            self._device_pending.pop(key, None)
+
+    def oidc_device_start(self, client_ip: str = "?") -> dict:
+        """Ask Entra for a device code. Returns what the terminal shows/polls.
+
+        Raises OverflowError when too many sign-ins are pending (the endpoint
+        is unauthenticated, so the table must be bounded), ValueError when
+        Entra refuses.
+        """
+        now = time.time()
+        with self._oidc_lock:
+            self._device_sweep(now)
+            mine = sum(1 for v in self._device_pending.values() if v.get("ip") == client_ip)
+            if (len(self._device_pending) >= self._DEVICE_MAX_PENDING
+                    or mine >= self._DEVICE_MAX_PER_IP):
+                raise OverflowError("too many pending sign-ins; finish or wait for one "
+                                    "to expire")
+        disc = self.oidc_discovery()
+        endpoint = disc.get("device_authorization_endpoint") or (
+            str(disc.get("token_endpoint", "")).rsplit("/token", 1)[0] + "/devicecode")
+        import httpx
+        with httpx.Client(timeout=15) as client:
+            resp = client.post(endpoint, data={
+                "client_id": self.config.oidc_cli_client_id,
+                "scope": self.config.oidc_scopes or "openid profile email",
+            })
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = {}
+        if resp.status_code != 200 or not payload.get("device_code"):
+            detail = str(payload.get("error_description") or payload.get("error") or "")[:200]
+            raise ValueError(f"device code request failed ({resp.status_code}) {detail}".strip())
+        expires_in = max(30, min(3600, int(payload.get("expires_in") or 900)))
+        interval = max(1, min(60, int(payload.get("interval") or 5)))
+        with self._oidc_lock:
+            self._device_pending[self._hash_token(payload["device_code"])] = {
+                "expires": now + expires_in, "interval": interval,
+                "next_poll": now + interval, "ip": client_ip}
+        log_event(_auth_log, 20, "auth.device_start", client=client_ip, expires_in=expires_in)
+        return {
+            "device_code": payload["device_code"],
+            "user_code": payload.get("user_code"),
+            "verification_uri": (payload.get("verification_uri")
+                                 or payload.get("verification_url")),
+            "expires_in": expires_in,
+            "interval": interval,
+            "message": payload.get("message"),
+        }
+
+    def oidc_device_poll(self, device_code: str) -> dict:
+        """One poll of a pending device sign-in.
+
+        Returns {"status": "pending"|"slow_down"|"denied"|"expired"} or
+        {"status": "ok", "user": <user row>} once Entra has issued an ID token,
+        which is verified exactly like the web flow's (audience = the CLI
+        client; no nonce, since the device grant has none and the token comes
+        straight from the token endpoint to this server).
+        """
+        key = self._hash_token(device_code)
+        now = time.time()
+        with self._oidc_lock:
+            self._device_sweep(now)
+            entry = self._device_pending.get(key)
+            if entry is None:
+                return {"status": "expired"}
+            if now < entry["next_poll"] - 0.5:
+                # Polling faster than agreed: RFC 8628 says back off by 5 s.
+                entry["interval"] = min(60, entry["interval"] + 5)
+                entry["next_poll"] = now + entry["interval"]
+                return {"status": "slow_down", "interval": entry["interval"]}
+            entry["next_poll"] = now + entry["interval"]
+            interval = entry["interval"]
+        disc = self.oidc_discovery()
+        import httpx
+        with httpx.Client(timeout=15) as client:
+            resp = client.post(disc["token_endpoint"], data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "client_id": self.config.oidc_cli_client_id,
+                "device_code": device_code,
+            })
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = {}
+        if resp.status_code == 200:
+            with self._oidc_lock:
+                self._device_pending.pop(key, None)
+            id_token = payload.get("id_token")
+            if not id_token:
+                raise ValueError("no id_token in token response (is 'openid' in OIDC_SCOPES?)")
+            claims = self._verify_id_token(id_token, "", disc,
+                                           audience=self.config.oidc_cli_client_id)
+            return {"status": "ok", "user": self.oidc_upsert_user(claims)}
+        error = str(payload.get("error") or "")
+        if error == "authorization_pending":
+            return {"status": "pending", "interval": interval}
+        if error == "slow_down":
+            with self._oidc_lock:
+                if key in self._device_pending:
+                    entry = self._device_pending[key]
+                    entry["interval"] = min(60, entry["interval"] + 5)
+                    entry["next_poll"] = time.time() + entry["interval"]
+                    interval = entry["interval"]
+            return {"status": "slow_down", "interval": interval}
+        with self._oidc_lock:
+            self._device_pending.pop(key, None)
+        if error in ("authorization_declined", "access_denied"):
+            return {"status": "denied"}
+        if error in ("expired_token", "bad_verification_code", "invalid_grant", "code_expired"):
+            return {"status": "expired"}
+        raise ValueError(f"device sign-in failed ({resp.status_code}) {error[:80]}".strip())
+
 
 def public_auth_config(config: Config, auth: "Auth") -> dict:
     """Non-secret auth facts the login page needs to render itself."""
@@ -492,6 +721,10 @@ def public_auth_config(config: Config, auth: "Auth") -> dict:
         "oidc_enabled": bool(auth.oidc_enabled),
         "allow_test_user": bool(config.allow_test_user),
         "app_name": APP_NAME,
+        # Terminal clients (deploy.py wire/login) read these to pick a flow.
+        "api_tokens": bool(config.auth_enabled),
+        "cli_login": bool(config.auth_enabled),
+        "device_flow": bool(auth.device_flow_enabled),
     }
 
 

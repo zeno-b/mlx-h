@@ -65,15 +65,42 @@ def _detect_total_ram_gb() -> float:
         return 8.0
 
 
-def _default_model_for_ram(ram_gb: float) -> str:
+def _ram_recommendation(ram_gb: float, path: Path | None = None) -> dict:
+    """The applied benchmark recommendation for a machine of this size, or {}.
+
+    `deploy.py recommend --apply` (catalog.write_recommendation) writes
+    DATA_DIR/recommendation.json stamped with the RAM it was measured on. A
+    file from a machine of a different size is ignored, so a copied data
+    directory cannot pin a 32B onto an 8GB Mac, and asking "what is the
+    default for 64GB?" on this machine still gets the tier answer. No file
+    means the tiers below, exactly as before the benchmark existed.
+    """
+    import json
+    target = path if path is not None else DATA_DIR / "recommendation.json"
+    try:
+        data = json.loads(Path(target).read_text(encoding="utf-8"))
+        measured = float(data.get("ram_gb") or 0)
+    except Exception:
+        return {}
+    if not isinstance(data, dict) or abs(measured - float(ram_gb)) >= 1.0:
+        return {}
+    return data
+
+
+def _default_model_for_ram(ram_gb: float, recommendation: Path | None = None) -> str:
     """Pick a coding model that fits comfortably alongside the KV cache, the web
     process and headroom for training, given the machine's RAM.
 
     The thresholds are deliberately conservative because unified memory is shared
     with the OS and the GPU wired limit. Bigger machines get a bigger, stronger
     model; 8GB Macs stay on the 3B that has carried this setup. Override any of
-    this with MODEL_ID.
+    this with MODEL_ID. A measured recommendation for this machine (see
+    _ram_recommendation) replaces the tier guess, and only when MODEL_ID is unset.
     """
+    if not os.environ.get("MODEL_ID"):
+        picked = str(_ram_recommendation(ram_gb, recommendation).get("model_id") or "").strip()
+        if picked:
+            return picked
     if ram_gb >= 48:
         return "mlx-community/Qwen2.5-Coder-32B-Instruct-4bit"   # ~18GB
     if ram_gb >= 24:
@@ -83,7 +110,7 @@ def _default_model_for_ram(ram_gb: float) -> str:
     return "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit"        # ~1.9GB
 
 
-def _default_context_for_ram(ram_gb: float) -> int:
+def _default_context_for_ram(ram_gb: float, recommendation: Path | None = None) -> int:
     """Pick a context window sized to the machine.
 
     Context sits in the KV cache, which shares unified memory with the model
@@ -93,7 +120,20 @@ def _default_context_for_ram(ram_gb: float) -> int:
     machines get proportionally more so they chunk less and keep more history.
     The chunking thresholds derive from this value, so making context RAM-aware
     makes chunk sizing RAM-aware too. Override with CONTEXT_SIZE.
+
+    A measured recommendation's context applies only while CONTEXT_SIZE is
+    unset AND the model is the recommended one: a window sized for a 3B is
+    not a safe default for whatever MODEL_ID names instead.
     """
+    if not os.environ.get("CONTEXT_SIZE"):
+        rec = _ram_recommendation(ram_gb, recommendation)
+        env_model = os.environ.get("MODEL_ID", "").strip()
+        try:
+            rec_ctx = int(rec.get("context_size") or 0)
+        except (TypeError, ValueError):
+            rec_ctx = 0
+        if 512 <= rec_ctx <= 131072 and (not env_model or env_model == rec.get("model_id")):
+            return rec_ctx
     if ram_gb >= 48:
         return 32768
     if ram_gb >= 24:
@@ -279,7 +319,7 @@ LOGIN_WINDOW_S = float(os.environ.get("LOGIN_WINDOW_S", "300"))
 
 # Bump when HTML_PAGE changes. Shown in the header and returned by /api/health so
 # a stale browser cache is immediately visible rather than silently misleading.
-UI_BUILD = "2026-09-07.texcel"
+UI_BUILD = "2026-10-17.settings"
 # Branding. Set APP_NAME to change the title shown in the header and browser tab.
 # Set APP_LOGO to a URL or a local path (rendered as an image) or to an emoji or
 # short text (rendered as-is). Both are safe to leave unset.
@@ -431,16 +471,67 @@ def iso(moment: datetime | None) -> str | None:
     return moment.isoformat() if moment else None
 
 
-def estimate_tokens(text: str) -> int:
-    """Approximate token count without loading a tokenizer."""
+# What one image costs in the prompt. A vision model's projector turns an image
+# into a fixed block of tokens (576 is the LLaVA-style 24x24 grid; Qwen-VL and
+# Gemma are in the same range at default resolution). Counting the base64 data
+# URL by characters instead made one screenshot "cost" 100k tokens and trimmed
+# the whole history away.
+IMAGE_TOKEN_ESTIMATE = 576
+_CT_IMAGE_PARTS = ("image_url", "image", "input_image")
+
+
+def _ct_content_text(content: Any) -> str:
+    """The text of an OpenAI content value (a string or a list of parts)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        content = [content]
+    if isinstance(content, list):
+        out = []
+        for part in content:
+            if isinstance(part, str):
+                out.append(part)
+            elif isinstance(part, dict) and part.get("type", "text") not in _CT_IMAGE_PARTS:
+                value = part.get("text")
+                if value is None:
+                    value = part.get("content")
+                if isinstance(value, str):
+                    out.append(value)
+        return "\n".join(out)
+    return str(content)
+
+
+def estimate_tokens(text: Any) -> int:
+    """Approximate token count without loading a tokenizer.
+
+    Also accepts a message's content as a list of parts (text and images),
+    which used to be measured by the length of the list (2 parts = 0 tokens).
+    """
     if not text:
         return 0
+    if not isinstance(text, str):
+        parts = text if isinstance(text, list) else [text]
+        images = sum(1 for p in parts
+                     if isinstance(p, dict) and p.get("type") in _CT_IMAGE_PARTS)
+        body = _ct_content_text(text)
+        return images * IMAGE_TOKEN_ESTIMATE + (
+            max(1, len(body) // CHARS_PER_TOKEN) if body else 0)
     return max(1, len(text) // CHARS_PER_TOKEN)
 
 
 def messages_tokens(messages: list[dict]) -> int:
-    # Four tokens per message covers the chat template role markers.
-    return sum(estimate_tokens(m.get("content", "")) + 4 for m in messages)
+    # Four tokens per message covers the chat template role markers. Native
+    # tool_calls on an assistant message are prompt text too once the
+    # template renders them.
+    total = 0
+    for m in messages:
+        total += estimate_tokens(m.get("content", "")) + 4
+        calls = m.get("tool_calls")
+        if calls:
+            total += estimate_tokens(repr(calls))
+    return total
 
 
 def trim_to_context(
@@ -483,7 +574,16 @@ def trim_to_context(
         for message in reversed(history[-2:]):
             if room <= 96:                      # not enough left to say anything
                 break
-            text = str(message.get("content") or "")
+            content = message.get("content")
+            if isinstance(content, list) and messages_tokens([{"content": content}]) <= room:
+                # A multimodal turn that fits whole is kept whole (images too).
+                candidate = {"role": message.get("role", "user"), "content": content}
+                recovered.insert(0, candidate)
+                room -= messages_tokens([candidate])
+                continue
+            # A list that does not fit is shortened to its text: half an
+            # image is not a thing, and str(list) was a Python repr.
+            text = _ct_content_text(content) if isinstance(content, list) else str(content or "")
             # ~4 characters per token, minus a little for the marker itself.
             allowed_chars = max(0, (room - 32) * 4)
             if len(text) > allowed_chars:
@@ -589,6 +689,9 @@ __all__ = [
     'APP_NAME',
     'BOOTSTRAP_MARKER',
     'CHARS_PER_TOKEN',
+    'IMAGE_TOKEN_ESTIMATE',
+    '_CT_IMAGE_PARTS',
+    '_ct_content_text',
     'CONTEXT_SAFETY_MARGIN',
     'LOGIN_MAX_FAILURES',
     'LOGIN_WINDOW_S',

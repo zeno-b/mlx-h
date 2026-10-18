@@ -1,15 +1,23 @@
 """The ReAct-style agent loop: routing, tools, memory, verification.
 
-Split out of the original single-file deploy.py; behaviour is unchanged.
+Split out of the original single-file deploy.py. Wave 3 added four things on
+top of the loop without changing its lanes: every tool dispatch goes through
+one `_dispatch` generator (so a human-approval policy has a single place to
+sit), a turn can be interrupted through the per-turn context, every streaming
+lane splits <think> reasoning out of the answer the same way, and tool calls
+are detected while they stream instead of being shown as JSON first.
 """
 
 from __future__ import annotations
 
 import asyncio
+import importlib
+import inspect
 import json
 import logging
 import re
 import time
+import uuid
 from dataclasses import replace as dataclass_replace
 from pathlib import Path
 from typing import Any, AsyncGenerator
@@ -24,6 +32,199 @@ from .model_client import *  # noqa: F401,F403
 from .textutil import *  # noqa: F401,F403
 from .codecheck import check_code, findings_note
 from .taskstate import *  # noqa: F401,F403
+from .toolparse import *  # noqa: F401,F403
+from .turnctx import *  # noqa: F401,F403
+
+
+# --------------------------------------------------------------------------- #
+# Wave 3 plumbing: policy lookup, dispatch outcomes, streamed lanes.
+# --------------------------------------------------------------------------- #
+def _ag_field(obj: Any, key: str, default: Any = None) -> Any:
+    """Read `key` from a dataclass-like object or a dict, whichever it is.
+
+    The policy module is written by another feature and returns small records
+    (Decision, Resolution). Reading them through this keeps the agent working
+    whether they arrive as dataclasses, namedtuples or plain dicts.
+    """
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _ag_policy() -> Any:
+    """The approval-policy module (decide, BROKER), or None when absent.
+
+    Looked up at call time rather than imported at the top, the same way
+    backends.py finds the catalogue: the policy is another feature's module,
+    in the bundled build its names are globals, and on a build without it the
+    agent must keep today's behaviour (every call allowed) instead of failing
+    to import. Tests replace this function to inject a fake policy.
+    """
+    if __package__:
+        try:
+            return importlib.import_module(f"{__package__}.policy")
+        except Exception:  # noqa: BLE001 - a missing policy means "allow"
+            return None
+    namespace = globals()
+    if callable(namespace.get("decide")) and namespace.get("BROKER") is not None:
+        class _Bundled:
+            decide = staticmethod(namespace["decide"])
+            BROKER = namespace["BROKER"]
+            unattended_decision = namespace.get("unattended_decision")
+        return _Bundled
+    return None
+
+
+def _ag_lookup(module: str, name: str) -> Any:
+    """A name from another feature's module, or None when it is not there."""
+    if __package__:
+        try:
+            return getattr(importlib.import_module(f"{__package__}.{module}"), name, None)
+        except Exception:  # noqa: BLE001 - optional feature
+            return None
+    return globals().get(name)
+
+
+def _ag_accepts(fn: Any, name: str) -> bool:
+    """Whether callable `fn` takes keyword `name` (or **kwargs)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(p.kind is p.VAR_KEYWORD for p in params.values())
+
+
+async def _ag_maybe_await(value: Any) -> Any:
+    """Await `value` when it is awaitable: the broker may be sync or async."""
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+
+def _ag_turn_fields() -> dict:
+    """{"turn_id": ...} for a final event when a route bound a turn, else {}.
+
+    Omitted rather than None without a turn, so callers that compare a final
+    event's keys (the CLI, scheduled tasks, older tests) see what they always
+    saw.
+    """
+    turn = current_turn()
+    return {"turn_id": turn.turn_id} if turn is not None and turn.turn_id else {}
+
+
+def _ag_join_reasoning(parts: "list[tuple[int, str]]") -> str:
+    """One reasoning text from per-step pieces, in step order, blank-line separated."""
+    return "\n\n".join(text.strip() for _step, text in parts if text and text.strip())
+
+
+def _ag_split_attachments(attachments: Any) -> tuple[list[dict], str]:
+    """(image parts, joined text) from OpenAI-shaped content parts.
+
+    Anything else (an attachment id the route did not resolve, an audio part
+    nothing transcribed) is ignored rather than sent to a model that would
+    reject the whole request over it.
+    """
+    images: list[dict] = []
+    texts: list[str] = []
+    for part in attachments or ():
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        if kind == "text" and str(part.get("text") or "").strip():
+            texts.append(str(part["text"]).strip())
+        elif kind in ("image_url", "input_image", "image"):
+            images.append(part)
+    return images, "\n\n".join(texts)
+
+
+def _ag_call_id() -> str:
+    """A fresh id for one tool call, shared by every event about that call."""
+    return "call_" + uuid.uuid4().hex[:12]
+
+
+def _ag_signature(name: str, args: Any) -> str:
+    """The dedup key of a call: name plus canonical JSON of its arguments."""
+    return f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)}"
+
+
+class _AgDispatched:
+    """What one pass through Agent._dispatch produced.
+
+    `args` are the arguments that actually ran: a human approving a call may
+    edit them, and the dedup signature, the trace and the task state must all
+    describe what happened rather than what the model first asked for.
+    """
+
+    __slots__ = ("call_id", "name", "args", "result", "error", "denied",
+                 "decided_by", "reason")
+
+    def __init__(self, call_id: str, name: str, args: dict) -> None:
+        self.call_id = call_id
+        self.name = name
+        self.args = args
+        self.result = ""
+        self.error: str | None = None
+        self.denied = False
+        self.decided_by = ""        # "user" | "policy" | "timeout" | "cancel" | ""
+        self.reason = ""
+
+    def scratch_note(self) -> str:
+        """The TOOL RESULT line a denied call leaves for the model to re-plan."""
+        return (f"TOOL RESULT [{self.name}]: {self.result}. Do not call it again "
+                "with the same arguments; find another way, or answer with what "
+                "you have.")
+
+
+# Matches a tool name in the opening of a streamed call, for the formats that
+# carry it as a JSON key or a <function=...> tag. Only accepted when the value
+# is a registered tool: {"args": {"name": "cv"}, "tool": "load_skill"} must not
+# be announced as a call to "cv".
+_AG_CALL_NAME = re.compile(
+    r'["\'](?:tool|name|tool_name|function)["\']\s*:\s*["\']([\w.\-]+)["\']'
+    r"|<function=([\w.\-]+)>")
+
+
+class _AgLane:
+    """One streamed generation, split as it arrives (Agent.stream_lane).
+
+    Holds the raw text (for the parsers, which strip reasoning themselves),
+    the visible answer, the reasoning, and the bookkeeping that maps the
+    detector's call indexes to the call ids the UI sees. Parts are kept as
+    lists and joined on demand: `str +=` on an attribute copies the whole
+    buffer per token.
+    """
+
+    def __init__(self, detector: Any = None) -> None:
+        self.detector = detector
+        self.raw: list[str] = []
+        self.answer: list[str] = []
+        self.reasoning: list[str] = []
+        self.cancelled = False
+        self.timed_out = False
+        self.stop = False                 # a complete call arrived: stop streaming
+        self.calls: dict[int, dict] = {}  # detector index -> call state
+        self.ended: list[int] = []        # indexes whose call completed, in order
+
+    @property
+    def text(self) -> str:
+        return "".join(self.raw)
+
+    @property
+    def visible(self) -> str:
+        return "".join(self.answer)
+
+    @property
+    def thinking(self) -> str:
+        return "".join(self.reasoning)
+
+    def first_call(self) -> tuple[str | None, bool]:
+        """(call id, whether tool_call_start was emitted) of the first call."""
+        if not self.ended:
+            return None, False
+        state = self.calls.get(self.ended[0]) or {}
+        return state.get("id"), bool(state.get("started"))
 
 
 # Tokens held back for conversation history when sizing the retrieval block.
@@ -92,6 +293,545 @@ class Agent:
         # test app.
         self._subagent_sem: asyncio.Semaphore | None = None
         self._subagent_loop: Any = None
+        # True on a child built by run_subagent. Its events are consumed by
+        # the parent's helper call and never reach a stream, so anything a
+        # human has to answer (an approval) also goes out through the turn's
+        # out-of-band channel, or the prompt would wait for nobody.
+        self._ag_nested = False
+
+    # --- Streaming lanes -------------------------------------------------- #
+    async def stream_lane(self, stream, lane: "_AgLane", *, step: int,
+                          cancel: "asyncio.Event | None" = None,
+                          token_type: str = "token", think_type: str = "think_token",
+                          deadline: float | None = None, stats: Any = None,
+                          known: "set[str] | None" = None):
+        """Stream one generation, splitting reasoning, answer and tool calls.
+
+        Every lane that streams model text comes through here. Only the main
+        loop used to split <think>, so the continuation, chunk-reduce and
+        reasoning-synthesis lanes streamed a reasoning model's whole thinking
+        phase into the answer bubble, and the final event then rewrote the
+        bubble without it. Think pieces become `think_type` events and are kept
+        on the lane for final.reasoning; answer pieces become `token_type`
+        events, unless the lane carries a ToolCallStreamDetector, in which case
+        call text becomes tool_call_start / tool_call_delta and never shows as
+        answer text (the JSON used to flash in the bubble and be retracted). A
+        completed call stops the stream, since the loop only acts on the first
+        call; that replaces a re-parse of the whole buffer after every token,
+        which was quadratic on a long create_document.
+
+        Exceptions from the model stream propagate: the caller owns retries
+        and closing the stream. Cancellation and the deadline are reported on
+        the lane (cancelled / timed_out) because every lane words them its
+        own way.
+        """
+        splitter = ThinkSplitter()
+        started = time.time()
+        async for token in stream:
+            if cancel is not None and cancel.is_set():
+                lane.cancelled = True
+                break
+            if not token:
+                continue
+            lane.raw.append(token)
+            for event in self._ag_pieces(splitter.feed(token), lane, step,
+                                         token_type, think_type, known):
+                yield event
+            if lane.stop:
+                break
+            if deadline is not None and time.time() - started > deadline:
+                lane.timed_out = True
+                break
+        # Release the partial-tag tail the splitter still holds: nothing
+        # arrives after the last token, so an answer ending in "a < b" would
+        # lose its last characters.
+        for event in self._ag_pieces(splitter.flush(), lane, step, token_type,
+                                     think_type, known):
+            yield event
+        if lane.detector is not None and not lane.cancelled:
+            truncated = getattr(stats, "finish_reason", "") == "length"
+            for event in self._ag_detected(lane.detector.flush(truncated=truncated),
+                                           lane, step, token_type, known):
+                yield event
+
+    def _ag_pieces(self, pieces, lane: "_AgLane", step: int, token_type: str,
+                   think_type: str, known: "set[str] | None") -> list[dict]:
+        out: list[dict] = []
+        for kind, piece in pieces:
+            if not piece:
+                continue
+            if kind == "think":
+                lane.reasoning.append(piece)
+                out.append({"type": think_type, "token": piece, "step": step})
+            elif lane.detector is None:
+                lane.answer.append(piece)
+                out.append({"type": token_type, "token": piece, "step": step})
+            else:
+                out.extend(self._ag_detected(lane.detector.feed(piece), lane, step,
+                                             token_type, known))
+        return out
+
+    @staticmethod
+    def _ag_call_state(lane: "_AgLane", index: int) -> dict:
+        return lane.calls.setdefault(index, {
+            "id": _ag_call_id(), "name": None, "held": [], "head": 0,
+            "started": False, "muted": False,
+            # final_answer is the loop's exit, not an action: its "answer"
+            # string is streamed as answer text instead of as a call card.
+            "fa": "", "fa_buf": "", "fa_esc": ""})
+
+    def _ag_name_call(self, state: dict, name: str | None, args: Any,
+                      known: "set[str] | None") -> None:
+        """Settle which tool a streamed call is for, or mute it."""
+        if not name:
+            return
+        if name != "final_answer" and known is not None:
+            repaired = self.repair_tool_call(name, args if isinstance(args, dict) else {},
+                                             known)
+            if repaired is None:
+                # Never announce a call that will not be dispatched: the loop
+                # corrects an unregistered name without running anything.
+                state["muted"] = True
+                return
+            name = repaired[0]
+        state["name"] = name
+        if name == "final_answer":
+            state["muted"] = True
+            state["fa"] = "seek"
+
+    def _ag_open_call(self, state: dict, step: int, token_type: str,
+                      lane: "_AgLane") -> list[dict]:
+        held, state["held"] = "".join(state["held"]), []
+        if state["fa"]:
+            text = self._ag_answer_feed(state, held)
+            if text:
+                lane.answer.append(text)
+                return [{"type": token_type, "token": text, "step": step}]
+            return []
+        if state["muted"]:
+            return []
+        state["started"] = True
+        out = [{"type": "tool_call_start", "id": state["id"], "name": state["name"],
+                "step": step}]
+        if held:
+            out.append({"type": "tool_call_delta", "id": state["id"], "args_delta": held,
+                        "step": step})
+        return out
+
+    @staticmethod
+    def _ag_answer_feed(state: dict, text: str) -> str:
+        """Decode the next piece of a streamed final_answer's "answer" string.
+
+        A small incremental JSON-string decoder, so a reply delivered as
+        {"tool": "final_answer", "args": {"answer": "..."}} streams its prose
+        live instead of arriving all at once when the call closes.
+        """
+        if state["fa"] == "done" or not text:
+            return ""
+        if state["fa"] == "seek":
+            state["fa_buf"] += text
+            m = re.search(r'["\']answer["\']\s*:\s*"', state["fa_buf"])
+            if not m:
+                if len(state["fa_buf"]) > 2000:
+                    state["fa"] = "done"
+                return ""
+            text, state["fa_buf"], state["fa"] = state["fa_buf"][m.end():], "", "in"
+        data, state["fa_esc"] = state["fa_esc"] + text, ""
+        out: list[str] = []
+        i = 0
+        while i < len(data):
+            c = data[i]
+            if c == '"':
+                state["fa"] = "done"
+                break
+            if c == "\\":
+                if i + 1 >= len(data) or (data[i + 1] == "u" and i + 6 > len(data)):
+                    state["fa_esc"] = data[i:]
+                    break
+                n = data[i + 1]
+                if n == "u":
+                    try:
+                        out.append(chr(int(data[i + 2:i + 6], 16)))
+                    except ValueError:
+                        pass
+                    i += 6
+                    continue
+                out.append({"n": "\n", "t": "\t", "r": "\r", "b": "\b",
+                            "f": "\f"}.get(n, n))
+                i += 2
+                continue
+            out.append(c)
+            i += 1
+        return "".join(out)
+
+    def _ag_detected(self, events, lane: "_AgLane", step: int, token_type: str,
+                     known: "set[str] | None") -> list[dict]:
+        """Translate ToolCallStreamDetector events into stream events."""
+        out: list[dict] = []
+        for ev in events:
+            kind = ev.get("type")
+            if kind == "text":
+                lane.answer.append(ev["text"])
+                out.append({"type": token_type, "token": ev["text"], "step": step})
+            elif kind == "call_start":
+                state = self._ag_call_state(lane, ev["index"])
+                if ev.get("name") and state["name"] is None:
+                    self._ag_name_call(state, ev["name"], {}, known)
+            elif kind == "args_delta":
+                state = self._ag_call_state(lane, ev["index"])
+                delta = ev.get("delta") or ""
+                if state["started"]:
+                    out.append({"type": "tool_call_delta", "id": state["id"],
+                                "args_delta": delta, "step": step})
+                    continue
+                if state["fa"]:
+                    text = self._ag_answer_feed(state, delta)
+                    if text:
+                        lane.answer.append(text)
+                        out.append({"type": token_type, "token": text, "step": step})
+                    continue
+                if state["muted"]:
+                    continue
+                state["held"].append(delta)
+                # Name the call as soon as its opening says which tool it is,
+                # so the UI can label the card; bounded, so a call whose name
+                # comes last is not re-scanned on every token.
+                if state["name"] is None and state["head"] < 600:
+                    head = "".join(state["held"])
+                    state["head"] = len(head)
+                    for m in _AG_CALL_NAME.finditer(head):
+                        candidate = m.group(1) or m.group(2)
+                        if candidate == "final_answer" or (known is None or candidate in known):
+                            self._ag_name_call(state, candidate, {}, known)
+                            break
+                if state["name"] is not None:
+                    out.extend(self._ag_open_call(state, step, token_type, lane))
+            elif kind == "call_end":
+                state = self._ag_call_state(lane, ev["index"])
+                lane.ended.append(ev["index"])
+                if not ev.get("late"):
+                    lane.stop = True
+                if not state["started"] and not state["muted"] and not state["fa"]:
+                    self._ag_name_call(state, ev.get("name"), ev.get("args"), known)
+                    out.extend(self._ag_open_call(state, step, token_type, lane))
+            elif kind == "call_abort":
+                state = lane.calls.get(ev.get("index"))
+                if state is not None:
+                    state["muted"] = True
+                raw = ev.get("raw") or ""
+                if raw:
+                    # It looked like a call and was not: show it, nothing lost.
+                    lane.answer.append(raw)
+                    out.append({"type": token_type, "token": raw, "step": step})
+        return out
+
+    # --- Tool dispatch ---------------------------------------------------- #
+    async def _ag_decide(self, name: str, args: dict, turn: Any) -> tuple[str, str, str, Any]:
+        """(action, risk, reason, decision) from the policy; allow when absent.
+
+        A policy that is not installed, or that raises, allows the call: that
+        is today's behaviour, and ToolRegistry.call still enforces deny and
+        unapproved asks synchronously, so failing open here cannot run a call
+        the registry would refuse.
+        """
+        policy = _ag_policy()
+        decide = getattr(policy, "decide", None) if policy is not None else None
+        if not callable(decide):
+            return "allow", "", "", None
+        # This agent's registry when the policy takes one: a profile agent has
+        # its own registry and config, and the policy must judge the call
+        # against those rather than the install-wide defaults.
+        extra = {"registry": self.registry} if _ag_accepts(decide, "registry") else {}
+        try:
+            # In a thread: the policy reads per-conversation overrides from
+            # SQLite, which must not stall every other stream on this loop.
+            decision = await _ag_maybe_await(
+                await asyncio.to_thread(decide, name, args, turn, **extra))
+        except Exception as exc:  # noqa: BLE001
+            log(f"tool policy check failed for {name} ({exc}); allowing it as "
+                "before.", logging.WARNING)
+            return "allow", "", "", None
+        action = _ag_field(decision, "action", "allow")
+        action = str(getattr(action, "value", action) or "allow").strip().lower()
+        if action not in ("allow", "ask", "deny"):
+            action = "allow"
+        return (action, str(_ag_field(decision, "risk", "") or ""),
+                str(_ag_field(decision, "reason", "") or ""), decision)
+
+    def _ag_unattended(self, name: str, args: dict, turn: Any) -> str:
+        """allow | deny for an "ask" that nobody can answer.
+
+        A scheduled task, an API client that cannot render a prompt, or a run
+        with no route at all: waiting would only stall the turn until the
+        timeout. The policy's own rule wins when it has one; otherwise
+        TOOL_APPROVAL_UNATTENDED (deny unless set to allow).
+        """
+        policy = _ag_policy()
+        hook = getattr(policy, "unattended_decision", None) if policy is not None else None
+        if callable(hook):
+            try:
+                value = hook(name, args, turn)
+                value = _ag_field(value, "action", value)
+                value = str(getattr(value, "value", value) or "").strip().lower()
+                if value in ("allow", "deny"):
+                    return value
+            except Exception as exc:  # noqa: BLE001
+                log(f"unattended tool policy failed for {name} ({exc}); denying.",
+                    logging.WARNING)
+        setting = str(getattr(self.config, "tool_approval_unattended", "deny") or "deny")
+        return "allow" if setting.strip().lower() == "allow" else "deny"
+
+    def _ag_approval_timeout(self, decision: Any, broker: Any) -> float:
+        """Seconds the approval stays open: the same number the broker uses."""
+        candidates = [_ag_field(decision, "timeout", None),
+                      getattr(self.config, "tool_approval_timeout_s", None)]
+        default = getattr(broker, "default_timeout", None)
+        if callable(default):
+            try:
+                candidates.append(default())
+            except Exception:  # noqa: BLE001
+                pass
+        for value in candidates:
+            try:
+                if value is not None and float(value) > 0:
+                    return float(value)
+            except (TypeError, ValueError):
+                continue
+        return 120.0
+
+    async def _ag_wait_approval(self, broker: Any, approval_id: str, timeout: float,
+                                turn: Any, cancel: Any) -> tuple[Any, str]:
+        """(resolution, how): how is "resolved", "timeout", "cancel" or "error".
+
+        Waits inside turn.waiting_on_human(), which hands the generation slot
+        back while a person reads the prompt: holding it would block every
+        other user's turn for as long as this one is waiting on a click. The
+        turn's cancel event is polled so Stop works during the wait, and the
+        broker's own timeout is backed by ours, so a broker that never
+        resolves cannot wedge the turn.
+        """
+        stop = cancel if cancel is not None else getattr(turn, "cancel", None)
+        async with turn.waiting_on_human():
+            try:
+                waiter = asyncio.ensure_future(
+                    _ag_maybe_await(broker.wait(approval_id, timeout)))
+            except Exception as exc:  # noqa: BLE001
+                log(f"approval wait failed to start ({exc}); denying.", logging.WARNING)
+                return None, "error"
+            limit = time.monotonic() + timeout + 5.0
+            while True:
+                done_set, _ = await asyncio.wait({waiter}, timeout=0.25)
+                if done_set:
+                    try:
+                        return waiter.result(), "resolved"
+                    except Exception as exc:  # noqa: BLE001
+                        log(f"approval wait failed ({exc}); denying.", logging.WARNING)
+                        return None, "error"
+                if stop is not None and stop.is_set():
+                    waiter.cancel()
+                    try:
+                        # cancel_turn records the refusal as the cancel's, not
+                        # as an answer the user gave; resolve is the fallback
+                        # for a broker without it.
+                        cancel_turn = getattr(broker, "cancel_turn", None)
+                        if callable(cancel_turn) and getattr(turn, "turn_id", None):
+                            cancel_turn(turn.turn_id)
+                        else:
+                            broker.resolve(approval_id, getattr(turn, "user_id", None),
+                                           "deny", "once")
+                    except Exception:  # noqa: BLE001 - the turn is ending anyway
+                        pass
+                    return None, "cancel"
+                if time.monotonic() > limit:
+                    waiter.cancel()
+                    return None, "timeout"
+
+    async def _dispatch(self, name: str, args: dict, conversation_id: str | None, *,
+                        step: int = 0, call_id: str | None = None,
+                        started: bool = False, extra: dict | None = None,
+                        announce: bool = True, runner: Any = None,
+                        cancel: "asyncio.Event | None" = None,
+                        before_run: "list[dict] | None" = None,
+                        short_circuit: "tuple[str, str | None] | None" = None):
+        """Run one tool call: announce it, consult the policy, maybe a human, run it.
+
+        The one place a tool call is executed from, for every lane (main loop,
+        overflow batches, run_and_seed, auto-fetch, fast path, router terminal,
+        skill autoload, delegation). There used to be seven copies of
+        `asyncio.to_thread(self.registry.call, ...)`, and an approval gate
+        added to some of them would have been a gate with a side door.
+
+        Yields stream events (tool_call_start unless the detector already sent
+        it, tool_call, then approval_required / approval_resolved when the
+        policy asks), then exactly one {"__dispatched__": _AgDispatched}. The
+        caller emits tool_result, because what it reports (context_chars,
+        summarised, auto, fast_path) differs per lane. A denied call is not
+        run; its outcome carries the "denied by ..." text as both result and
+        error so the lane feeds it back and the model can re-plan.
+
+        `runner(args) -> (result, error)` replaces the registry call for the
+        actions that are not registry tools (delegate_task). `short_circuit`
+        reports a result without running or asking (the dedup guard).
+        """
+        outcome = _AgDispatched(call_id or _ag_call_id(), name, args)
+        extra = dict(extra or {})
+        if announce:
+            if not started:
+                yield {"type": "tool_call_start", "id": outcome.call_id, "name": name,
+                       "step": step, **extra}
+            yield {"type": "tool_call", "id": outcome.call_id, "name": name, "args": args,
+                   "step": step, **extra}
+        if short_circuit is not None:
+            outcome.result, outcome.error = short_circuit
+            yield {"__dispatched__": outcome}
+            return
+
+        turn = current_turn()
+        action, risk, reason, decision = await self._ag_decide(name, args, turn)
+        if action == "ask" and (turn is None or not getattr(turn, "interactive", True)):
+            action = self._ag_unattended(name, args, turn)
+            outcome.decided_by = "policy"
+            if action == "deny":
+                reason = reason or "it needs approval and nobody is watching this turn"
+        elif action == "ask":
+            policy = _ag_policy()
+            broker = getattr(policy, "BROKER", None) if policy is not None else None
+            approval_id = None
+            if broker is not None:
+                try:
+                    approval_id = broker.request(turn, outcome.call_id, name, args,
+                                                 risk, reason)
+                except Exception as exc:  # noqa: BLE001
+                    log(f"could not open an approval for {name} ({exc}).",
+                        logging.WARNING)
+            if not approval_id:
+                # Fail closed: the policy said a person must agree, and there
+                # is no way to ask one.
+                action, outcome.decided_by = "deny", "policy"
+                reason = "it needs approval and the approval service is unavailable"
+            else:
+                timeout = self._ag_approval_timeout(decision, broker)
+                ask = {"type": "approval_required", "id": approval_id,
+                       "call_id": outcome.call_id, "name": name, "args": args,
+                       "risk": risk, "reason": reason, "step": step,
+                       "expires_in": timeout, "scopes": ["once", "conversation", "tool"]}
+                if self._ag_nested:
+                    turn.send(ask)
+                yield ask
+                resolution, how = await self._ag_wait_approval(
+                    broker, approval_id, timeout, turn, cancel)
+                verdict = _ag_field(resolution, "decision", "")
+                verdict = str(getattr(verdict, "value", verdict) or "").strip().lower()
+                if how == "timeout" or (how == "resolved" and verdict == "timeout"):
+                    verdict = "timeout"
+                elif how != "resolved" or verdict not in ("allow", "deny"):
+                    verdict = "deny"
+                scope = str(_ag_field(resolution, "scope", "") or "once")
+                by = (_ag_field(resolution, "by", None)
+                      or ("cancel" if how == "cancel" else getattr(turn, "user_id", None)))
+                resolved = {"type": "approval_resolved", "id": approval_id,
+                            "call_id": outcome.call_id, "decision": verdict,
+                            "scope": scope, "by": by}
+                if self._ag_nested:
+                    turn.send(resolved)
+                yield resolved
+                if verdict == "allow":
+                    action, outcome.decided_by = "allow", "user"
+                    edited = _ag_field(resolution, "args", None)
+                    if isinstance(edited, dict) and edited != args:
+                        outcome.args = edited
+                        if announce:
+                            # Say what will actually run, under the same id.
+                            yield {"type": "tool_call", "id": outcome.call_id,
+                                   "name": name, "args": edited, "step": step,
+                                   "edited": True, **extra}
+                else:
+                    action = "deny"
+                    if how == "error":
+                        outcome.decided_by = "policy"
+                        reason = "the approval could not be completed"
+                    elif how == "cancel":
+                        outcome.decided_by, reason = "cancel", "the turn was stopped"
+                    elif verdict == "timeout":
+                        outcome.decided_by = "timeout"
+                        reason = f"no answer within {timeout:.0f}s"
+                    else:
+                        outcome.decided_by = "user"
+                        reason = str(_ag_field(resolution, "reason", "") or "") or reason
+
+        if action == "deny":
+            outcome.denied = True
+            outcome.decided_by = outcome.decided_by or "policy"
+            outcome.reason = reason
+            who = "policy" if outcome.decided_by == "policy" else "the user"
+            outcome.result = f"denied by {who}" + (f" ({reason})" if reason else "")
+            outcome.error = outcome.result
+            log_event(get_logger("agent"), logging.INFO, "tool.denied", tool=name,
+                      by=outcome.decided_by, conversation_id=conversation_id,
+                      reason=reason)
+            yield {"__dispatched__": outcome}
+            return
+
+        for event in before_run or ():
+            yield event
+        # An approval granted above left a one-shot grant with the broker,
+        # keyed to this turn and the (possibly edited) arguments; the policy's
+        # synchronous check inside ToolRegistry.call consumes it there, in the
+        # worker thread, which sees this turn through the copied contextvars.
+        if runner is not None:
+            outcome.result, outcome.error = await runner(outcome.args)
+        else:
+            outcome.result, outcome.error = await asyncio.to_thread(
+                self.registry.call, name, outcome.args, conversation_id)
+        yield {"__dispatched__": outcome}
+
+    def vision_capable(self) -> bool:
+        """Whether the model being served can read image content parts.
+
+        The route can say so authoritatively (turn.extras["vision"], from the
+        model manager it holds). Otherwise both halves must agree: the backend
+        has the "vision" capability AND the catalogue marks the served model as
+        a vision model. The backend alone is not enough: mlx-lm declares
+        vision, and a 3B text model behind it would be handed image parts it
+        cannot see. An unknown model counts as text-only.
+        """
+        turn = current_turn()
+        extras = getattr(turn, "extras", None)
+        if isinstance(extras, dict) and isinstance(extras.get("vision"), bool):
+            return extras["vision"]
+        manager = (getattr(self.registry, "model_manager", None)
+                   or getattr(self.client, "model_manager", None))
+        # One rule for every surface (vision.served_vision, which the chat
+        # route and /v1 use too): VISION_MODE=on/off is honoured, and mlx-lm
+        # only counts when it ships a processor for the model's vision tower.
+        served = _ag_lookup("vision", "served_vision")
+        if callable(served):
+            try:
+                return bool(served(manager, self.config)[0])
+            except Exception:  # noqa: BLE001
+                return False
+        backend = getattr(manager, "backend", None)
+        if backend is None:
+            get_backend = _ag_lookup("backends", "get_backend")
+            try:
+                backend = (get_backend(getattr(self.config, "model_backend", None))
+                           if callable(get_backend) else None)
+            except Exception:  # noqa: BLE001
+                backend = None
+        try:
+            caps = backend.caps_for(manager) if backend is not None else frozenset()
+        except Exception:  # noqa: BLE001
+            caps = frozenset()
+        if "vision" not in caps:
+            return False
+        metadata = _ag_lookup("catalog", "model_metadata")
+        model = (getattr(manager, "model", None) if manager is not None else None) \
+            or getattr(self.config, "model", "")
+        try:
+            meta = metadata(str(model or "")) if callable(metadata) else None
+        except Exception:  # noqa: BLE001
+            meta = None
+        return bool(isinstance(meta, dict) and meta.get("vision"))
 
     async def forced_prose_answer(self, history: list[dict], user_message: str,
                                   reserve: int, temperature: float | None,
@@ -335,9 +1075,16 @@ class Agent:
         counter, because a depth counter still pays for the generation that
         discovers it has run out of depth.
         """
+        # Never more than the parent has. The capabilities come from the
+        # model's own delegate_task arguments, so without this intersection an
+        # agent limited to web_search could ask for "file_ops,code_exec" and
+        # the helper got them: a privilege escalation by prompt. An empty
+        # intersection must not become agent_tools="" (which means every
+        # tool), so it falls back to final_answer, which is always there.
+        parent_tools = set(self.registry.names())
         allowed = [name for name in tools_for_capabilities(
             [part.strip() for part in (capabilities or "").split(",") if part.strip()])
-            if name != "delegate_task"]
+            if name != "delegate_task" and name in parent_tools] or ["final_answer"]
         child_config = dataclass_replace(
             self.config,
             agent_tools=",".join(allowed),
@@ -364,6 +1111,7 @@ class Agent:
         )
         child_registry = ToolRegistry(child_config, self.registry.db)
         child = Agent(child_config, child_registry, self.client)
+        child._ag_nested = True
         answer = ""
         async for event in child.run(task, [], conversation_id=parent_conversation,
                                      max_tokens=self.config.max_tokens):
@@ -901,14 +1649,17 @@ class Agent:
 
         stats = GenerationStats()
         extra = ""
+        lane = _AgLane()
         stream = self.client.stream(messages, reserve, temperature, stats, kind="code")
         try:
-            async for token in stream:
-                if cancel is not None and cancel.is_set():
-                    yield {"type": "cancelled", "step": 1, "partial": extra, "trace": []}
-                    return
-                extra += token
-                yield {"type": "token", "token": token, "step": 1}
+            async for event in self.stream_lane(stream, lane, step=1, cancel=cancel,
+                                                stats=stats):
+                yield event
+            if lane.cancelled:
+                yield {"type": "cancelled", "step": 1, "partial": lane.visible,
+                       "reasoning": lane.thinking, "trace": []}
+                return
+            extra = lane.text
         except Exception as exc:
             log(f"continuation stream failed ({exc}); falling back to non-streaming.",
                 logging.WARNING)
@@ -962,6 +1713,8 @@ class Agent:
             "changed_files": [],
             "diff": "",
             "continued": True,
+            "reasoning": lane.thinking.strip(),
+            **_ag_turn_fields(),
         }
 
     async def route(self, message: str, history: list[dict] | None = None,
@@ -1160,7 +1913,11 @@ class Agent:
         if is_followup_remark(user_message):
             return user_message
         try:
-            scope = [p.strip() for p in (self.config.rag_scope or "").split(",") if p.strip()]
+            # A project turn retrieves within the project's own RAG scope; the
+            # workspace module is optional, so without it this is RAG_SCOPE.
+            scoped = _ag_lookup("workspaces", "effective_rag_scope")
+            raw_scope = scoped(self.config) if callable(scoped) else self.config.rag_scope
+            scope = [p.strip() for p in (raw_scope or "").split(",") if p.strip()]
             # Scope retrieval to the acting user's own + shared documents so one
             # user's imported history never surfaces in another's answers.
             hits = db.search_documents(user_message, limit=self.config.rag_passages,
@@ -1637,6 +2394,8 @@ class Agent:
         elapsed_ms = float(final.get("elapsed_ms") or 0.0)
         passes = 0
         last_addition = ""
+        # Each pass thinks again; the turn's reasoning is all of it, in order.
+        reasoning = [str(final.get("reasoning") or "")]
 
         while passes < passes_allowed and was_truncated(answer):
             if cancel is not None and cancel.is_set():
@@ -1657,7 +2416,13 @@ class Agent:
                 if event.get("type") == "final":
                     resumed = event
                 elif event.get("type") == "cancelled":
-                    yield event
+                    # The partial of a stopped pass is only that pass's text;
+                    # what the user has is the whole answer up to the stop.
+                    stopped = dict(event)
+                    extra = str(event.get("partial") or "")
+                    stopped["partial"] = (self.stitch_continuation(partial, extra)
+                                          if extra.strip() else partial)
+                    yield stopped
                     return
                 else:
                     yield event
@@ -1666,6 +2431,7 @@ class Agent:
             prompt_tokens += int(resumed.get("prompt_tokens") or 0)
             completion_tokens += int(resumed.get("completion_tokens") or 0)
             elapsed_ms += float(resumed.get("elapsed_ms") or 0.0)
+            reasoning.append(str(resumed.get("reasoning") or ""))
             grown = str(resumed.get("answer") or "")
             body = strip_truncation_note(grown)
             addition = body[len(partial):].strip()
@@ -1695,6 +2461,8 @@ class Agent:
         completed["elapsed_ms"] = round(elapsed_ms)
         completed["truncated"] = was_truncated(answer)
         completed["continued"] = passes
+        if passes:
+            completed["reasoning"] = _ag_join_reasoning(list(enumerate(reasoning)))
         if passes and was_truncated(answer):
             # Honest about where it stopped: the note under the answer still
             # says "ask me to continue", and now that is the actual next step.
@@ -1705,7 +2473,8 @@ class Agent:
                                + "; say \"continue\" for more, or raise Max tokens")}
         yield {"__final__": completed}
 
-    async def run_iterating(self, message, history, conversation_id, max_tokens, temperature):
+    async def run_iterating(self, message, history, conversation_id, max_tokens, temperature,
+                            cancel=None, attachments=None, vision=None):
         """Run the agent, then verify any code it changed and, if the checks fail,
         let it see the errors and try again — up to auto_iterate_rounds times.
 
@@ -1714,7 +2483,17 @@ class Agent:
         - When execution is enabled and a test command exists: run the tests.
         A failure at either layer sends the agent back with the exact errors.
         Only the final round's answer is surfaced as the turn's answer.
+
+        `cancel` (an asyncio.Event) interrupts the turn; when None, the bound
+        TurnContext's cancel is used, so a route only has to set the context.
+        A cancelled turn ends with the `cancelled` event (carrying `partial`)
+        and nothing after it: no auto-continue, no verification round.
+        `attachments` are OpenAI-shaped content parts for this message (see
+        run); `vision` overrides the served-model vision check.
         """
+        if cancel is None:
+            turn = current_turn()
+            cancel = turn.cancel if turn is not None else None
         rounds = self.config.auto_iterate_rounds
         verify = rounds > 0
         current = message
@@ -1729,20 +2508,39 @@ class Agent:
         produced: list[str] = []
         for round_i in range(rounds + 1):
             last_final = None
+            # Only the first round sees the attachments: later rounds are this
+            # process asking for a fix, not the user showing something. Passed
+            # only when present, so a replaced run() without the parameter
+            # keeps working.
+            media = ({"attachments": attachments, "vision": vision}
+                     if attachments and round_i == 0 else {})
             async for ev in self.run(current, history, conversation_id, max_tokens,
-                                     temperature, internal=round_i > 0):
+                                     temperature, cancel=cancel, internal=round_i > 0,
+                                     **media):
+                if ev.get("type") == "cancelled":
+                    # Stopped by the user: hand back what streamed and end the
+                    # turn here. Verifying or continuing a cancelled answer is
+                    # the opposite of what Stop asked for.
+                    yield ev
+                    return
                 if ev.get("type") == "final":
                     # Finish it before anything treats it as the round's answer:
                     # the verification below reads changed files, and the task
                     # state records the artifact, and both should see the whole
                     # thing rather than the half that fitted in one reply.
+                    stopped = None
                     async for sub in self.auto_continue(
                             ev, message, history, conversation_id, max_tokens,
-                            temperature):
+                            temperature, cancel):
                         if "__final__" in sub:
                             ev = sub["__final__"]
+                        elif sub.get("type") == "cancelled":
+                            stopped = sub
                         else:
                             yield sub
+                    if stopped is not None:
+                        yield stopped
+                        return
                     for name in ev.get("documents") or []:
                         if name not in produced:
                             produced.append(name)
@@ -2049,17 +2847,36 @@ class Agent:
         temperature: float | None = None,
         cancel: asyncio.Event | None = None,
         internal: bool = False,
+        attachments: "list[dict] | None" = None,
+        vision: "bool | None" = None,
     ) -> AsyncGenerator[dict, None]:
-        """Yield events: context, step, token, tool_call, tool_result, final, error, cancelled.
+        """Yield events: context, step, token, think_token, tool_call_start,
+        tool_call_delta, tool_call, approval_required, approval_resolved,
+        tool_result, final, cancelled (and the notice/phase/usage family).
 
         `internal` marks a message this process wrote rather than the user (the
         auto-iterate fix request). Such a message must not be folded into the
         task state: it is not a requirement, not a correction, and not "the
         latest user request".
+
+        `cancel` falls back to the bound TurnContext's cancel event.
+        `attachments` are OpenAI-shaped content parts ({"type": "text"},
+        {"type": "image_url", ...}) sent with this message: text parts join the
+        turn's context, image parts become part of the user message when the
+        served model can see (vision_capable(), or `vision` when the caller
+        knows better), and otherwise the turn says it cannot see them.
         """
         started = time.time()
         reserve = max_tokens or self.config.max_tokens
         known = set(self.registry.names())
+        if cancel is None:
+            _turn = current_turn()
+            cancel = _turn.cancel if _turn is not None else None
+        # Reasoning shown live this turn, per step, for final.reasoning.
+        reasoning_log: list[tuple[int, str]] = []
+        image_parts, attached_text = _ag_split_attachments(attachments)
+        can_see = bool(image_parts) and (vision if isinstance(vision, bool)
+                                         else self.vision_capable())
 
         # A leading /command (/search, /no-search, /kb, /agent) is an explicit routing
         # override. Honour it, and strip it from the message so neither the base
@@ -2228,9 +3045,18 @@ class Agent:
                 # Through registry.call, not the library directly, so the use is
                 # counted and persisted to tool_calls exactly like a model-issued
                 # load -- which is what a rating arriving later is attributed with.
-                body, error = await asyncio.to_thread(
-                    self.registry.call, "load_skill", {"name": matched.name},
-                    conversation_id)
+                # Not announced (it is the app's step, not the model's), but
+                # still through _dispatch, so a policy that gates load_skill
+                # gates the automatic load too.
+                loaded = None
+                async for event in self._dispatch("load_skill", {"name": matched.name},
+                                                  conversation_id, announce=False,
+                                                  cancel=cancel):
+                    if "__dispatched__" in event:
+                        loaded = event["__dispatched__"]
+                    else:
+                        yield event
+                body, error = loaded.result, loaded.error
                 if not error:
                     skill_context = (
                         f"You have a written procedure for this. Follow it.\n\n{body}"
@@ -2401,9 +3227,27 @@ class Agent:
         kind_hint = (self.ANSWER_HINTS.get(shape.kind, "")
                      if shape.depth == "short" and not doc_format and not brief
                      else "")
+        # What the user attached. Text parts (an extracted document, a
+        # transcript) ride on the user turn like an @reference. Images go on
+        # the user message itself when the model can see them (attach()
+        # below); when it cannot, the turn says so instead of answering as if
+        # the picture were not there.
+        attachment_context = ("ATTACHED BY THE USER:\n" + attached_text
+                              if attached_text else "")
+        if image_parts and not can_see:
+            yield {"type": "notice", "info": True,
+                   "message": ("this model cannot see images; answering from the "
+                               "text only")}
+            attachment_context = "\n\n".join(part for part in (
+                attachment_context,
+                f"The user attached {len(image_parts)} image"
+                + ("s" if len(image_parts) != 1 else "")
+                + ", but the model answering cannot see images. If the request "
+                  "depends on them, say so in one sentence, then help with the "
+                  "text.") if part)
         extra_context = "\n\n".join(
-            part for part in (skill_context, reference_context, brief,
-                              document_directive, kind_hint) if part)
+            part for part in (skill_context, reference_context, attachment_context,
+                              brief, document_directive, kind_hint) if part)
         # A document turn can only ever call create_document (plus a lookup tool
         # when it is researching), so the other twenty-one specs are ~1600
         # tokens of a 4096-token window describing tools it will not touch --
@@ -2471,6 +3315,10 @@ class Agent:
         escalated = False
         scratch: list[dict] = []
         seen_calls: list[str] = []
+        # Calls refused this turn (by a person or the policy), by signature, so
+        # a model that asks again gets the refusal back instead of the user
+        # getting the same question twice.
+        denied_calls: dict[str, str] = {}
         trace: list[dict] = []
         nudges = 0
         # The last answer good enough to show, kept while it is being revised so
@@ -2498,6 +3346,29 @@ class Agent:
         # Snapshot of files changed before this turn, so the final event can show
         # a diff of exactly what this turn changed for you to review before push.
         changed_before = set(self.registry.changed_files)
+
+        def attach(msgs: list[dict]) -> list[dict]:
+            """The prompt with this turn's images on the user's own message.
+
+            Applied at the stream call, not when the prompt is built: base is
+            rebuilt by several lanes (the prose lane, the switch into agent
+            mode), every builder treats content as a string, and the token
+            estimate already counts image parts once they are there.
+            """
+            if not can_see or not base:
+                return msgs
+            target = base[-1]
+            out = list(msgs)
+            hits = [i for i, m in enumerate(out) if m is target]
+            if not hits:
+                hits = [i for i in range(len(out) - 1, -1, -1)
+                        if out[i].get("role") == "user"
+                        and out[i].get("content") == target.get("content")][:1]
+            for i in hits[:1]:
+                out[i] = {**out[i], "content": [
+                    {"type": "text", "text": str(out[i].get("content") or "")},
+                    *image_parts]}
+            return out
 
         def detail(message: str) -> dict | None:
             """A verbose under-the-hood line, only emitted when show_internals is on."""
@@ -2688,6 +3559,11 @@ class Agent:
                 # for a turn that wrote nothing is noise.
                 "checkpoint": (self.registry.checkpoint_id
                                if new_files and self.registry.checkpoint_id else None),
+                # What the thinking area showed, so a reload (and an API client
+                # asking for reasoning_content) gets it back. "" when the model
+                # did not reason out loud.
+                "reasoning": _ag_join_reasoning(reasoning_log),
+                **_ag_turn_fields(),
             }
 
         # Every quality gate an answer clears before the user sees it, in one
@@ -2745,16 +3621,24 @@ class Agent:
         # as it goes; returns True if the result was seeded (model should now
         # synthesise), False if the tool failed.
         async def run_and_seed(name: str, args: dict, note: str, directive: str) -> bool:
-            yield {"type": "tool_call", "name": name, "args": args, "step": 0}
-            result, error = await asyncio.to_thread(
-                self.registry.call, name, args, conversation_id
-            )
-            yield {"type": "tool_result", "name": name, "result": result,
-                   "error": error, "step": 0}
+            outcome = None
+            async for event in self._dispatch(name, args, conversation_id, step=0,
+                                              cancel=cancel):
+                if "__dispatched__" in event:
+                    outcome = event["__dispatched__"]
+                else:
+                    yield event
+            # What actually ran: a person approving the call may have edited it.
+            args = outcome.args
+            result, error = outcome.result, outcome.error
+            yield {"type": "tool_result", "id": outcome.call_id, "name": name,
+                   "result": result, "error": error, "step": 0}
             if error:
                 # A failed tool is not fatal: record it and let the model proceed.
                 scratch.append({"role": "assistant", "content": f"I tried {name} and it failed."})
-                scratch.append({"role": "user", "content": f"TOOL RESULT [{name}]:\n{result}"})
+                scratch.append({"role": "user", "content": (
+                    outcome.scratch_note() if outcome.denied
+                    else f"TOOL RESULT [{name}]:\n{result}")})
                 yield {"__seeded__": False}
                 return
             trace.append({"name": name, "args": args, "result": result[:1000], "error": None})
@@ -2810,14 +3694,23 @@ class Agent:
                                                           ensure_ascii=False, default=str)
                     if signature in seen_calls:
                         continue
-                    yield {"type": "tool_call", "name": "fetch_url",
-                           "args": {"url": url}, "step": 0, "auto": True}
-                    page, page_err = await asyncio.to_thread(
-                        self.registry.call, "fetch_url", {"url": url}, conversation_id
-                    )
-                    yield {"type": "tool_result", "name": "fetch_url", "result": page,
+                    fetched = None
+                    async for event in self._dispatch("fetch_url", {"url": url},
+                                                      conversation_id, step=0,
+                                                      extra={"auto": True},
+                                                      cancel=cancel):
+                        if "__dispatched__" in event:
+                            fetched = event["__dispatched__"]
+                        else:
+                            yield event
+                    page, page_err = fetched.result, fetched.error
+                    yield {"type": "tool_result", "id": fetched.call_id,
+                           "name": "fetch_url", "result": page,
                            "error": page_err, "step": 0, "auto": True}
-                    seen_calls.append(signature)
+                    seen_calls.append(_ag_signature("fetch_url", fetched.args))
+                    url = str(fetched.args.get("url") or url)
+                    if cancel is not None and cancel.is_set():
+                        break
                     if page_err:
                         continue  # a dead link is not fatal; the snippets remain
                     # If the fetched page is mostly markup/nav with little prose,
@@ -2854,20 +3747,19 @@ class Agent:
                             f"Question: {user_message[:500]}\n\nSource {idx} "
                             f"({url}):\n{page_text}\n\nRelevant findings from this source:"},
                     ]
-                    finding = ""
                     estats = GenerationStats()
                     estream = self.client.stream(extract_messages, self.config.reasoning_tokens, 0.0, estats, kind="reasoning")
                     started_src = time.time()
+                    elane = _AgLane()
                     try:
-                        async for tok in estream:
-                            if cancel is not None and cancel.is_set():
-                                break
-                            finding += tok
-                            yield {"type": "reason_token", "step": idx, "token": tok}
-                            if time.time() - started_src > self.config.reasoning_step_timeout:
-                                yield {"type": "notice", "info": True,
-                                       "message": f"source {idx} slow; keeping partial and moving on"}
-                                break
+                        async for event in self.stream_lane(
+                                estream, elane, step=idx, cancel=cancel,
+                                token_type="reason_token", stats=estats,
+                                deadline=self.config.reasoning_step_timeout):
+                            yield event
+                        if elane.timed_out:
+                            yield {"type": "notice", "info": True,
+                                   "message": f"source {idx} slow; keeping partial and moving on"}
                     except Exception as exc:
                         # Best-effort: no retry. Whatever streamed is kept.
                         yield {"type": "notice", "info": True,
@@ -2875,7 +3767,8 @@ class Agent:
                     finally:
                         await estream.aclose()
                     account(estats)
-                    finding = strip_reasoning(finding).strip()
+                    reasoning_log.append((idx, elane.thinking))
+                    finding = strip_reasoning(elane.text).strip()
                     took = time.time() - started_src
                     yield {"type": "reason_done", "step": idx, "conclusion": finding[:200]}
                     ev = detail(f"source {idx}: extracted {len(finding)} chars in {took:.1f}s")
@@ -2938,7 +3831,8 @@ class Agent:
             notes: list[str] = []
             for i, part in enumerate(parts, 1):
                 if cancel is not None and cancel.is_set():
-                    yield {"type": "cancelled", "step": i, "trace": trace}
+                    yield {"type": "cancelled", "step": i, "trace": trace, "partial": "",
+                           "reasoning": _ag_join_reasoning(reasoning_log)}
                     return
                 yield {"type": "reason_step", "step": i, "total": len(parts),
                        "label": f"reading part {i}/{len(parts)}"}
@@ -2952,24 +3846,24 @@ class Agent:
                         f"Request: {hint}\n\nNotes so far:\n{notes_text}\n\n"
                         f"Part {i} of {len(parts)}:\n{part}\n\nRelevant notes from this part:"},
                 ]
-                finding = ""
                 mstats = GenerationStats()
                 mstream = self.client.stream(map_messages, self.config.reasoning_tokens, 0.0, mstats, kind="reasoning")
-                started_part = time.time()
+                mlane = _AgLane()
                 try:
-                    async for tok in mstream:
-                        if cancel is not None and cancel.is_set():
-                            break
-                        finding += tok
-                        yield {"type": "reason_token", "step": i, "token": tok}
-                        if time.time() - started_part > self.config.reasoning_step_timeout:
-                            break
+                    async for event in self.stream_lane(
+                            mstream, mlane, step=i, cancel=cancel,
+                            token_type="reason_token", stats=mstats,
+                            deadline=self.config.reasoning_step_timeout):
+                        yield event
+                    finding = mlane.text
                 except Exception:
+                    finding = mlane.text
                     if not strip_reasoning(finding).strip():
                         finding = await self.resilient_complete(map_messages, self.config.reasoning_tokens, 0.0)
                 finally:
                     await mstream.aclose()
                 account(mstats)
+                reasoning_log.append((i, mlane.thinking))
                 finding = strip_reasoning(finding).strip()
                 yield {"type": "reason_done", "step": i, "conclusion": finding[:200]}
                 if finding:
@@ -2985,20 +3879,25 @@ class Agent:
                     f"Request: {hint}\n\nNotes gathered from the full input, in order:\n"
                     f"{joined}\n\nNow give the complete answer to the request in plain text."},
             ]
-            answer_buf = ""
             rstats = GenerationStats()
             rstream = self.client.stream(reduce_messages, reserve, temperature, rstats, kind="reasoning")
+            rlane = _AgLane()
             try:
-                async for tok in rstream:
-                    if cancel is not None and cancel.is_set():
-                        break
-                    answer_buf += tok
-                    yield {"type": "token", "token": tok, "step": len(parts)}
+                async for event in self.stream_lane(rstream, rlane, step=len(parts),
+                                                    cancel=cancel, stats=rstats):
+                    yield event
+                answer_buf = rlane.text
             except Exception:
                 answer_buf = await self.resilient_complete(reduce_messages, reserve, temperature)
             finally:
                 await rstream.aclose()
             account(rstats)
+            reasoning_log.append((len(parts), rlane.thinking))
+            if rlane.cancelled:
+                yield {"type": "cancelled", "step": len(parts), "trace": trace,
+                       "partial": rlane.visible.strip(),
+                       "reasoning": _ag_join_reasoning(reasoning_log)}
+                return
             answer = strip_reasoning(answer_buf).strip() or ("Notes from the input:\n" + joined)
             yield done(answer, len(parts))
             return
@@ -3006,15 +3905,22 @@ class Agent:
         # Step 1: deterministic shortcuts. A bare URL or a pure arithmetic
         # expression needs no model call at all. calculator and fetch_url produce
         # the answer itself (a number, a page), so we can return it directly.
-        shortcut = quick_tool(user_message) if self.config.fast_path else None
+        # Not when the user attached images: "what is 2+2 in this photo" is a
+        # question about the photo, and a shortcut cannot see it.
+        shortcut = (quick_tool(user_message)
+                    if self.config.fast_path and not can_see else None)
         if shortcut and self.registry.get(shortcut[0]) is not None:
             name, args = shortcut
-            yield {"type": "tool_call", "name": name, "args": args, "step": 0, "fast_path": True}
-            result, error = await asyncio.to_thread(
-                self.registry.call, name, args, conversation_id
-            )
-            yield {"type": "tool_result", "name": name, "result": result,
-                   "error": error, "step": 0, "fast_path": True}
+            outcome = None
+            async for event in self._dispatch(name, args, conversation_id, step=0,
+                                              extra={"fast_path": True}, cancel=cancel):
+                if "__dispatched__" in event:
+                    outcome = event["__dispatched__"]
+                else:
+                    yield event
+            args, result, error = outcome.args, outcome.result, outcome.error
+            yield {"type": "tool_result", "id": outcome.call_id, "name": name,
+                   "result": result, "error": error, "step": 0, "fast_path": True}
             if not error:
                 trace.append({"name": name, "args": args, "result": result[:1000], "error": None})
                 yield done(result.strip(), 0)
@@ -3039,6 +3945,11 @@ class Agent:
         elif doc_format:
             # Nothing to route: the turn has to end in a create_document call,
             # and the router's only useful answer would be the one already made.
+            pass
+        elif can_see:
+            # The router reads only the text, so on "what does this say?" with
+            # a photo attached it would guess a web search. The model that can
+            # see the image decides, with the tools available.
             pass
         elif self.config.knowledge_triage and is_substantive(user_message):
             # Decide how to handle a substantive message, then execute the
@@ -3228,12 +4139,16 @@ class Agent:
                 # terminal tool (fetch_url), so "summarise <url>" returns a summary
                 # instead of dumping the raw page.
                 if tool.terminal and not decision.get("__seed__"):
-                    yield {"type": "tool_call", "name": action, "args": args, "step": 0}
-                    result, error = await asyncio.to_thread(
-                        self.registry.call, action, args, conversation_id
-                    )
-                    yield {"type": "tool_result", "name": action, "result": result,
-                           "error": error, "step": 0}
+                    outcome = None
+                    async for event in self._dispatch(action, args, conversation_id,
+                                                      step=0, cancel=cancel):
+                        if "__dispatched__" in event:
+                            outcome = event["__dispatched__"]
+                        else:
+                            yield event
+                    args, result, error = outcome.args, outcome.result, outcome.error
+                    yield {"type": "tool_result", "id": outcome.call_id, "name": action,
+                           "result": result, "error": error, "step": 0}
                     if not error:
                         trace.append({"name": action, "args": args,
                                       "result": result[:1000], "error": None})
@@ -3362,7 +4277,8 @@ class Agent:
                     note_chars = max(300, self.config.reasoning_tokens)
                     for i, sub in enumerate(steps, 1):
                         if cancel is not None and cancel.is_set():
-                            yield {"type": "cancelled", "step": i, "trace": trace}
+                            yield {"type": "cancelled", "step": i, "trace": trace, "partial": "",
+                                   "reasoning": _ag_join_reasoning(reasoning_log)}
                             return
                         yield {"type": "phase", "label": f"reasoning step {i}/{len(steps)}"}
                         # Stream each step live so thinking is never a frozen
@@ -3372,20 +4288,21 @@ class Agent:
                         conclusion = ""
                         rstats = GenerationStats()
                         rstream = self.client.stream(step_messages, self.config.reasoning_tokens, 0.0, rstats, kind="reasoning")
-                        started_step = time.time()
+                        slane = _AgLane()
                         try:
-                            async for tok in rstream:
-                                if cancel is not None and cancel.is_set():
-                                    break
-                                conclusion += tok
-                                yield {"type": "reason_token", "step": i, "token": tok}
-                                # Per-step wall-clock cap: keep what streamed and
-                                # move on rather than letting one step wedge.
-                                if time.time() - started_step > self.config.reasoning_step_timeout:
-                                    yield {"type": "notice", "message":
-                                           f"step {i} taking long; moving on with partial", "info": False}
-                                    break
+                            # Per-step wall-clock cap: keep what streamed and
+                            # move on rather than letting one step wedge.
+                            async for event in self.stream_lane(
+                                    rstream, slane, step=i, cancel=cancel,
+                                    token_type="reason_token", stats=rstats,
+                                    deadline=self.config.reasoning_step_timeout):
+                                yield event
+                            conclusion = slane.text
+                            if slane.timed_out:
+                                yield {"type": "notice", "message":
+                                       f"step {i} taking long; moving on with partial", "info": False}
                         except Exception:
+                            conclusion = slane.text
                             # Streaming failed; fall back to a resilient
                             # non-stream. Into the SAME rstats the stream was
                             # using, which is accounted below: a fallback that
@@ -3397,6 +4314,7 @@ class Agent:
                         finally:
                             await rstream.aclose()
                         account(rstats)
+                        reasoning_log.append((i, slane.thinking))
                         conclusion = strip_reasoning(conclusion).strip()
                         yield {"type": "reason_done", "step": i, "conclusion": conclusion[:200]}
                         # A step that reported it cannot be settled from the
@@ -3474,12 +4392,13 @@ class Agent:
                         answer_buf = ""
                         fstats = GenerationStats()
                         fstream = self.client.stream(final_messages, reserve, temperature, fstats, kind=gen_kind)
+                        flane = _AgLane()
                         try:
-                            async for tok in fstream:
-                                if cancel is not None and cancel.is_set():
-                                    break
-                                answer_buf += tok
-                                yield {"type": "token", "token": tok, "step": len(steps)}
+                            async for event in self.stream_lane(
+                                    fstream, flane, step=len(steps), cancel=cancel,
+                                    stats=fstats):
+                                yield event
+                            answer_buf = flane.text
                         except Exception:
                             # Fall back to a non-streaming resilient synthesis,
                             # billed to the same stats object: see plan_steps.
@@ -3488,6 +4407,12 @@ class Agent:
                         finally:
                             await fstream.aclose()
                         account(fstats)
+                        reasoning_log.append((len(steps), flane.thinking))
+                        if flane.cancelled:
+                            yield {"type": "cancelled", "step": len(steps), "trace": trace,
+                                   "partial": flane.visible.strip(),
+                                   "reasoning": _ag_join_reasoning(reasoning_log)}
+                            return
                         answer = strip_reasoning(answer_buf).strip()
                         if not answer:
                             answer = "Here is what I worked out:\n" + joined
@@ -3500,7 +4425,8 @@ class Agent:
 
         for step in range(1, self.config.agent_max_steps + 1):
             if cancel is not None and cancel.is_set():
-                yield {"type": "cancelled", "step": step, "trace": trace}
+                yield {"type": "cancelled", "step": step, "trace": trace,
+                       "partial": draft, "reasoning": _ag_join_reasoning(reasoning_log)}
                 return
 
             messages, condensed = self.assemble(base, scratch, reserve)
@@ -3550,6 +4476,7 @@ class Agent:
             # Set by the retry loop when a readiness probe proves the backend
             # cannot generate, so the failure message below need not re-probe.
             backend_dead = False
+            lane = _AgLane()
             for attempt in range(self.config.resilient_retries + 1):
                 buffer = ""
                 stats = GenerationStats()
@@ -3567,36 +4494,24 @@ class Agent:
                     ctx_reserve = min(self.config.context_size - self.config.min_max_tokens,
                                       int(self.config.context_size * (attempt / (attempt + 1))))
                     messages, _ = self.assemble(base, scratch, ctx_reserve)
-                stream = self.client.stream(messages, gen_reserve, step_temperature, stats, kind=gen_kind)
-                # Split the model's <think> reasoning from its answer as it
-                # streams, so the reasoning shows in its own visible thinking
-                # area instead of being hidden or dumped raw into the answer.
-                splitter = ThinkSplitter()
+                stream = self.client.stream(attach(messages), gen_reserve, step_temperature,
+                                            stats, kind=gen_kind)
+                # Reasoning, answer and tool-call text are told apart as they
+                # stream: <think> goes to the thinking area, a call becomes
+                # tool_call_start/tool_call_delta instead of JSON flashing in
+                # the answer bubble, and a completed call ends the stream.
+                lane = _AgLane(ToolCallStreamDetector(known))
                 try:
-                    async for token in stream:
-                        if cancel is not None and cancel.is_set():
-                            cancelled = True
-                            break
-                        buffer += token
-                        for kind, piece in splitter.feed(token):
-                            if not piece:
-                                continue
-                            if kind == "think":
-                                yield {"type": "think_token", "token": piece, "step": step}
-                            else:
-                                yield {"type": "token", "token": piece, "step": step}
-                        visible = strip_reasoning(buffer).lstrip()
-                        if visible.startswith(("{", "```")) and parse_tool_call(buffer, known):
-                            break
-                    # Release the partial-tag tail the splitter is still
-                    # holding: nothing arrives after the last token, so an
-                    # answer ending in "a < b" would lose its last characters.
-                    for kind, piece in splitter.flush():
-                        yield {"type": "think_token" if kind == "think" else "token",
-                               "token": piece, "step": step}
+                    async for event in self.stream_lane(stream, lane, step=step,
+                                                        cancel=cancel, stats=stats,
+                                                        known=known):
+                        yield event
+                    buffer = lane.text
+                    cancelled = lane.cancelled
                     step_failed = False
                     break
                 except Exception as exc:
+                    buffer = lane.text
                     await stream.aclose()
                     log(f"generation step {step} attempt {attempt + 1} failed: {exc}",
                         logging.DEBUG)
@@ -3666,10 +4581,13 @@ class Agent:
                 return
 
             account(stats)
+            reasoning_log.append((step, lane.thinking))
             yield {"type": "usage", "step": step, **stats.as_event()}
 
             if cancelled:
-                yield {"type": "cancelled", "step": step, "partial": buffer.strip(), "trace": trace}
+                yield {"type": "cancelled", "step": step,
+                       "partial": lane.visible.strip() or draft, "trace": trace,
+                       "reasoning": _ag_join_reasoning(reasoning_log)}
                 return
 
             call = parse_tool_call(buffer, known)
@@ -3892,6 +4810,9 @@ class Agent:
                 return
 
             name, args = call
+            # The id the detector gave this call while it streamed, so the
+            # card the UI opened on tool_call_start is the one that fills in.
+            call_id, announced = lane.first_call()
 
             if name == "final_answer":
                 answer = str(args.get("answer") or "").strip()
@@ -3950,28 +4871,47 @@ class Agent:
                     error = None
                 else:
                     delegated += 1
-                    yield {"type": "tool_call", "name": name, "args": args, "step": step}
-                    yield {"type": "phase", "label": f"helper {delegated}: {sub_task[:60]}"}
-                    try:
-                        async with self.subagents:
-                            result = await asyncio.wait_for(
-                                self.run_subagent(sub_task, caps, conversation_id),
-                                timeout=self.config.agent_run_timeout)
-                        error = None
-                    except asyncio.TimeoutError:
-                        result = (f"(the helper ran out of time after "
-                                  f"{self.config.agent_run_timeout:.0f}s)")
-                        error = result
-                    except Exception as exc:
-                        result = f"(the helper failed: {type(exc).__name__}: {exc})"
-                        error = result
-                        log(f"subagent failed: {exc}", logging.WARNING)
+
+                    # Spawning a helper is an action like any other, so it goes
+                    # through _dispatch (and its approval gate); only the
+                    # execution differs, since a child agent is a coroutine on
+                    # this loop rather than a registry handler.
+                    async def helper(run_args: dict, _task: str = sub_task,
+                                     _caps: str = caps) -> tuple[str, str | None]:
+                        task_text = str(run_args.get("task") or _task).strip() or _task
+                        caps_text = str(run_args.get("capabilities", _caps) or "")
+                        try:
+                            async with self.subagents:
+                                out = await asyncio.wait_for(
+                                    self.run_subagent(task_text, caps_text, conversation_id),
+                                    timeout=self.config.agent_run_timeout)
+                            return out, None
+                        except asyncio.TimeoutError:
+                            msg = (f"(the helper ran out of time after "
+                                   f"{self.config.agent_run_timeout:.0f}s)")
+                            return msg, msg
+                        except Exception as exc:
+                            log(f"subagent failed: {exc}", logging.WARNING)
+                            msg = f"(the helper failed: {type(exc).__name__}: {exc})"
+                            return msg, msg
+
+                    outcome = None
+                    async for event in self._dispatch(
+                            name, args, conversation_id, step=step, call_id=call_id,
+                            started=announced, cancel=cancel, runner=helper,
+                            before_run=[{"type": "phase",
+                                         "label": f"helper {delegated}: {sub_task[:60]}"}]):
+                        if "__dispatched__" in event:
+                            outcome = event["__dispatched__"]
+                        else:
+                            yield event
+                    args, result, error = outcome.args, outcome.result, outcome.error
                     if not result:
                         result = "(the helper came back with nothing)"
                     trace.append({"name": name, "args": args,
                                   "result": str(result)[:1000], "error": error})
-                    yield {"type": "tool_result", "name": name, "result": result,
-                           "error": error, "step": step}
+                    yield {"type": "tool_result", "id": outcome.call_id, "name": name,
+                           "result": result, "error": error, "step": step}
                 scratch.append({"role": "assistant",
                                 "content": strip_reasoning(buffer).strip()})
                 scratch.append({"role": "user", "content":
@@ -3979,21 +4919,34 @@ class Agent:
                                 "original question. You cannot see the work it did."})
                 continue
 
-            signature = f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)}"
-            yield {"type": "tool_call", "name": name, "args": args, "step": step}
-
-            if signature in seen_calls:
-                result = (
+            signature = _ag_signature(name, args)
+            short = None
+            if signature in denied_calls:
+                # Asked and refused already this turn: say so again rather
+                # than putting the same question to the user twice.
+                short = (denied_calls[signature], denied_calls[signature])
+            elif signature in seen_calls:
+                short = (
                     f"You already called {name} with these arguments and received a result. "
                     "Do not repeat it. Answer the user now with what you have, or call a "
-                    "different tool."
-                )
-                error = None
-            else:
-                seen_calls.append(signature)
-                result, error = await asyncio.to_thread(
-                    self.registry.call, name, args, conversation_id
-                )
+                    "different tool.", None)
+            outcome = None
+            async for event in self._dispatch(name, args, conversation_id, step=step,
+                                              call_id=call_id, started=announced,
+                                              cancel=cancel, short_circuit=short):
+                if "__dispatched__" in event:
+                    outcome = event["__dispatched__"]
+                else:
+                    yield event
+            # The signature of what actually RAN: an approver may have edited
+            # the arguments, and a repeat of the edited call is the duplicate.
+            args, result, error = outcome.args, outcome.result, outcome.error
+            denied = outcome.denied or signature in denied_calls
+            if short is None:
+                if outcome.denied:
+                    denied_calls[signature] = result
+                else:
+                    seen_calls.append(_ag_signature(name, args))
 
             budget = self._tool_budget(reserve)
             result_for_model, was_summarised = await self.compress_tool_result(name, result, budget)
@@ -4010,7 +4963,8 @@ class Agent:
                                      describe_document(
                                          Path(str(args.get("path") or "")).suffix.lower()))
                 self.save_task(conversation_id, task)
-            yield {"type": "tool_result", "name": name, "result": result, "error": error,
+            yield {"type": "tool_result", "id": outcome.call_id, "name": name,
+                   "result": result, "error": error,
                    "step": step, "context_chars": len(result_for_model),
                    "summarised": was_summarised}
             ev = detail(f"tool {name}: {len(result)} chars returned, "
@@ -4023,9 +4977,10 @@ class Agent:
             scratch.append({"role": "assistant", "content": strip_reasoning(buffer).strip()})
             scratch.append({
                 "role": "user",
-                "content": f"TOOL RESULT [{name}]:\n{result_for_model}\n\n"
-                           "Use this to answer the original question, or call one more tool "
-                           "if you genuinely still need it.",
+                "content": (outcome.scratch_note() if denied else
+                            f"TOOL RESULT [{name}]:\n{result_for_model}\n\n"
+                            "Use this to answer the original question, or call one more tool "
+                            "if you genuinely still need it."),
             })
 
         # Ordinary step budget exhausted without a final answer. Rather than
@@ -4053,7 +5008,9 @@ class Agent:
             for extra in range(1, self.config.agent_max_steps + 1):
                 step = self.config.agent_max_steps * extra_batches + extra
                 if cancel is not None and cancel.is_set():
-                    yield {"type": "cancelled", "step": step, "trace": trace}
+                    yield {"type": "cancelled", "step": step, "trace": trace,
+                           "partial": draft,
+                           "reasoning": _ag_join_reasoning(reasoning_log)}
                     return
                 messages, _ = self.assemble(base, scratch, reserve)
                 yield {"type": "step", "step": step, "max_steps": self.config.hard_step_cap,
@@ -4089,24 +5046,36 @@ class Agent:
                         yield done(answer, step, truncated=True)
                         return
                     continue
-                signature = f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)}"
-                yield {"type": "tool_call", "name": name, "args": args, "step": step}
-                if signature in seen_calls:
-                    result, error = ("Already ran that; use the result you have or try "
-                                     "another tool.", None)
-                else:
-                    seen_calls.append(signature)
-                    result, error = await asyncio.to_thread(
-                        self.registry.call, name, args, conversation_id
-                    )
+                signature = _ag_signature(name, args)
+                short = None
+                if signature in denied_calls:
+                    short = (denied_calls[signature], denied_calls[signature])
+                elif signature in seen_calls:
+                    short = ("Already ran that; use the result you have or try "
+                             "another tool.", None)
+                outcome = None
+                async for event in self._dispatch(name, args, conversation_id, step=step,
+                                                  cancel=cancel, short_circuit=short):
+                    if "__dispatched__" in event:
+                        outcome = event["__dispatched__"]
+                    else:
+                        yield event
+                args, result, error = outcome.args, outcome.result, outcome.error
+                denied = outcome.denied or signature in denied_calls
+                if short is None:
+                    if outcome.denied:
+                        denied_calls[signature] = result
+                    else:
+                        seen_calls.append(_ag_signature(name, args))
                 budget = self._tool_budget(reserve)
                 result_for_model, _ = await self.compress_tool_result(name, result, budget)
                 trace.append({"name": name, "args": args, "result": result[:1000], "error": error})
-                yield {"type": "tool_result", "name": name, "result": result,
-                       "error": error, "step": step}
+                yield {"type": "tool_result", "id": outcome.call_id, "name": name,
+                       "result": result, "error": error, "step": step}
                 scratch.append({"role": "assistant", "content": strip_reasoning(buffer).strip()})
-                scratch.append({"role": "user",
-                                "content": f"TOOL RESULT [{name}]:\n{result_for_model}"})
+                scratch.append({"role": "user", "content": (
+                    outcome.scratch_note() if denied
+                    else f"TOOL RESULT [{name}]:\n{result_for_model}")})
                 self.partial_add(conversation_id, f"Tool {name}: {str(result)[:500]}")
 
             if not batch_progress:
