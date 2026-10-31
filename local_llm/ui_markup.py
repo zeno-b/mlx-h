@@ -39,11 +39,11 @@ UI_HEAD = r"""
  <meta charset="utf-8">
  <meta name="viewport" content="width=device-width, initial-scale=1">
  <title>{{APP_NAME}}</title>
- <!-- Texcel brand typeface. Loaded when online; the CSS font stack falls back to
-      a clean geometric system sans offline, so the app never blocks on this. -->
+ <!-- The one interface typeface. Loaded when online; the CSS font stack falls
+      back to the system sans offline, so the app never blocks on this. -->
  <link rel="preconnect" href="https://fonts.googleapis.com">
  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
- <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Raleway:ital,wght@0,400;0,500;0,600;0,700;0,800;1,400&display=swap">
+ <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap">
  <style>"""
 
 UI_BODY = r"""</style>

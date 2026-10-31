@@ -43,7 +43,11 @@ UI_CSS = r"""
      --r-sm: 6px; --r-md: 10px; --r-lg: 14px; --r-pill: 999px;
      --fs-xs: 11px; --fs-sm: 12px; --fs-md: 14px; --fs-lg: 16px; --fs-xl: 20px;
      --lh: 1.5;
-     --font-sans: "Raleway", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+     /* One typeface for the whole interface. Monospace is reserved for
+        literal code (code blocks, inline code, tool output, logs), where
+        column alignment matters; numbers in the chrome use tabular figures
+        of the sans instead. */
+     --font-sans: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
      --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
      --ctl-h: 34px; --ctl-h-sm: 28px;
      --z-tip: 50; --z-pop: 60; --z-modal: 70; --z-login: 100;
@@ -98,6 +102,13 @@ UI_CSS = r"""
      --chart-2: #2563eb;
      --chart-3: #1f7a3d;
      --chart-4: #7719aa;
+     --rail-bg: #f0f0f3;
+     --rail-border: #e3e3e8;
+     --rail-fg: #55575d;
+     --rail-hover: rgba(16, 16, 20, 0.05);
+     --rail-active-bg: #ffffff;
+     --rail-active-fg: #1a1a1a;
+     --rail-active-ring: rgba(16, 16, 20, 0.07);
    }
    /* Dark theme, written twice on purpose: once for the explicit choice
       (html.dark) and once for System mode when the OS is dark. CSS has no
@@ -146,6 +157,13 @@ UI_CSS = r"""
      --chart-2: #6ea8fe;
      --chart-3: #9be29b;
      --chart-4: #c792ea;
+     --rail-bg: #0f0e0d;
+     --rail-border: #252321;
+     --rail-fg: #a3a19e;
+     --rail-hover: rgba(255, 255, 255, 0.045);
+     --rail-active-bg: #23211f;
+     --rail-active-fg: #f4f4f4;
+     --rail-active-ring: rgba(255, 255, 255, 0.07);
    }
    @media (prefers-color-scheme: dark) {
      html:not(.light):not(.dark) {
@@ -192,6 +210,13 @@ UI_CSS = r"""
        --chart-2: #6ea8fe;
        --chart-3: #9be29b;
        --chart-4: #c792ea;
+       --rail-bg: #0f0e0d;
+       --rail-border: #252321;
+       --rail-fg: #a3a19e;
+       --rail-hover: rgba(255, 255, 255, 0.045);
+       --rail-active-bg: #23211f;
+       --rail-active-fg: #f4f4f4;
+       --rail-active-ring: rgba(255, 255, 255, 0.07);
      }
    }
    /* Appearance preferences. They redefine size tokens on <body>, so every
@@ -228,7 +253,7 @@ UI_CSS = r"""
    }
    * { scrollbar-width: thin; scrollbar-color: var(--btn-border) transparent; }
    ::selection { background: color-mix(in srgb, var(--accent) 30%, transparent); }
-   h1, h2, h3, h4, h5 { margin: 0; line-height: 1.3; font-weight: 700; }
+   h1, h2, h3, h4, h5 { margin: 0; line-height: 1.3; font-weight: 600; letter-spacing: -0.01em; }
    h1 { font-size: var(--fs-xl); }
    h2 { font-size: var(--fs-lg); }
    h3, h4, h5 { font-size: var(--fs-md); }
@@ -249,15 +274,15 @@ UI_CSS = r"""
    .hl-com { color: var(--hl-com); font-style: italic; }
 
    /* ============================================================ typography */
-   .h1 { font-size: var(--fs-xl); font-weight: 700; line-height: 1.3; margin: 0; }
-   .h2 { font-size: var(--fs-lg); font-weight: 700; line-height: 1.3; margin: 0; }
-   .h3 { font-size: var(--fs-md); font-weight: 700; line-height: 1.3; margin: 0; }
+   .h1 { font-size: var(--fs-xl); font-weight: 600; line-height: 1.3; letter-spacing: -0.01em; margin: 0; }
+   .h2 { font-size: var(--fs-lg); font-weight: 600; line-height: 1.3; letter-spacing: -0.01em; margin: 0; }
+   .h3 { font-size: var(--fs-md); font-weight: 600; line-height: 1.3; margin: 0; }
    .muted { color: var(--muted); }
    .hint { font-size: var(--fs-xs); color: var(--muted); line-height: 1.45; margin: 0; }
    .hint.warn { color: var(--warn); }
    .hint.error { color: var(--error); }
    .hint.ok { color: var(--success); }
-   .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+   .mono { font-variant-numeric: tabular-nums slashed-zero; }
    .fs-xs { font-size: var(--fs-xs); }
    .fs-sm { font-size: var(--fs-sm); }
    .strong { font-weight: 600; }
@@ -476,7 +501,7 @@ UI_CSS = r"""
    .range { display: flex; align-items: center; gap: var(--sp-3); min-width: 0; width: 100%; }
    .range input[type=range] { flex: 1 1 auto; }
    .range-value {
-     min-width: 5ch; text-align: right; font-family: var(--font-mono);
+     min-width: 5ch; text-align: right;
      font-size: var(--fs-sm); color: var(--fg); font-variant-numeric: tabular-nums;
    }
    input[type=range] {
@@ -593,12 +618,12 @@ UI_CSS = r"""
    .card.failed { border-color: color-mix(in srgb, var(--error) 60%, var(--border)); }
    .card h4 { margin: 0; font-size: var(--fs-md); }
    .card .goal { font-size: var(--fs-sm); color: var(--muted); line-height: 1.45; max-height: 3.2em; overflow: hidden; }
-   .card .meta { font-size: var(--fs-xs); color: var(--muted); font-family: var(--font-mono); }
+   .card .meta { font-size: var(--fs-xs); color: var(--muted); font-variant-numeric: tabular-nums; }
    .pill {
      display: inline-flex; align-items: center; gap: var(--sp-1);
      padding: 1px var(--sp-2); border-radius: var(--r-pill);
      border: 1px solid var(--btn-border); color: var(--muted);
-     font-family: var(--font-mono); font-size: var(--fs-xs); line-height: 1.5;
+     font-size: var(--fs-xs); font-weight: 500; line-height: 1.5; font-variant-numeric: tabular-nums;
      white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis;
    }
    .pill.ok { border-color: var(--success); color: var(--success); }
@@ -633,7 +658,7 @@ UI_CSS = r"""
    .table tbody tr:hover td, table.models tr:hover td { background: var(--surface-2); }
    .table td.cell-status, .table td.cell-action { width: 1%; white-space: nowrap; }
    .table td.cell-action { text-align: right; }
-   .table td.id, table.models td.id, .table .mono { font-family: var(--font-mono); font-size: var(--fs-sm); word-break: break-all; }
+   .table td.id, table.models td.id, .table .mono { font-variant-numeric: tabular-nums slashed-zero; font-size: var(--fs-sm); word-break: break-all; }
    .readonly {
      display: flex; align-items: center; min-height: var(--ctl-h); width: 100%; min-width: 0;
      padding: var(--sp-1) var(--sp-3);
@@ -655,7 +680,7 @@ UI_CSS = r"""
      border: 1px solid var(--border); border-radius: var(--r-md);
      font-family: var(--font-mono); font-size: var(--fs-xs); line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere;
    }
-   .tools-list { font-size: var(--fs-xs); color: var(--muted); font-family: var(--font-mono); line-height: 1.6; }
+   .tools-list { font-size: var(--fs-xs); color: var(--muted); line-height: 1.6; }
 
    /* ============================================================== tooltips */
    /* Any element with data-tip explains itself on hover (mouse only: on a
@@ -710,7 +735,7 @@ UI_CSS = r"""
    .brand-slot { display: inline-flex; align-items: center; }
    .brand-logo { height: 24px; width: auto; aspect-ratio: 160.03 / 183.2; display: block; }
    .brand-mark { font-size: 18px; line-height: 1; color: var(--accent); }
-   .brand strong { font-weight: 800; font-size: var(--fs-md); letter-spacing: .09em; text-transform: uppercase; white-space: nowrap; }
+   .brand strong { font-weight: 700; font-size: var(--fs-md); letter-spacing: .06em; text-transform: uppercase; white-space: nowrap; }
    .brand .build { color: var(--muted); font-size: var(--fs-xs); white-space: nowrap; }
    body > header .seg { flex: 0 1 auto; }
    /* One line, ellipsised. The full detail lives in the pill's tooltip, so
@@ -783,7 +808,7 @@ UI_CSS = r"""
      align-self: flex-start; max-width: 85%; min-width: 0;
      padding: var(--sp-2) var(--sp-3);
      background: var(--surface-2); border: 1px solid var(--tool); border-radius: var(--r-md);
-     font-family: var(--font-mono); font-size: var(--fs-sm);
+     font-size: var(--fs-sm);
    }
    .tool-card .name { color: var(--tool); font-weight: 600; }
    .tool-card .args { color: var(--muted); margin: var(--sp-1) 0; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -809,7 +834,7 @@ UI_CSS = r"""
    .gnode.ok::before { border-color: var(--success); background: var(--success); }
    .gnode.failed::before { border-color: var(--error); background: var(--error); }
    .gnode.notice::before { border-color: var(--warn); background: var(--warn); }
-   .gnode .ghead { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; color: var(--muted); font-family: var(--font-mono); font-size: var(--fs-sm); }
+   .gnode .ghead { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; color: var(--muted); font-size: var(--fs-sm); }
    .gnode.tool .ghead { cursor: pointer; user-select: none; }
    .gnode .gtool { color: var(--tool); font-weight: 600; }
    .gnode .gpill {
@@ -820,7 +845,7 @@ UI_CSS = r"""
    .gnode.tool.running .gpill { background: var(--accent-soft); color: var(--accent); }
    .gnode .gcaret { margin-left: auto; color: var(--muted); transition: transform .15s ease; }
    .gnode.open .gcaret { transform: rotate(90deg); }
-   .gnode .gargs { color: var(--muted); font-family: var(--font-mono); font-size: var(--fs-sm); margin-top: 3px; overflow-wrap: anywhere; }
+   .gnode .gargs { color: var(--muted); font-size: var(--fs-sm); margin-top: 3px; overflow-wrap: anywhere; }
    .gbody {
      margin: 6px 0 0; padding: var(--sp-2) 10px; max-height: 240px; overflow: auto;
      background: var(--logbox-bg); color: var(--logbox-fg); border-radius: var(--r-sm);
@@ -846,7 +871,7 @@ UI_CSS = r"""
    .gnode.diff .gtool { color: var(--accent); }
    .gnode.diff:not(.open) .gbody { display: none; }
    .gdiff { max-height: 340px; overflow: auto; font-size: var(--fs-xs); line-height: 1.4; }
-   .gdetail { margin: 1px 0 1px 22px; font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--muted); white-space: pre-wrap; }
+   .gdetail { margin: 1px 0 1px 22px; font-size: var(--fs-xs); color: var(--muted); white-space: pre-wrap; }
    .gdetail::before { content: "\2699 "; opacity: 0.6; }
    /* The answer is the turn's result, not a step: no timeline dot. */
    .gnode.answer::before { content: none; }
@@ -858,7 +883,7 @@ UI_CSS = r"""
    }
    .gnode.answer.pending .gtext { opacity: 0.75; }
    .gnode.answer.failed .gtext { border-color: color-mix(in srgb, var(--error) 50%, var(--border)); }
-   .gmeta { color: var(--muted); font-size: var(--fs-xs); font-family: var(--font-mono); margin: 2px 0 0 6px; }
+   .gmeta { color: var(--muted); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; margin: 2px 0 0 6px; }
    /* One line, always the same height, never wider than the column: a long
       notice used to wrap to four lines and snap back on the next event,
       moving the page under text being read. tabular-nums keeps the clock
@@ -866,7 +891,7 @@ UI_CSS = r"""
    .gactivity {
      display: flex; align-items: center; gap: var(--sp-2);
      min-height: 17px; min-width: 0; margin: 2px 0 0 6px;
-     font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--accent);
+     font-size: var(--fs-sm); color: var(--accent);
      transition: color .45s ease;
    }
    .gactivity .glabel { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
@@ -904,7 +929,7 @@ UI_CSS = r"""
      display: flex; justify-content: space-between; align-items: center; gap: var(--sp-2);
      padding: 3px var(--sp-1) 3px var(--sp-3);
      background: var(--chip-bg); border-bottom: 1px solid var(--border);
-     font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--muted);
+     font-size: var(--fs-xs); font-weight: 500; color: var(--muted);
    }
    .codebar .btn, .codebar button { min-height: 22px; padding: 0 var(--sp-2); font-size: var(--fs-xs); border-radius: var(--r-sm); color: var(--muted); }
    .codebar .btn:hover:not(:disabled), .codebar button:hover:not(:disabled) { color: var(--fg); }
@@ -1030,7 +1055,7 @@ UI_CSS = r"""
    .task-card:hover { border-color: var(--btn-border); }
    .task-card.selected:hover { border-color: var(--accent); }
    #runFeed { display: flex; flex-direction: column; gap: var(--sp-2); }
-   .feed-line { font-size: var(--fs-sm); color: var(--muted); font-family: var(--font-mono); overflow-wrap: anywhere; }
+   .feed-line { font-size: var(--fs-sm); color: var(--muted); overflow-wrap: anywhere; }
    .feed-answer {
      padding: 10px var(--sp-3); border: 1px solid var(--success); border-radius: var(--r-md);
      background: var(--surface); white-space: pre-wrap; line-height: 1.45; overflow-wrap: anywhere;
@@ -1077,22 +1102,37 @@ UI_CSS = r"""
 
    /* ============================================================== settings */
    #settingsView { flex-direction: row; }
+   /* The rail is its own quiet, tinted surface with neutral item states. The
+      accent is kept for the active item's icon and the unsaved-edits dot, so
+      orange in the rail always means something. */
    .settings-rail {
-     flex: 0 0 220px; width: 220px; min-width: 0;
-     display: flex; flex-direction: column; gap: 2px;
+     flex: 0 0 240px; width: 240px; min-width: 0;
+     display: flex; flex-direction: column; gap: var(--sp-1);
      padding: var(--sp-4) var(--sp-3); overflow-y: auto;
-     background: var(--panel-bg); border-right: 1px solid var(--border);
+     background: var(--rail-bg); border-right: 1px solid var(--rail-border);
    }
-   .settings-rail input[type=search], #settingsSearch { width: 100%; margin-bottom: var(--sp-3); flex: 0 0 auto; }
+   .rail-title { padding: 0 var(--sp-2) var(--sp-2); font-size: var(--fs-lg); font-weight: 600; letter-spacing: -0.01em; }
+   .rail-search { position: relative; flex: 0 0 auto; margin-bottom: var(--sp-3); }
+   .rail-search .icon { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: var(--muted); pointer-events: none; }
+   .rail-search #settingsSearch { width: 100%; padding-left: 32px; }
    .rail-items { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
    .rail-item {
-     width: 100%; justify-content: flex-start; text-align: left; flex: 0 0 auto;
-     background: transparent; border-color: transparent; color: var(--muted); font-weight: 600;
+     width: 100%; justify-content: flex-start; gap: 10px; text-align: left; flex: 0 0 auto;
+     padding: 0 var(--sp-2) 0 10px; border-radius: var(--r-sm);
+     background: transparent; border-color: transparent; color: var(--rail-fg); font-weight: 500;
    }
-   .rail-item:hover:not(:disabled) { background: var(--btn-hover); color: var(--fg); }
+   .rail-item .rail-icon { opacity: 0.8; transition: color .12s ease, opacity .12s ease; }
+   .rail-item:hover:not(:disabled) { background: var(--rail-hover); color: var(--rail-active-fg); }
+   .rail-item:hover:not(:disabled) .rail-icon { opacity: 1; }
    .rail-item.active, .rail-item[aria-current="page"], .rail-item[aria-current="true"], .rail-item[aria-selected="true"], .rail-item[aria-pressed="true"] {
-     background: var(--accent-soft); border-color: transparent; color: var(--fg);
-     box-shadow: inset 3px 0 0 var(--accent);
+     background: var(--rail-active-bg); border-color: transparent; color: var(--rail-active-fg);
+     box-shadow: 0 0 0 1px var(--rail-active-ring), var(--shadow-1);
+   }
+   .rail-item.active .rail-icon, .rail-item[aria-selected="true"] .rail-icon { color: var(--accent); opacity: 1; }
+   /* A section holding unsaved edits (settingsUpdateBar toggles .dirty). */
+   .rail-item.dirty::after {
+     content: ""; flex: 0 0 auto; margin-left: auto;
+     width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
    }
    .settings-main {
      flex: 1 1 auto; min-width: 0; min-height: 0;
@@ -1250,7 +1290,7 @@ UI_CSS = r"""
    .ops-meter { display: flex; flex-direction: column; gap: 2px; min-width: 72px; }
    .ops-meter .meter > div.warn { background: var(--warn); }
    .ops-meter .meter > div.error { background: var(--error); }
-   .ops-code { font-family: var(--font-mono); font-size: var(--fs-xl); letter-spacing: .12em; }
+   .ops-code { font-size: var(--fs-xl); font-weight: 600; letter-spacing: .12em; font-variant-numeric: tabular-nums slashed-zero; }
    /* The cluster node table has six columns; on a phone it scrolls inside
       the card instead of widening the page. */
    .ops-scroll { overflow-x: auto; min-width: 0; }
@@ -1303,7 +1343,7 @@ UI_CSS = r"""
    .msg-thumb { display: block; max-width: 180px; max-height: 140px; object-fit: cover; border-radius: var(--r-md); border: 1px solid var(--border); background: var(--surface); cursor: zoom-in; }
    .msg.user .att-chip { background: color-mix(in srgb, var(--accent-fg) 14%, transparent); border-color: transparent; color: inherit; }
    .msg-reasoning { margin: 0 0 var(--sp-2); }
-   .msg-reasoning > summary { cursor: pointer; user-select: none; color: var(--muted); font-family: var(--font-mono); font-size: var(--fs-xs); }
+   .msg-reasoning > summary { cursor: pointer; user-select: none; color: var(--muted); font-size: var(--fs-xs); }
    .msg-reasoning-body { margin: var(--sp-1) 0 0; max-height: 200px; overflow: auto; color: var(--muted); font-style: italic; font-size: var(--fs-sm); white-space: pre-wrap; overflow-wrap: anywhere; }
    .msg-meta { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); margin-top: var(--sp-1); color: var(--muted); font-size: var(--fs-xs); white-space: normal; }
    .gnode.tool.awaiting .gpill { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
@@ -1342,7 +1382,7 @@ UI_CSS = r"""
    }
    .notif-item .notif-title { font-weight: 600; font-size: var(--fs-sm); }
    .notif-item .notif-body { color: var(--muted); font-size: var(--fs-sm); overflow-wrap: anywhere; }
-   .notif-item .notif-when { color: var(--muted); font-size: var(--fs-xs); font-family: var(--font-mono); }
+   .notif-item .notif-when { color: var(--muted); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
    .notif-item.unread .notif-title::before, .notif-item.unread .notif-body:first-child::before {
      content: ""; display: inline-block; width: 7px; height: 7px; margin-right: var(--sp-1);
      border-radius: 50%; background: var(--accent); vertical-align: middle;
@@ -1442,18 +1482,16 @@ UI_CSS = r"""
      .settings-rail {
        flex: 0 0 auto; width: auto; gap: var(--sp-2);
        padding: var(--sp-2) var(--sp-3); overflow: visible;
-       border-right: 0; border-bottom: 1px solid var(--border);
+       border-right: 0; border-bottom: 1px solid var(--rail-border);
      }
-     .settings-rail input[type=search], #settingsSearch { margin: 0; }
+     .rail-title, .rail-item .rail-icon { display: none; }
+     .rail-search { margin: 0; }
      .rail-items {
        flex-direction: row; overflow-x: auto; scrollbar-width: none;
-       padding: 2px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--r-md);
+       padding: 2px; border: 1px solid var(--rail-border); border-radius: var(--r-md);
      }
      .rail-items::-webkit-scrollbar { display: none; }
-     .rail-item { width: auto; min-height: calc(var(--ctl-h) - 6px); padding: 0 var(--sp-3); font-size: var(--fs-sm); border-radius: calc(var(--r-md) - 3px); }
-     .rail-item.active, .rail-item[aria-current="page"], .rail-item[aria-current="true"], .rail-item[aria-selected="true"], .rail-item[aria-pressed="true"] {
-       background: var(--btn-bg); border-color: var(--border); box-shadow: var(--shadow-1);
-     }
+     .rail-item { width: auto; gap: 6px; min-height: calc(var(--ctl-h) - 6px); padding: 0 var(--sp-3); font-size: var(--fs-sm); border-radius: calc(var(--r-md) - 3px); }
      .settings-main { padding: var(--sp-4) var(--sp-3) 0; }
      .settings-bar { padding: var(--sp-2) var(--sp-3); }
      /* Tasks: list above the monitor, one scroll for both. */

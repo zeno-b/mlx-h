@@ -1134,21 +1134,64 @@ def _uis_section(sec: dict[str, Any], first: bool) -> str:
     return "".join(parts)
 
 
+# Rail icons, keyed by section: the inner paths of a 24x24 stroke icon in the
+# same line style as the header icons. Presentation only, so they live here
+# rather than in the settings schema.
+_RAIL_ICONS = {
+    "appearance": '<circle cx="13.5" cy="6.5" r="1"/><circle cx="17.5" cy="10.5" r="1"/>'
+                  '<circle cx="8.5" cy="7.5" r="1"/><circle cx="6.5" cy="12.5" r="1"/>'
+                  '<path d="M12 2a10 10 0 0 0 0 20c.93 0 1.65-.75 1.65-1.69 0-.44-.18-.84-.44-1.13'
+                  '-.29-.29-.44-.65-.44-1.12a1.64 1.64 0 0 1 1.67-1.67h2c3.05 0 5.55-2.5 5.55-5.55'
+                  'C21.97 6.01 17.46 2 12 2z"/>',
+    "generation": '<path d="M9.94 15.5A2 2 0 0 0 8.5 14.06l-6.14-1.58a.5.5 0 0 1 0-.96L8.5 9.94'
+                  'A2 2 0 0 0 9.94 8.5l1.58-6.14a.5.5 0 0 1 .96 0l1.58 6.14a2 2 0 0 0 1.44 1.44'
+                  'l6.14 1.58a.5.5 0 0 1 0 .96l-6.14 1.58a2 2 0 0 0-1.44 1.44l-1.58 6.14a.5.5 0 0 1-.96 0z"/>'
+                  '<path d="M20 3v4"/><path d="M22 5h-4"/>',
+    "agent": '<path d="M12 8V4H8"/><rect x="4" y="8" width="16" height="12" rx="2"/>'
+             '<path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/>',
+    "models": '<path d="M12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0'
+              ' 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83z"/><path d="m2 12.65 9.17 4.16a2 2 0 0 0 1.66 0L22 12.65"/>'
+              '<path d="m2 17.65 9.17 4.16a2 2 0 0 0 1.66 0L22 17.65"/>',
+    "performance": '<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>',
+    "memory": '<path d="M12 7v14"/><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4'
+              ' 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/>',
+    "tools": '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94'
+             ' 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94z"/>',
+    "admin": '<path d="M2.59 17.41A2 2 0 0 0 2 18.83V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1'
+             ' 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.17a2 2 0 0 0 1.42-.59l.81-.81a6.5 6.5 0 1 0-4-4z"/>'
+             '<circle cx="16.5" cy="7.5" r="1"/>',
+}
+
+_SEARCH_ICON = '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>'
+
+
+def _uis_icon(paths: str, cls: str = "icon", size: int = 18) -> str:
+    return (f'<svg class="{cls}" viewBox="0 0 24 24" width="{size}" height="{size}" aria-hidden="true"'
+            ' fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"'
+            f' stroke-linejoin="round">{paths}</svg>')
+
+
 def render_settings_html() -> str:
     """The whole #settingsView: rail, search, sections, settings bar."""
     rail = "".join(
         f'<button type="button" class="rail-item{" admin-only" if s.get("admin") else ""}'
         f'{" active" if i == 0 else ""}" data-section="{s["key"]}" role="tab"'
         f' aria-selected="{"true" if i == 0 else "false"}"'
-        f' onclick="openSettings(\'{s["key"]}\')">{_uis_esc(s["label"])}</button>'
+        f' onclick="openSettings(\'{s["key"]}\')">'
+        f'{_uis_icon(_RAIL_ICONS.get(s["key"], ""), "icon rail-icon")}'
+        f'<span>{_uis_esc(s["label"])}</span></button>'
         for i, s in enumerate(SETTINGS_SECTIONS))
     sections = "".join(_uis_section(s, i == 0) for i, s in enumerate(SETTINGS_SECTIONS))
     first = SETTINGS_SECTIONS[0]
     return (
         '<div id="settingsView" class="view hidden" aria-label="Settings">'
         '<nav class="settings-rail" id="settingsRail" aria-label="Settings sections">'
+        '<div class="rail-title" aria-hidden="true">Settings</div>'
+        '<div class="rail-search">'
+        f'{_uis_icon(_SEARCH_ICON, size=15)}'
         '<input type="search" id="settingsSearch" class="input" placeholder="Search settings"'
         ' aria-label="Search settings" autocomplete="off" spellcheck="false">'
+        '</div>'
         f'<div class="rail-items" role="tablist">{rail}</div>'
         '</nav>'
         '<div class="settings-main">'
@@ -1191,4 +1234,5 @@ __all__ = [
     "_uis_groups",
     "_uis_body",
     "_uis_section",
+    "_uis_icon",
 ]
