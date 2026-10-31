@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template for LocalLLM Bar.app/Contents/Info.plist. `deploy.py companion build`
+  fills the {{NAME}} placeholders (local_llm/companion.py:companion_render_info_plist)
+  and refuses to build if one is left over or the result does not parse.
+  LSUIElement keeps the app out of the Dock and the app switcher: it lives in the
+  menu bar only. NSAllowsArbitraryLoads lets it reach a self-hosted server over
+  plain http on a LAN or tailnet name, which App Transport Security would
+  otherwise block; the app warns in its menu when a token travels that way.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>{{EXECUTABLE}}</string>
+	<key>CFBundleIdentifier</key>
+	<string>{{BUNDLE_ID}}</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>{{NAME}}</string>
+	<key>CFBundleDisplayName</key>
+	<string>{{NAME}}</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>{{VERSION}}</string>
+	<key>CFBundleVersion</key>
+	<string>{{BUILD}}</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>{{MIN_MACOS}}</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+</dict>
+</plist>

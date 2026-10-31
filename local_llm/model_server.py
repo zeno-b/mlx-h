@@ -238,6 +238,44 @@ class ModelServerManager:
                                      if self.backend.help_module else "")
             return self._launch_signature() != before
 
+    # Config fields apply_config() reads: a settings change outside them can
+    # never make a restart due, so the caller need not touch the manager.
+    CONFIG_FIELDS = frozenset(cfg for _attr, cfg in _MSM_CONFIG_MAP) | {"model_backend"}
+
+    def launch_signature_for(self, config: Any) -> tuple:
+        """The launch signature apply_config(config) would leave, computed
+        without the lock and without changing anything. Comparing it before
+        and after a settings change tells whether that change alone alters
+        the next start's command."""
+        backend = get_backend(getattr(config, "model_backend", self.backend.name))
+        values = {attr: getattr(config, cfg_name) for attr, cfg_name in _MSM_CONFIG_MAP
+                  if hasattr(config, cfg_name)}
+        extra = values.get("backend_extra_args", self.backend_extra_args)
+        names = backend.launch_inputs or _MSM_LAUNCH_ATTRS
+        return (backend.name, str(extra or "")) + tuple(
+            values[name] if name in values else getattr(self, name, None) for name in names)
+
+    def apply_config_nowait(self, config: Any, wait: float = 0.25) -> bool:
+        """apply_config() for a request handler: never waits out a model load.
+
+        start() holds the lock for the whole launch (minutes for a cold model),
+        so a Settings save calling apply_config() could hang that long. This
+        waits at most `wait` seconds; when a start still holds the lock, the
+        answer is computed lock-free from the config and the apply itself runs
+        in a daemon thread that adopts the values once the start lets go (the
+        start in progress already built its command, so a restart is due
+        either way). Returns True when the next start launches differently.
+        """
+        if self.lock.acquire(timeout=max(0.0, float(wait))):
+            try:
+                return self.apply_config(config)
+            finally:
+                self.lock.release()
+        due = self.launch_signature_for(config) != self._launch_signature()
+        threading.Thread(target=self.apply_config, args=(config,), daemon=True,
+                         name="msm-apply-config").start()
+        return due
+
     def adapter_path(self) -> Path | None:
         """The adapter directory the next start will use, or None for the base model."""
         try:

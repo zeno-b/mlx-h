@@ -106,7 +106,9 @@ def test_legacy_capability_keys_expand_exactly_as_before():
         "create_document"]
     assert tools_for_capabilities(["code_exec"]) == always + ["run_shell", "run_python", "run_tests"]
     assert tools_for_capabilities(["web_api"]) == always + ["web_search", "fetch_url"]
-    assert tools_for_capabilities(["knowledge"]) == always
+    # Phase B (upgrade/ROUTING_AND_TOOLING.md P3): "knowledge" used to grant RAG
+    # only; it now also grants the knowledge-base tools. Deliberate change.
+    assert tools_for_capabilities(["knowledge"]) == always + ["search_docs", "kb_overview"]
     assert tools_for_capabilities(["office365"]) == always + [
         "o365_mail", "o365_files", "o365_calendar"]
     assert CAPABILITY_ORDER[:6] == ["file_ops", "code_exec", "web_api", "knowledge",
@@ -383,13 +385,19 @@ def test_image_generate_is_unavailable_without_a_generator_and_saves_output():
 # database
 # --------------------------------------------------------------------------- #
 def test_database_is_read_only():
-    reg = _reg(["database"])
+    # *.db is in the default FILE_DENY_GLOBS (Phase B, P8): a .db file in the
+    # project is reachable by name only once an admin narrows the list.
+    # DATABASE_URLS (below) is the supported way to name a database.
+    guarded = _reg(["database"])
+    reg = _reg(["database"], project_dir=str(_root(guarded)), file_deny_globs=".env,data/**")
     path = _root(reg) / "shop.db"
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE items (id INTEGER, name TEXT)")
     conn.executemany("INSERT INTO items VALUES (?, ?)", [(1, "pen"), (2, "ink")])
     conn.commit()
     conn.close()
+    _o, err = guarded.call("database", {"database": "shop.db", "sql": "SELECT 1"}, None)
+    assert err and "protected (FILE_DENY_GLOBS)" in err, err
     out, err = reg.call("database", {"database": "shop.db",
                                      "sql": "SELECT name, replace(name, 'p', 'P') FROM items "
                                             "ORDER BY id"}, None)

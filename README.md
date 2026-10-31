@@ -130,23 +130,72 @@ the multi-user, multi-node and auth features are additive and off by default.
 
 ## Installation
 
+**One line** (macOS on Apple Silicon; it never uses sudo):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zeno-b/native-silicon-local-llm/main/install.sh | bash
+```
+
+The installer checks for native arm64 and Python 3.10+ (it suggests
+`brew install python@3.12` when there is none), clones the repository into
+`~/local-llm` (`--dir` to change it) or fast-forwards an existing checkout, and
+runs `deploy.py init`. Options go after `bash -s --`, for example
+`... | bash -s -- --multi-user --service`:
+
+| option | effect |
+| --- | --- |
+| `--multi-user` | require login, bind all interfaces, generate an admin password (printed once) |
+| `--service` | install the launchd LaunchAgent: starts now and at login, restarts after a crash |
+| `--cluster primary` | multi-user plus a generated `NODE_TOKEN` |
+| `--join URL --code CODE` | make this Mac a secondary of the primary at URL (pairing code from its Settings > Cluster) |
+| `--model ID`, `--host HOST` | override the recommendation |
+| `--force` | regenerate an existing `.env` (the old one is kept as `.env.bak`) |
+| `--dry-run` | print every action without running it |
+
+Re-running is safe: it updates the checkout, refreshes the dependencies and keeps
+your `.env`. Run from inside a checkout (`./install.sh`), it uses that checkout. A
+HEAD-only Homebrew formula also exists; [packaging/README.md](packaging/README.md)
+explains where it keeps data and why install.sh is the recommended path.
+
+**By hand:**
+
 ```bash
 git clone https://github.com/zeno-b/native-silicon-local-llm.git
 cd native-silicon-local-llm
 
-# 1. Configure (optional — sensible RAM-based defaults otherwise)
-cp .env.example .env
-# edit .env: set AUTH_ENABLED=1 and AUTH_ADMIN_PASSWORD for multi-user, etc.
+# 1. Configure. init creates ./.venv, installs the dependencies and writes .env
+#    for this Mac: the model that fits its RAM with headroom, its context window
+#    and admission limits. Add --multi-user to require login.
+python3 deploy.py init
 
-# 2. Run. First launch creates ./.venv, installs deps, downloads a model, and
-#    initialises the SQLite database (schema + migrations) automatically.
+# 2. Run. The first launch downloads the model and initialises the SQLite
+#    database (schema + migrations) automatically.
 python3 deploy.py
 ```
 
+`deploy.py init` never overwrites an existing `.env`: it writes `.env.new` beside
+it and prints what differs (`--force` replaces it and keeps `.env.bak`). Without
+init, copy `.env.example` to `.env` and edit it; every variable is optional and
+the defaults scale with RAM.
+
 The app prints the detected RAM, the chosen model and context window, and the URL
-to open (a free port is picked if the preferred one is busy). Environment
-variables from `.env` are read by your shell/process manager — either `export`
-them, use `env $(cat .env | xargs)`, or a process manager that loads `.env`.
+to open (a free port is picked if the preferred one is busy). `deploy.py` and
+`python -m local_llm` read `.env` (or the file `LOCAL_LLM_ENV_FILE` names)
+themselves before anything else, so no `export` is needed. A variable already set
+in the environment wins over the file, and `LOCAL_LLM_DOTENV=0` turns the file
+off. Values are literal (no `$VAR` expansion) and switches are `1`/`0`:
+`AUTH_ENABLED=true` reads as off, which `--doctor` flags.
+
+**Run at login:** `python3 deploy.py service install` writes
+`~/Library/LaunchAgents/local.llm.server.plist`, which runs `.venv/bin/python
+deploy.py` from the checkout, restarts it after a crash and logs to
+`logs/service.*.log`. `service status` reports on it (read only) and
+`service uninstall` removes it.
+
+**Health check:** `python3 deploy.py --doctor` reports the ports, then checks the
+Python architecture, the venv, whether the configured model is downloaded, free
+disk, RAM against the model's size, and `.env` (parse errors, `true`/`false`
+switches, permissions).
 
 **Development mode** (single user, no login):
 
@@ -196,9 +245,11 @@ every variable with placeholders. Highlights:
 | Model catalogue | `MODEL_ALIASES`, `BENCH_MIN_DECODE_TPS`, `BENCH_HEADROOM_GB` (see [Model catalogue](#model-catalogue-aliases-and-the-benchmark-sweep)) |
 | Multi-node / remote | `CLUSTER_NODES`, `CLUSTER_HOSTFILE`, `CLUSTER_PYTHON`, `WEB_HOST`, `TRUSTED_PROXIES`, `PUBLIC_BASE_URL`, `NODE_CA_FILE`, `NODE_CLIENT_CERT`, `NODE_CLIENT_KEY`, `NODE_ALLOW_PLAINTEXT`, `NODE_E2E_KEY` |
 | Tool-call parsing | `TOOL_CALL_FORMAT`, `TOOL_CALL_REPAIR` (see [Tool-call formats](#tool-call-formats)) |
-| Tool approvals | `TOOL_APPROVAL_MODE`, `TOOL_APPROVAL_UNATTENDED`, `TOOL_APPROVAL_TIMEOUT_S`, `TOOL_APPROVAL_TAINT`, `TOOL_APPROVAL_ROLES` (see [Tool approvals and audit](#tool-approvals-and-audit)) |
+| Tool approvals | `APPROVAL_DEFAULT_MODE`, `TOOL_APPROVAL_MODE`, `TOOL_APPROVAL_UNATTENDED`, `TOOL_APPROVAL_TIMEOUT_S`, `TOOL_APPROVAL_TAINT`, `TOOL_APPROVAL_ROLES` (see [Tool approvals and audit](#tool-approvals-and-audit)) |
 | OpenAI / Anthropic API | `V1_DEFAULT_MODE`, `V1_RAW_ENABLED` (see [OpenAI and Anthropic compatible API](#openai-and-anthropic-compatible-api)) |
-| Agent/tools | `AGENT_ENABLED`, `AGENT_ESCALATION`, `AUTO_CONTINUE`, `AUTO_CONTINUE_MAX`, `AGENT_MIN_STEPS`, `AGENT_MAX_STEPS`, `AGENT_TOOLS`, `CODE_MAX_TOKENS`, `PROJECT_DIR`, `ALLOW_SHELL`, `ALLOW_PYTHON` |
+| Agent/tools | `AGENT_ENABLED`, `AGENT_ESCALATION`, `AUTO_CONTINUE`, `AUTO_CONTINUE_MAX`, `AGENT_MIN_STEPS`, `AGENT_MAX_STEPS`, `AGENT_TOOLS`, `CODE_MAX_TOKENS`, `PROJECT_DIR`, `ALLOW_SHELL`, `ALLOW_PYTHON`, `FILE_DENY_GLOBS` (paths no file tool, @reference or download may touch), `OUTPUTS_DIR` (where `create_document` writes a bare file name, default `outputs`) |
+| Retrieval and reasoning budget | `RAG_DF_CEILING` (query words in more than this share of the indexed documents, default 0.2, stop counting as relevance; from 20 documents up), `REASONING_PROMPT` (`auto`: the think-first instruction only for catalogue thinking models; `always`, `never`), `THINK_MAX_TOKENS` (reasoning tokens per agent step before it is asked for the answer only, default 384, 0 = no cap) |
+| Intent lexicon | `INTENT_LEXICON_ENABLED` (default 1: the app's own terms such as knowledge base, codebase, skills, memory, history, tasks and a PDF or Word file are read as instructions before the router runs, picking the tools and retrieval for the turn; settings, conversation buttons and switched-off tools get a reply that says where to find them; slash commands `/kb`, `/docs`, `/code`, `/skills`, `/history`, `/mem`, `/pdf` map to the same intents; 0 = router only) |
 | Sandbox | `EXEC_BACKEND`, `DOCKER_IMAGE`, `EXEC_ENV_PASSTHROUGH`, `EXEC_MEMORY_MB`, `EXEC_MAX_FILE_MB`, `EXEC_PIDS_LIMIT`, `EXEC_GUARDRAIL`, `TOOL_TIMEOUT`, `TEST_TIMEOUT`, `TEST_COMMAND` (see [Sandboxed execution](#sandboxed-execution)) |
 | Task continuity | `TASK_STATE_ENABLED`, `TASK_ARTIFACT_CHARS`, `DRIFT_CHECK_ENABLED`, `ARTIFACT_REPLY_HEADROOM`, `DEBUG_PROMPTS` (see [Multi-turn task continuity](#multi-turn-task-continuity)) |
 | Training | `TRAIN_MIN_EXAMPLES`, `TRAIN_EPOCHS`, `TRAIN_ITERS`, `TRAIN_LR`, `TRAIN_SEQ_LEN`, `TRAIN_BATCH_SIZE`, `TRAIN_NUM_LAYERS`, `TRAIN_FINE_TUNE_TYPE`, `TRAIN_LORA_RANK`, `TRAIN_TOOL_RATIO`, `TRAIN_TOOL_QUALITY`, `TRAIN_REPLAY_RATIO`, `TRAIN_VAL_SPLIT`, `TRAIN_VAL_CHECK`, `TRAIN_TIMEOUT`, `TRAIN_MAX_BACKUPS`, `AUTO_RETRAIN_THRESHOLD` (see [Feedback and LoRA retraining](#feedback-and-lora-retraining)) |
@@ -1055,9 +1106,38 @@ Every tool has a risk class: `read` (read_file, search, fetch_url, recall_*),
 send, a non-GET HTTP call, unknown tools; MCP tools use the server's
 readOnlyHint/destructiveHint annotations, otherwise external).
 
-- `TOOL_APPROVAL_MODE` (default `off`): `off` runs every call as before;
-  `risky` asks the user before write, exec and external calls; `all` asks before
-  every call. An unknown value means `risky`.
+**Tool approvals: ask before every action by default.** Every user has their
+own approvals mode, shown and changed by the **Approvals** control in the header
+(visible on every view, for every role, at every width; on a phone it shrinks to
+a shield whose glyph and colour give the mode). The same preference is in
+Settings > Tools > Approvals > My approvals.
+
+| Mode | Header label | What waits for the user's yes |
+|---|---|---|
+| `all` | Ask every action | Every tool call, including `list_files` and `read_file` (the default) |
+| `risky` | Ask for changes | Writes, code execution, sends and deletes; reads run on their own |
+| `off` | Don't ask | Nothing (administrator rules still apply) |
+
+- `APPROVAL_DEFAULT_MODE` (default `all`): the mode of a user who has not chosen
+  one. An unknown value means `all`. The choice is stored per user
+  (`approval_mode` in `user_preferences`, `POST /api/me/preferences`);
+  `GET /api/me/approval-mode` reports the choice, the default, the
+  administrator floor and the effective mode.
+- `TOOL_APPROVAL_MODE` (default `off`) is the administrator's floor ("Minimum
+  for everyone"): the stricter of it and the user's mode wins (`all` > `risky` >
+  `off`), and the header then shows the effective mode with a lock. `off` leaves
+  it to each user; `risky` always asks before write, exec and external calls;
+  `all` always asks before every call. An unknown value means `risky`. A turn
+  without a user (internal helpers, the CLI's own registry, eval sandboxes)
+  follows this floor alone. An `@file`/`@url` reference the user typed is not
+  asked about again under the user's own mode; the floor still applies.
+- Runs nobody watches (`POST /api/chat`, `/v1` agent mode, scheduled tasks, the
+  `/mcp` server) cannot show a prompt, so a call the user's mode would ask about
+  is refused (`TOOL_APPROVAL_UNATTENDED=deny`) with the tool result "approval
+  needed: switch Approvals to Ask for changes or Don't ask in the header to let
+  unattended runs use tools" (for a write: switch to Don't ask) and a
+  `tool.approval_needed` warning in the log. When the administrator's floor is
+  what asks, the message says so instead.
 - Overrides refine it, later layers winning: global rows, the agent profile
   (`agents.tool_policy` or profile rows), `TOOL_APPROVAL_ROLES` (JSON, e.g.
   `{"user": {"risk:exec": "deny"}}`), the user's own rows, the conversation's
@@ -1073,13 +1153,52 @@ readOnlyHint/destructiveHint annotations, otherwise external).
 - `TOOL_APPROVAL_TIMEOUT_S` (default `120`): an unanswered prompt is a refusal.
 
 A prompt can be answered for this call (`once`), the conversation, or the tool
-(`tool`, all of the user's conversations); the last two save an override.
+(`tool`, all of the user's conversations); the last two save an override, which
+is how a long turn under Ask every action needs one click per tool instead of
+one per call.
 `ToolRegistry.call` enforces the policy itself and fails closed. Every decision
 other than today's silent allow is appended to `tool_decisions`, which is
 append-only and survives conversation deletion. Routes:
 `GET /api/approvals/pending`, `GET/POST /api/tool-policies`,
 `DELETE /api/tool-policies/{id}`, `GET /api/audit/tool-decisions` (users see
 their own rows; admins manage global and profile rules and see every row).
+
+### File safety: overwrites, partial reads, the Changes footer, Undo
+
+- **No silent overwrites.** `write_file` on a file that already exists is shown
+  to the user as an approval card in an interactive turn (path, size before ->
+  after, a line diff stat, the drafted content editable, and a plain warning
+  when most of the file would go), even when a rule allows writes, unless the
+  user's Approvals mode is Don't ask. Where nobody is asked (Don't ask,
+  unattended runs, the execute_code bridge, `/api/tools/call`), a `write_file`
+  that shrinks an existing file by more than half (and by at least 256
+  characters) or by more than 2,000 characters is refused; the error tells the
+  model to use `edit_file`, or to write the new version to `outputs/<name>`
+  (for example `outputs/README.md`) unless the user asked to replace the file.
+- **Partial reads say so.** `read_file` takes `offset` and `limit` (characters).
+  A result that is not the whole file starts and ends with
+  `[README.md: showing characters 1-1500 of 103,363. Call read_file with offset=1500 to continue.]`,
+  and the context cut re-renders that line for the part the model actually
+  sees. `read_file` results are paged, never summarised.
+- **The reply tells the truth about files.** Scratch labels (`TOOL RESULT [..]:`,
+  `HELPER RESULT:`) are removed from final answers, and a turn that changed
+  files ends with a code-built **Changes made this turn** footer: each path,
+  created / modified / removed, size before and after, and the checkpoint id
+  (also in the final event as `changes`). It is added even when the reply says
+  nothing was written.
+- **Undo.** The changed-files node under a turn has an **Undo these changes**
+  button: after a confirm it calls `POST /api/checkpoints/{id}/rollback` for
+  that turn's checkpoint. The owner of the turn may roll it back, an
+  administrator any; another user gets 404.
+- **One card per call, and only the tools the request offers.** A request like
+  "check the codebase and write a readme.md" is the `codebase_write` intent:
+  file tools only, no web tools. A call shows at most one card: the overwrite
+  card replaces the plain approval card for the same `write_file`. The intent's
+  own confirmation of `write_file`/`edit_file` does not ask again when the user's
+  Approvals mode is Don't ask or when they answered an earlier card for that
+  tool with "conversation" or "tool". A call to a tool the intent did not offer
+  (a made-up `fetch_url`, say) is not run and not asked about; the model is told
+  which tools it has.
 
 ---
 
@@ -1683,4 +1802,77 @@ Other diagnostics: `python3 deploy.py --doctor` (ports), `--bench` (throughput),
 - **Headings render in the fallback font.** Google Fonts is unreachable from that
   machine or blocked by policy. Everything else works; the page falls back to the
   system font stack by design.
+
+---
+
+## Terminal client (`deploy.py chat`)
+
+`deploy.py chat` talks to the same multi-user server as the browser, over the
+same API, so a terminal user gets the same conversations, tools, approvals,
+model aliases, agent profiles and projects. The client lives in
+`local_llm/client.py`, uses only the Python standard library and imports nothing
+else from the package: copy that one file to another Mac and
+`python3 client.py chat|login|logout|whoami` works there with a stock python3.
+
+```bash
+python3 deploy.py login --url http://studio.local:8000          # username + password
+python3 deploy.py login --url http://studio.local:8000 --oidc   # Microsoft device code
+python3 deploy.py whoami
+python3 deploy.py chat                                          # interactive REPL
+python3 deploy.py chat -m "Summarise RFC 9110 in five lines"    # one-shot
+git diff | python3 deploy.py chat                               # stdin is the message
+git diff | python3 deploy.py chat -m "Review this diff" --stdin # message + stdin
+python3 deploy.py chat --list                                   # your conversations
+python3 deploy.py logout
 ```
+
+**Server and token.** The URL comes from `--url`, else `LLM_URL`, else the
+server you last signed in to, else `http://127.0.0.1:8000`. The token comes from
+`--token`, else `LLM_API_TOKEN`, else `~/.config/local-llm/credentials.json`
+(directory `0700`, file `0600`, one entry per server URL; the menu-bar
+companion reads the same file). `LLM_CREDENTIALS_FILE` moves that file.
+
+**Sign-in.** `login` asks for the username and reads the password with getpass:
+it is never echoed, logged, or written anywhere, and only the API token it buys
+(`POST /api/auth/cli/login`, same throttle as the web login) is stored.
+`--oidc` runs the Entra device-code flow (`/api/auth/device/start` and `/poll`):
+it prints the verification URL and code, polls at the interval the server gives,
+backs off on `slow_down`, and stops on a declined or expired code. It needs
+`OIDC_CLI_CLIENT_ID` on the server. `--name` labels the token (default
+`cli on <host>`). `logout` revokes the token on the server and removes it from
+the file; `whoami` shows who the saved token belongs to. With
+`AUTH_ENABLED=0` none of this is needed.
+
+**One-shot mode** (`-m`, or text piped on stdin) prints only the answer on
+stdout; tool lines, reasoning, notices and the usage footer go to stderr (`-q`
+silences them), so `answer=$(deploy.py chat -m ...)` captures just the answer.
+`--json` prints the raw stream events as JSON lines instead. Exit codes: `0`
+answered, `1` error, `2` usage, `3` not signed in or refused, `4` server
+unreachable, `130` cancelled.
+
+**Options** (both modes): `--conversation ID` continues a conversation (`--new`
+ignores `LLM_CONVERSATION`), `--model ALIAS`, `--agent-id PROFILE`,
+`--project ID`, `--mode auto|chat|agent`, `--attach PATH` (repeatable),
+`--think` (show reasoning), `--max-tokens`, `--temperature`, `--no-color`.
+
+**REPL commands.** `/new`, `/history`, `/open <id>` (shows the last messages),
+`/model [alias|off]` (checked against `GET /api/models/aliases`),
+`/agent [profile|off]`, `/project [id|off]`, `/mode auto|chat|agent`,
+`/attach <path>` (uploaded now, sent with the next message), `/think`, `/stop`
+(cancel a turn still running in this conversation), `/help`, `/quit` or Ctrl-D.
+A line ending in `\` continues on the next line; `//text` sends `/text`
+literally. Line editing and history use readline when Python has it (history in
+`~/.config/local-llm/history`, mode `0600`).
+
+**While a turn runs.** Tokens render as they arrive, reasoning dimmed (toggle
+with `/think`), each tool call as one line (name, short arguments, then ok or
+the error), a queue position when every generation slot is busy, and a footer
+with tokens, time to first token and tokens per second. A tool that needs
+approval asks `[a]llow once / allow for [c]onversation / allow [t]ool / [d]eny`
+and posts the answer to the turn; a cloud-fallback consent asks the same way
+(`[t]` is "always" there). In one-shot mode with stdin piped the question is
+asked on `/dev/tty`; with no terminal at all it is denied. Ctrl-C cancels the
+turn on the server (`POST /api/chat/turns/{id}/cancel`) and keeps the partial
+answer; a second Ctrl-C quits. A dropped connection resumes from the last event
+id (`/api/chat/turns/{id}/events?after=N`) within `TURN_DETACH_GRACE_S`. Colour
+is used only when stdout is a terminal and `NO_COLOR` is unset.

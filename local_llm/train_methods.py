@@ -80,6 +80,43 @@ PREFERENCE_TRAINER_MODULE = "mlx_lm_lora.train"
 TRAIN_METHODS = ("sft", "dpo", "orpo", "kto", "grpo")
 
 
+# --------------------------------------------------------------------------- #
+# Training data paths, resolved when used                                      #
+# --------------------------------------------------------------------------- #
+# SFT_DIR and REPLAY_FILE are copied into every module by star import when it
+# loads, so redirecting DATA_DIR on the config module afterwards (what the test
+# template and the UI preview server do, the way Config.settings_path honours
+# it) left the export writing into the repo's data/sft. These read the config
+# module's DATA_DIR at call time. A caller passes its own module's constant, so
+# a sandbox that patches SFT_DIR / REPLAY_FILE directly still wins.
+_TM_REPO_DATA_DIR = ROOT / "data"
+
+
+def train_data_root() -> Path:
+    """DATA_DIR as the config module holds it now (the bundle's own global there)."""
+    mod = sys.modules.get(getattr(Config, "__module__", "") or "")
+    value = getattr(mod, "DATA_DIR", None) if mod is not None else None
+    return Path(value) if value is not None else Path(DATA_DIR)
+
+
+def train_sft_dir(current: Path | None = None) -> Path:
+    """The SFT data directory: `current` (default this module's SFT_DIR) when it
+    was redirected, else DATA_DIR/sft when DATA_DIR was, else the repo default."""
+    base = Path(current) if current is not None else Path(SFT_DIR)
+    if base != _TM_REPO_DATA_DIR / "sft":
+        return base
+    root = train_data_root()
+    return root / "sft" if root != _TM_REPO_DATA_DIR else base
+
+
+def train_replay_file(current: Path | None = None) -> Path:
+    """The rehearsal corpus, following a redirected REPLAY_FILE, SFT_DIR or DATA_DIR."""
+    base = Path(current) if current is not None else Path(REPLAY_FILE)
+    if base != _TM_REPO_DATA_DIR / "sft" / "replay.jsonl":
+        return base
+    return train_sft_dir() / "replay.jsonl"
+
+
 @dataclass(frozen=True)
 class TrainMethodSpec:
     """One training method: which trainer runs it and how its run is judged."""
@@ -1131,6 +1168,7 @@ def train_plan_cli(argv: list[str]) -> int:
 # Re-exported explicitly: the original file was one flat namespace, so private
 # helpers (leading underscore) must cross module boundaries too.
 __all__ = [
+    '_TM_REPO_DATA_DIR',
     'GRPO_REWARD_NAMES',
     'PREFERENCE_TRAINER_MODULE',
     'TRAIN_METHODS',
@@ -1143,6 +1181,9 @@ __all__ = [
     'describe_train_methods',
     'estimate_train_memory',
     'export_preferences',
+    'train_data_root',
+    'train_replay_file',
+    'train_sft_dir',
     'gate_preference_run',
     'grpo_score',
     'layer_streaming_support',

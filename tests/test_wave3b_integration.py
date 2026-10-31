@@ -54,7 +54,8 @@ LEGACY_EXPANSION = {
                  "file_info", "create_document"],
     "code_exec": ["run_shell", "run_python", "run_tests"],
     "web_api": ["web_search", "fetch_url"],
-    "knowledge": [],
+    # Phase B (upgrade/ROUTING_AND_TOOLING.md P3): RAG plus the knowledge tools.
+    "knowledge": ["search_docs", "kb_overview"],
     "memory": ["remember", "recall_memory", "forget", "recall_feedback"],
     "office365": ["o365_mail", "o365_files", "o365_calendar"],
 }

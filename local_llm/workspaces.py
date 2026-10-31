@@ -226,7 +226,12 @@ def _ws_safe_segment(user_id: str) -> str:
 
 
 def user_workspace_root(user_id: str, create: bool = True) -> Path:
-    """WORKSPACE_DIR/users/<user_id>, created on demand."""
+    """WORKSPACE_DIR/users/<user_id>, created on demand.
+
+    Only a caller about to write (a tool run, a project being created) asks
+    for create=True. Views pass create=False: opening the Projects panel used
+    to leave an empty users/<id> folder for every account that looked.
+    """
     root = (WORKSPACE_DIR / "users" / _ws_safe_segment(user_id))
     if create:
         root.mkdir(parents=True, exist_ok=True)
@@ -321,7 +326,9 @@ def default_root_for_user(config: Config, user: dict) -> Path | None:
         return None
     if user.get("role") == "admin" or user.get("id") == SENTINEL_LOCAL_USER:
         return None
-    return user_workspace_root(user["id"])
+    # A path, not a folder: GET routes (the Projects panel, a file download,
+    # checkpoint scopes) read it, and the tools create it when they write.
+    return user_workspace_root(user["id"], create=False)
 
 
 def exec_isolation_warning(config: Config) -> str | None:
@@ -479,7 +486,9 @@ def create_project(db: Any, config: Config, user: dict, name: str,
         base = parents[0] if parents else WORKSPACE_DIR.resolve()
         default = (WORKSPACE_DIR / "projects" / (_ws_slug(clean_name) or project_id))
     else:
-        base = user_workspace_root(user["id"])
+        # Not created here: the mkdir below makes it with the project, after
+        # validation, so a refused name leaves no empty folder behind.
+        base = user_workspace_root(user["id"], create=False)
         parents = [base]
         default = base / (_ws_slug(clean_name) or project_id)
     raw = str(root_path or "").strip()

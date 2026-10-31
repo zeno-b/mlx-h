@@ -41,6 +41,14 @@ from .train_methods import *  # noqa: F401,F403
 from .mlx_engine import *  # noqa: F401,F403
 # `deploy.py wire <client>`: connect coding tools to this server.
 from .wire import *  # noqa: F401,F403
+# `deploy.py companion build|install|uninstall|plugin`: the menu-bar companion.
+from .companion import *  # noqa: F401,F403
+# `deploy.py init` / `deploy.py service` and the --doctor install checks.
+from .setup_cmds import *  # noqa: F401,F403
+# `deploy.py chat|login|logout|whoami`: the terminal client (stdlib only).
+from .client import *  # noqa: F401,F403
+# `deploy.py eval`: the built-in evaluation and regression suites (evals.py).
+from .evals import *  # noqa: F401,F403
 # ---- extension imports: one `from .<feature> import *` per feature, above this line ---- #
 
 
@@ -255,6 +263,19 @@ def subcommands() -> dict:
         "mlx-engine": mlx_engine_cli,
         # Connect Claude Code, Aider, Codex, Continue, opencode... (wire.py).
         "wire": wire_cli,
+        # Build/install the macOS menu-bar companion or SwiftBar plugin (companion.py).
+        "companion": companion_cli,
+        # First-run .env from this Mac's RAM, and the launchd service (setup_cmds.py).
+        "init": init_cli,
+        "service": service_cli,
+        # Terminal client for the served model (client.py): REPL or one-shot
+        # chat, and sign-in that saves an API token per server URL.
+        "chat": chat_cli,
+        "login": login_cli,
+        "logout": logout_cli,
+        "whoami": whoami_cli,
+        # Tool-calling, RAG, multi-turn, routing, parser and /v1 API suites (evals.py).
+        "eval": eval_cli,
         # ---- extension subcommands: "name": handler, above this line ---- #
     }
 
@@ -287,7 +308,7 @@ def main(argv: list[str] | None = None) -> None:
         print(cfg.identity or "(none)")
         print("\n=== system prompt (as sent, with identity + tool preamble) ===")
         print(build_agent_system_prompt(cfg.system_prompt_with_identity, reg,
-                                        reasoning=cfg.reasoning_visible))
+                                        reasoning=reasoning_prompt_wanted(cfg)))
         print(f"\n=== model: {cfg.model} | context: {cfg.context_size} | "
               f"project: {cfg.project_dir or '(sandbox workspace)'} ===")
         return
@@ -296,6 +317,7 @@ def main(argv: list[str] | None = None) -> None:
     # and would therefore report on the wrong ones.
     if args.doctor:
         doctor(args.web_port, args.model_port)
+        print_install_checks(args.web_port, args.model_port)
         return
 
     if args.bench:

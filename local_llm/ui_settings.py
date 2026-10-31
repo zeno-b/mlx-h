@@ -172,7 +172,7 @@ _UIS_PANEL_MODEL = r"""
   </div>
   <pre id="modelCurrent" class="logbox mono">loading...</pre>
   <h3 class="h3">Switch model</h3>
-  <table class="table models"><tbody id="modelTable"></tbody></table>
+  <table class="table models"><thead><tr><th>Model</th><th>Fits this Mac</th><th>Status</th><th></th></tr></thead><tbody id="modelTable"></tbody></table>
   <div class="field">
     <label class="field-label" for="modelCustom">Or any Hugging Face repo id or alias</label>
     <div class="field-control row">
@@ -314,11 +314,21 @@ _UIS_PANEL_TOOLS = r"""
 <div class="panel-block card" data-panel="catalogue">
   <div class="card-header"><h3 class="h3">Tool catalogue</h3>
     <div class="card-actions">
-      <button type="button" class="btn btn-sm" onclick="loadToolsCatalogue()" title="Refresh tools">Refresh</button>
+      <button type="button" class="btn btn-sm" onclick="integLoadCatalogue()" title="Refresh the tool catalogue">Refresh</button>
     </div>
   </div>
-  <p class="hint">The tools the agent can call right now. Which of them a named agent may use is set per agent in Admin &gt; Agents.</p>
-  <div id="toolsList" class="tools-list">loading...</div>
+  <p class="hint">Every tool the agent can call: the capability that grants it, how risky the approval policy rates it, where it comes from and which agent profiles reach it. Which tools a named agent may use is set per agent in Admin &gt; Agents; when to ask first is set under Approvals.</p>
+  <div class="row wrap">
+    <input type="search" class="input grow" id="integCatFilter" placeholder="Filter by name, capability or risk" aria-label="Filter tools" autocomplete="off" spellcheck="false">
+    <div class="seg" role="radiogroup" id="integCatSource" aria-label="Where the tool comes from">
+      <button type="button" class="btn-sm active" data-value="" aria-pressed="true">All</button>
+      <button type="button" class="btn-sm" data-value="builtin" aria-pressed="false">Built in</button>
+      <button type="button" class="btn-sm" data-value="extra" aria-pressed="false">Extra</button>
+      <button type="button" class="btn-sm" data-value="mcp" aria-pressed="false">MCP</button>
+    </div>
+  </div>
+  <div id="toolsList">loading...</div>
+  <p class="hint" id="integCatSummary"></p>
 </div>
 """
 
@@ -326,11 +336,14 @@ _UIS_PANEL_MCP = r"""
 <div class="panel-block card admin-only" data-panel="mcp">
   <div class="card-header"><h3 class="h3">MCP servers</h3>
     <div class="card-actions">
-      <button type="button" class="btn btn-sm" onclick="loadMcpStatus()" title="Refresh MCP status">Refresh</button>
+      <button type="button" class="btn btn-sm" onclick="integLoadMcp()" title="Refresh MCP status">Refresh</button>
     </div>
   </div>
-  <p class="hint">External tool servers from MCP_SERVERS. A server that failed to start is listed with its error; its tools are simply missing otherwise.</p>
-  <div id="mcpStatus" class="tools-list">loading...</div>
+  <p class="hint">External tool servers from MCP_SERVERS, as they are right now. A server that failed to start is listed with its error; its tools are simply missing otherwise. The capability mcp:&lt;server&gt; grants one server's tools, mcp grants them all.</p>
+  <div id="mcpStatus">loading...</div>
+  <h3 class="h3">This app as an MCP server</h3>
+  <dl class="kv" id="integMcpServe"></dl>
+  <p class="hint">With Serve tools over MCP on (below), MCP clients such as Claude Code or Codex reach this app's tools at that URL, signed in with an API token (chat scope) sent as a Bearer header. They run under the same roles, approvals and audit as chat.</p>
 </div>
 """
 
@@ -481,7 +494,8 @@ _UIS_PANELS: dict[tuple[str, str], tuple[str, str]] = {
     ("models", "knowledge"): (_UIS_PANEL_KNOWLEDGE, ""),
     ("performance", ""): ("", _UIS_PANEL_PERF),
     ("memory", ""): (_UIS_PANEL_MEMORY, ""),
-    ("tools", ""): (_UIS_PANEL_TOOLS, _UIS_PANEL_MCP),
+    ("tools", "catalogue"): (_UIS_PANEL_TOOLS, ""),
+    ("tools", "mcp"): (_UIS_PANEL_MCP, ""),
     ("admin", "users"): (_UIS_PANEL_USERS, ""),
     ("admin", "agents"): (_UIS_PANEL_AGENTS, ""),
     ("admin", "cluster"): (_UIS_PANEL_CLUSTER, ""),
@@ -645,6 +659,437 @@ _uis_ops_merge()
 # ---- panels-ops end --------------------------------------------------------- #
 
 
+# ---- panels-integrations (Wave 4a: items 2, 10, 16, 17) -------------------- #
+# The Tools sub-tabs (Connect a client, API tokens, Approvals, MCP), Admin >
+# Audit and Agent > Projects. The catalogue and MCP status cards above keep
+# their ids (toolsList, mcpStatus) and are upgraded in place; these are new.
+# Loaders live in ui_script_integrations.py and register with ADMIN_TABS, so a
+# card loads only while its tab is visible. Tables are built by the script.
+# Every route behind them enforces its own access (owner scoping for tokens,
+# rules, projects and decisions; ADMIN for MCP and the full audit), so the
+# admin-only classes here are cosmetic.
+
+_UIS_INTEG_CLIENTS = r"""
+<div class="panel-block card" data-panel="clients">
+  <div class="card-header"><h3 class="h3">Connect a client</h3></div>
+  <p class="hint">Point a coding agent or an SDK at this server's OpenAI and Anthropic compatible API. Pick the client to see what it needs.</p>
+  <div class="seg wrap" role="radiogroup" id="integClientSeg" aria-label="Client">
+    <button type="button" class="btn-sm active" data-value="claude-code" aria-pressed="true">Claude Code</button>
+    <button type="button" class="btn-sm" data-value="aider" aria-pressed="false">Aider</button>
+    <button type="button" class="btn-sm" data-value="codex" aria-pressed="false">Codex</button>
+    <button type="button" class="btn-sm" data-value="continue" aria-pressed="false">Continue</button>
+    <button type="button" class="btn-sm" data-value="opencode" aria-pressed="false">OpenCode</button>
+    <button type="button" class="btn-sm" data-value="hermes" aria-pressed="false">Hermes</button>
+    <button type="button" class="btn-sm" data-value="generic" aria-pressed="false">Generic</button>
+  </div>
+  <dl class="kv" id="integClientFacts"></dl>
+  <span class="field-label">From a terminal</span>
+  <div class="row nowrap"><div class="readonly mono grow" id="integClientCmd"></div><button type="button" class="btn btn-sm" onclick="integCopyClientCmd(this)">Copy</button></div>
+  <p class="hint">Run it in this app's folder on the machine the client runs on. --login signs in with your username and password and mints a token for the client (--device uses Microsoft sign-in instead); add --write to merge the settings into the client's config file, which is backed up first. Without --write it only prints them.</p>
+  <span class="field-label">Or set it up by hand</span>
+  <div class="codeblock"><div class="codebar"><span id="integClientTitle">settings</span><button type="button" class="btn btn-sm" onclick="integCopyClientText(this)">Copy</button></div><pre id="integClientText">loading...</pre></div>
+  <div class="stack tight" id="integClientNotes"></div>
+</div>
+"""
+
+_UIS_INTEG_TOKENS = r"""
+<div class="panel-block card" data-panel="tokens">
+  <div class="card-header"><h3 class="h3">API tokens</h3>
+    <div class="card-actions">
+      <span class="hint admin-only" aria-hidden="true">All users</span>
+      <label class="switch admin-only" id="integTokAllWrap" title="Show every user's tokens"><input type="checkbox" id="integTokAll" aria-label="Show every user's tokens"><span class="slider"></span></label>
+      <button type="button" class="btn btn-sm" onclick="integLoadTokens()" title="Refresh tokens">Refresh</button>
+    </div>
+  </div>
+  <p class="hint">A token lets a script, a coding agent or the CLI call this server as you (Authorization: Bearer). Give each client its own token, with the narrowest scopes it needs, so one can be revoked without breaking the others.</p>
+  <p class="hint warn" id="integTokAuthOff" hidden>Sign-in is off on this server (AUTH_ENABLED=0), so clients need no token: any value works.</p>
+  <div class="stack" id="integTokForm">
+    <div class="field-row"><label class="field-label" for="integTokName">Name</label><div class="field-control"><input class="input" type="text" id="integTokName" maxlength="80" placeholder="laptop claude-code" autocomplete="off" spellcheck="false"></div></div>
+    <div class="field-row"><span class="field-label" id="integTokScopesLabel">Scopes</span>
+      <div class="field-control cap-grid" id="integTokScopes" role="group" aria-labelledby="integTokScopesLabel">
+        <label class="check"><input type="checkbox" value="chat" checked><span>chat: conversations, the /v1 API and MCP</span></label>
+        <label class="check"><input type="checkbox" value="status"><span>status: read-only health, models and tasks</span></label>
+        <label class="check admin-only"><input type="checkbox" value="control"><span>control: switch models, run and cancel tasks</span></label>
+        <label class="check"><input type="checkbox" value="admin"><span>admin: everything your account may do</span></label>
+      </div>
+    </div>
+    <div class="field-row"><label class="field-label" for="integTokDays">Lifetime</label><div class="field-control"><input class="input" type="number" id="integTokDays" min="0" max="3650" step="1" placeholder="server default"><span class="unit muted">days</span></div></div>
+    <div class="row"><button type="button" class="btn btn-sm btn-primary" id="integTokCreateBtn" onclick="integCreateToken()">Create token</button></div>
+  </div>
+  <div class="stack tight" id="integTokNewBox" hidden>
+    <span class="field-label">Your new token</span>
+    <div class="row nowrap">
+      <input class="input mono grow" type="text" id="integTokNew" readonly aria-label="New API token" autocomplete="off" spellcheck="false">
+      <button type="button" class="btn btn-sm" onclick="integCopyNewToken(this)">Copy</button>
+      <button type="button" class="btn btn-sm btn-ghost" onclick="integHideNewToken()">Done</button>
+    </div>
+    <p class="hint warn">Shown once: the server keeps only a hash of it. Copy it into the client now; if it is lost, revoke it and create another.</p>
+  </div>
+  <div id="integTokList"><p class="muted">loading...</p></div>
+</div>
+"""
+
+_UIS_INTEG_APPROVALS = r"""
+<div class="panel-block card" data-panel="approvals">
+  <div class="card-header"><h3 class="h3">Waiting for you</h3>
+    <div class="card-actions">
+      <span class="pill muted" id="integApprCount">0</span>
+      <button type="button" class="btn btn-sm" onclick="integLoadPending()" title="Refresh pending approvals">Refresh</button>
+    </div>
+  </div>
+  <p class="hint">Tool calls paused until you answer, from any of your chats or API clients. Answer here or in the chat that asked; a call nobody answers is refused when its time runs out.</p>
+  <div class="stack" id="integApprList"><p class="muted">loading...</p></div>
+</div>
+<div class="panel-block card" data-panel="policies">
+  <div class="card-header"><h3 class="h3">Tool rules</h3>
+    <div class="card-actions">
+      <button type="button" class="btn btn-sm" onclick="integLoadPolicies()" title="Refresh rules">Refresh</button>
+    </div>
+  </div>
+  <dl class="kv" id="integPolFacts"></dl>
+  <p class="hint">A rule allows, asks first or denies one tool, a capability (cap:), a risk class (risk:) or every tool (*). Administrator rules (everyone, agent profile) come first and their deny is final; your own rules (you, one conversation) can tighten anything and turn an administrator's ask into allow.</p>
+  <div class="stack" id="integPolForm">
+    <div class="field-row"><span class="field-label" id="integPolScopeLabel">Applies to</span>
+      <div class="field-control">
+        <div class="seg" role="radiogroup" id="integPolScope" aria-labelledby="integPolScopeLabel">
+          <button type="button" class="btn-sm active" data-value="user" aria-pressed="true">Me</button>
+          <button type="button" class="btn-sm" data-value="conversation" aria-pressed="false">One conversation</button>
+          <button type="button" class="btn-sm admin-only" data-value="profile" aria-pressed="false">Agent profile</button>
+          <button type="button" class="btn-sm admin-only" data-value="global" aria-pressed="false">Everyone</button>
+        </div>
+      </div>
+    </div>
+    <div class="field-row" id="integPolTargetRow" hidden><label class="field-label" for="integPolTarget" id="integPolTargetLabel">Which</label><div class="field-control"><select class="input select" id="integPolTarget"></select></div></div>
+    <div class="field-row"><label class="field-label" for="integPolTool">Tool</label><div class="field-control"><select class="input select" id="integPolTool"></select></div></div>
+    <div class="field-row"><span class="field-label" id="integPolDecisionLabel">Decision</span>
+      <div class="field-control">
+        <div class="seg" role="radiogroup" id="integPolDecision" aria-labelledby="integPolDecisionLabel">
+          <button type="button" class="btn-sm" data-value="allow" aria-pressed="false">Allow</button>
+          <button type="button" class="btn-sm active" data-value="ask" aria-pressed="true">Ask first</button>
+          <button type="button" class="btn-sm" data-value="deny" aria-pressed="false">Deny</button>
+        </div>
+      </div>
+    </div>
+    <div class="field-row"><label class="field-label" for="integPolExpires">Expires</label><div class="field-control"><select class="input select" id="integPolExpires">
+      <option value="">Never</option><option value="3600">In 1 hour</option><option value="86400">In 1 day</option><option value="604800">In 7 days</option>
+    </select></div></div>
+    <div class="row"><button type="button" class="btn btn-sm btn-primary" onclick="integSavePolicy()">Save rule</button></div>
+  </div>
+  <div id="integPolList"><p class="muted">loading...</p></div>
+  <h3 class="h3">Your recent tool decisions</h3>
+  <div id="integMyAudit"><p class="muted">loading...</p></div>
+  <div class="row"><span class="spacer"></span><button type="button" class="btn btn-sm" id="integMyAuditMore" onclick="integLoadMyAudit(false)" hidden>Older</button></div>
+</div>
+"""
+
+_UIS_INTEG_MCPEDIT = r"""
+<div class="panel-block card admin-only" data-panel="mcpedit">
+  <div class="card-header"><h3 class="h3">Configure MCP servers</h3>
+    <div class="card-actions">
+      <button type="button" class="btn btn-sm" onclick="integMcpAdd('stdio')" title="Add a server this machine starts as a process">Add stdio server</button>
+      <button type="button" class="btn btn-sm" onclick="integMcpAdd('http')" title="Add a server reached over HTTP">Add HTTP server</button>
+      <button type="button" class="btn btn-sm btn-ghost" onclick="integMcpLoadConfig()" title="Discard edits and reload the current setting">Reset</button>
+    </div>
+  </div>
+  <p class="hint">Builds MCP_SERVERS. A stdio server is a command this machine starts; it receives only the environment listed here, never the app's own secrets. An HTTP server is a Streamable HTTP endpoint. Write a secret as ${NAME} to read it from the app's environment when it connects instead of storing it in the setting.</p>
+  <div class="stack" id="integMcpRows"></div>
+  <p class="hint error" id="integMcpProblems" hidden></p>
+  <p class="hint warn" id="integMcpMasked" hidden>Values shown as *** are secrets the server masks when it shows settings. Replace each with the real value or a ${NAME} reference before using the result, or the server receives a literal ***.</p>
+  <div class="codeblock"><div class="codebar"><span>.env</span><button type="button" class="btn btn-sm" onclick="integMcpCopy(this)">Copy</button></div><pre id="integMcpJson"></pre></div>
+  <div class="row">
+    <span class="badge" id="integMcpRestart">restart</span>
+    <span class="hint grow" id="integMcpHow">MCP_SERVERS is read when the app starts: replace the MCP_SERVERS line in .env with this one and restart the app.</span>
+    <button type="button" class="btn btn-sm btn-primary" id="integMcpApply" onclick="integMcpApply()" hidden>Apply</button>
+  </div>
+</div>
+"""
+
+_UIS_INTEG_AUDIT = r"""
+<div class="panel-block card admin-only" data-panel="audit">
+  <div class="card-header"><h3 class="h3">Tool decisions</h3>
+    <div class="card-actions">
+      <button type="button" class="btn btn-sm" onclick="integLoadAudit(true)" title="Reload from the newest">Refresh</button>
+    </div>
+  </div>
+  <p class="hint">Every tool call the approval policy did not silently allow: who, which tool, the decision, the rule or person behind it and how long the answer took. Arguments are stored redacted. Rows are kept when a conversation is deleted.</p>
+  <div class="row wrap">
+    <select class="input select" id="integAudUser" aria-label="User"><option value="">All users</option></select>
+    <input class="input" type="search" id="integAudTool" placeholder="Tool name" aria-label="Tool name" autocomplete="off" spellcheck="false">
+    <select class="input select" id="integAudDecision" aria-label="Decision">
+      <option value="">Any decision</option><option value="allow">Allowed</option><option value="ask">Asked</option><option value="deny">Denied</option><option value="timeout">Timed out</option><option value="cancelled">Cancelled</option>
+    </select>
+    <input class="input" type="date" id="integAudFrom" aria-label="From date">
+    <input class="input" type="date" id="integAudTo" aria-label="To date">
+  </div>
+  <div id="integAudList"><p class="muted">loading...</p></div>
+  <div class="row"><span class="hint" id="integAudCount"></span><span class="spacer"></span><button type="button" class="btn btn-sm" id="integAudMore" onclick="integLoadAudit(false)" hidden>Older</button></div>
+</div>
+"""
+
+_UIS_INTEG_PROJECTS = r"""
+<div class="panel-block card" data-panel="projects">
+  <div class="card-header"><h3 class="h3">Projects</h3>
+    <div class="card-actions">
+      <button type="button" class="btn btn-sm" onclick="integLoadProjects()" title="Refresh projects">Refresh</button>
+    </div>
+  </div>
+  <p class="hint">A project is a folder the agent works in, with its own context files (AGENTS.md and the like) and knowledge scope. Share it with people by adding them as members.</p>
+  <p class="hint warn" id="integProjOff" hidden>Projects are off on this server. An administrator turns them on with Per-user workspaces (WORKSPACES_ENABLED) under Tools, then restarts the app.</p>
+  <div class="stack" id="integProjBody">
+    <p class="hint warn admin-only" id="integProjWarn" hidden></p>
+    <div class="row wrap">
+      <input class="input grow" type="text" id="integProjName" maxlength="80" placeholder="Project name" aria-label="Project name" autocomplete="off" spellcheck="false">
+      <input class="input grow mono" type="text" id="integProjRoot" placeholder="Folder (optional)" aria-label="Project folder" autocomplete="off" spellcheck="false">
+      <span class="hint admin-only" aria-hidden="true">Shared</span>
+      <label class="switch admin-only" id="integProjSharedWrap" title="Open to every signed-in user"><input type="checkbox" id="integProjShared" aria-label="Open to every signed-in user"><span class="slider"></span></label>
+      <button type="button" class="btn btn-sm btn-primary" onclick="integCreateProject()">Create</button>
+    </div>
+    <p class="hint" id="integProjRootHint"></p>
+    <div id="integProjList"><p class="muted">loading...</p></div>
+    <div class="stack tight" id="integProjDetail" hidden>
+      <div class="row"><h3 class="h3 grow" id="integProjDetailTitle"></h3><button type="button" class="btn btn-sm btn-ghost" onclick="integCloseProject()">Close</button></div>
+      <dl class="kv" id="integProjFacts"></dl>
+      <span class="field-label">Members</span>
+      <div id="integProjMembers"></div>
+      <div class="row wrap" id="integProjAddRow">
+        <input class="input grow" type="text" id="integProjMember" placeholder="Username" aria-label="Username to add" autocomplete="off" spellcheck="false">
+        <select class="input select" id="integProjMemberRole" aria-label="Member role"><option value="member">Member</option><option value="manager">Manager</option></select>
+        <button type="button" class="btn btn-sm" onclick="integAddMember()">Add member</button>
+      </div>
+      <span class="field-label">Context the agent gets</span>
+      <pre class="logbox mono" id="integProjContext"></pre>
+    </div>
+  </div>
+</div>
+"""
+
+# (section, sub) -> (markup before the schema groups, markup after them).
+_UIS_INTEG_PANELS: dict[tuple[str, str], tuple[str, str]] = {
+    ("tools", "clients"): (_UIS_INTEG_CLIENTS, ""),
+    ("tools", "tokens"): (_UIS_INTEG_TOKENS, ""),
+    ("tools", "approvals"): (_UIS_INTEG_APPROVALS, ""),
+    ("tools", "mcp"): (_UIS_INTEG_MCPEDIT, ""),
+    ("admin", "audit"): (_UIS_INTEG_AUDIT, ""),
+    ("agent", ""): ("", _UIS_INTEG_PROJECTS),
+}
+
+
+def _uis_integ_merge() -> None:
+    """Append the integrations cards to _UIS_PANELS without rewriting its entries."""
+    for key, (before, after) in _UIS_INTEG_PANELS.items():
+        old_before, old_after = _UIS_PANELS.get(key, ("", ""))
+        _UIS_PANELS[key] = (old_before.strip() + before.strip(), old_after.strip() + after.strip())
+
+
+_uis_integ_merge()
+# ---- panels-integrations end ----------------------------------------------- #
+
+
+# ---- dashboards (Wave 4a: item 14) ------------------------------------------ #
+# Admin > Dashboards: KPI tiles, charts per window, breakdown tables and the
+# recent warnings from the structured log feed (dashboards.py), then the
+# adapter ratings and the blind A/B voting card (elo.py). Loaders live in
+# ui_script_dashboards.py (dashTabHook wires them into ADMIN_TABS). Every route
+# behind them is admin-only on the server except the vote and next-pair routes,
+# which any signed-in user may call; the section is admin-only in the rail.
+_UIS_DASH_PANEL = r"""
+<div class="panel-block card" data-panel="dashboards">
+  <div class="card-header"><h3 class="h3">Overview</h3>
+    <div class="card-actions">
+      <div class="seg" role="radiogroup" id="dashWindow" aria-label="Time window">
+        <button type="button" class="btn-sm" data-value="1h" aria-pressed="false">1 hour</button>
+        <button type="button" class="btn-sm active" data-value="24h" aria-pressed="true">24 hours</button>
+        <button type="button" class="btn-sm" data-value="7d" aria-pressed="false">7 days</button>
+      </div>
+      <button type="button" class="btn btn-sm" onclick="dashLoad()" title="Refresh the dashboards">Refresh</button>
+    </div>
+  </div>
+  <p class="hint" id="dashRange">Requests, latency and tokens from the metrics this server records for every request.</p>
+  <div class="dash-kpis" id="dashKpis"><span class="muted">loading...</span></div>
+</div>
+<div class="panel-block card" data-panel="dashcharts">
+  <div class="card-header"><h3 class="h3">Over time</h3></div>
+  <div class="dash-charts">
+    <div class="dash-chart"><span class="field-label">Requests and errors</span><div id="dashChartRequests"></div></div>
+    <div class="dash-chart"><span class="field-label">Latency</span><div id="dashChartLatency"></div></div>
+    <div class="dash-chart"><span class="field-label">Time to first token</span><div id="dashChartTtft"></div></div>
+    <div class="dash-chart"><span class="field-label">Decode speed</span><div id="dashChartTps"></div></div>
+    <div class="dash-chart"><span class="field-label">Tokens</span><div id="dashChartTokens"></div></div>
+    <div class="dash-chart"><span class="field-label">Tool calls</span><div id="dashChartTools"></div></div>
+    <div class="dash-chart"><span class="field-label">Prompt cache hits</span><div id="dashChartCache"></div></div>
+    <div class="dash-chart"><span class="field-label">Queue wait</span><div id="dashChartQueue"></div></div>
+  </div>
+  <p class="hint">Latency counts successful requests only. Cache hits are shown only for engines that report cached prompt tokens.</p>
+</div>
+<div class="panel-block card" data-panel="dashbreakdown">
+  <div class="card-header"><h3 class="h3">Breakdown</h3></div>
+  <span class="field-label">Per user</span>
+  <div class="ops-scroll"><table class="table"><thead><tr><th>User</th><th>Requests</th><th>Errors</th><th>Latency p50</th><th>Tokens in / out</th></tr></thead><tbody id="dashUsers"></tbody></table></div>
+  <span class="field-label">Per model, adapter and engine</span>
+  <div class="ops-scroll"><table class="table"><thead><tr><th>Model</th><th>Adapter</th><th>Engine</th><th>Generations</th><th>TTFT p50</th><th>Decode</th></tr></thead><tbody id="dashModels"></tbody></table></div>
+  <span class="field-label">Errors by type</span>
+  <div id="dashErrors"></div>
+  <span class="field-label">Per node</span>
+  <div class="ops-scroll"><table class="table"><thead><tr><th>Node</th><th>Requests</th><th>Failed</th><th>p50</th><th>p95</th></tr></thead><tbody id="dashNodes"></tbody></table></div>
+  <span class="field-label">Tools</span>
+  <div class="ops-scroll"><table class="table"><thead><tr><th>Tool</th><th>Calls</th><th>Error rate</th><th>Average</th><th>p95</th></tr></thead><tbody id="dashTools"></tbody></table></div>
+  <span class="field-label">Approvals</span>
+  <dl class="kv" id="dashApprovals"></dl>
+  <span class="field-label">Feedback by adapter</span>
+  <div class="ops-scroll"><table class="table"><thead><tr><th>Adapter</th><th>Ratings</th><th>Up</th><th>Down</th><th>Up rate</th></tr></thead><tbody id="dashFeedback"></tbody></table></div>
+</div>
+<div class="panel-block card" data-panel="dashevents">
+  <div class="card-header"><h3 class="h3">Events</h3>
+    <div class="card-actions">
+      <div class="seg" role="radiogroup" id="dashEventLevel" aria-label="Which events">
+        <button type="button" class="btn-sm active" data-value="WARNING" aria-pressed="true">Warnings and errors</button>
+        <button type="button" class="btn-sm" data-value="" aria-pressed="false">All</button>
+      </div>
+    </div>
+  </div>
+  <p class="hint" id="dashEventSince">Structured log events this process has seen (kept in memory, whatever LOG_FORMAT says; secrets are redacted).</p>
+  <div id="dashEventCounts"></div>
+  <div class="ops-scroll"><table class="table"><thead><tr><th>Time</th><th>Level</th><th>Event</th><th>Message</th></tr></thead><tbody id="dashEvents"></tbody></table></div>
+</div>
+<div class="panel-block card" data-panel="adapterratings">
+  <div class="card-header"><h3 class="h3">Adapter ratings</h3>
+    <div class="card-actions">
+      <button type="button" class="btn btn-sm" onclick="dashRecompute()" title="Rebuild the ratings from every stored match">Recompute</button>
+    </div>
+  </div>
+  <p class="hint">ELO ratings (K=24, everyone starts at 1500) from pairwise comparisons on the same prompt: your votes below, opposite thumbs on one prompt across adapters, and tournaments. Fewer than 10 games is provisional.</p>
+  <div class="ops-scroll"><table class="table"><thead><tr><th>Rank</th><th>Adapter</th><th>ELO</th><th>Games</th><th>W / L / T</th><th>Win rate</th></tr></thead><tbody id="dashRatings"></tbody></table></div>
+  <p class="hint" id="dashRatingsNote"></p>
+  <span class="field-label">Tournament</span>
+  <div class="row wrap">
+    <div class="seg" role="radiogroup" id="dashJudge" aria-label="Who judges">
+      <button type="button" class="btn-sm active" data-value="model" aria-pressed="true">Model judges</button>
+      <button type="button" class="btn-sm" data-value="human" aria-pressed="false">People vote</button>
+    </div>
+    <button type="button" class="btn btn-sm btn-primary" id="dashTourneyBtn" onclick="dashStartTournament()" title="Answer a fixed prompt set with every adapter and compare">Run tournament</button>
+    <button type="button" class="btn btn-sm btn-ghost" id="dashTourneyCancel" onclick="dashCancelTournament()" hidden>Cancel</button>
+  </div>
+  <div class="row nowrap" id="dashTourneyBox" hidden><span class="pill running" id="dashTourneyPill">running</span><span class="hint mono grow ellipsis" id="dashTourneyText"></span></div>
+  <p class="hint">A tournament loads each adapter in turn on the shared model server, so chats get "Model not ready" until it ends. It refuses to start while anything is generating.</p>
+  <span class="field-label">Recent matches</span>
+  <div class="ops-scroll"><table class="table"><thead><tr><th>When</th><th>A</th><th>B</th><th>Winner</th><th>Judge</th><th>Source</th></tr></thead><tbody id="dashMatches"></tbody></table></div>
+</div>
+<div class="panel-block card" data-panel="abvote">
+  <div class="card-header"><h3 class="h3">Compare answers</h3>
+    <div class="card-actions">
+      <span class="pill muted" id="dashVoteLeft">0 waiting</span>
+      <button type="button" class="btn btn-sm" onclick="dashLoadPair()" title="Load the next comparison">Next</button>
+    </div>
+  </div>
+  <p class="hint">Two adapters answered the same prompt. Pick the better answer; which adapter wrote which is shown after you vote.</p>
+  <p class="empty" id="dashVoteEmpty">Nothing to compare. Run a tournament with "People vote" to prepare pairs.</p>
+  <div class="stack tight" id="dashVoteBox" hidden>
+    <span class="field-label">Prompt</span>
+    <div class="readonly" id="dashVotePrompt"></div>
+    <div class="dash-ab">
+      <div class="stack tight"><span class="field-label">Answer A</span><div class="dash-answer" id="dashVoteA"></div></div>
+      <div class="stack tight"><span class="field-label">Answer B</span><div class="dash-answer" id="dashVoteB"></div></div>
+    </div>
+    <div class="row wrap center">
+      <button type="button" class="btn" onclick="dashVote('a')">A is better</button>
+      <button type="button" class="btn" onclick="dashVote('tie')">About the same</button>
+      <button type="button" class="btn" onclick="dashVote('b')">B is better</button>
+    </div>
+  </div>
+</div>
+"""
+
+
+def _uis_dash_merge() -> None:
+    """Put the dashboard cards in Admin > Dashboards without rewriting _UIS_PANELS."""
+    old_before, old_after = _UIS_PANELS.get(("admin", "dashboards"), ("", ""))
+    _UIS_PANELS[("admin", "dashboards")] = (old_before.strip() + _UIS_DASH_PANEL.strip(),
+                                            old_after.strip())
+
+
+_uis_dash_merge()
+# ---- dashboards end --------------------------------------------------------- #
+
+
+# ---- evals (Wave 4b: item 19) ----------------------------------------------- #
+# Admin > Evals: start a run of the evaluation suites (scripted or live), follow
+# it, compare its per-suite scores with the baseline of the model and adapter it
+# ran against, keep a run as the new baseline, and read the failed cases. The
+# regression-gate settings (EVAL_ON_PROMOTE, EVAL_MAX_REGRESSION) render below
+# these cards. Loaders live in ui_script_evals.py (evalsTabHook wires them into
+# ADMIN_TABS); every route behind them is admin-only.
+_UIS_EVALS_PANEL = r"""
+<div class="panel-block card" data-panel="evals">
+  <div class="card-header"><h3 class="h3">Run evaluations</h3>
+    <div class="card-actions">
+      <div class="seg" role="radiogroup" id="evalsMode" aria-label="Which model answers">
+        <button type="button" class="btn-sm active" data-value="scripted" aria-pressed="true">Scripted</button>
+        <button type="button" class="btn-sm" data-value="live" aria-pressed="false">Live model</button>
+      </div>
+      <button type="button" class="btn btn-sm btn-primary" id="evalsRunBtn" onclick="evalsRun()" title="Run the selected suites">Run</button>
+      <button type="button" class="btn btn-sm btn-ghost" id="evalsCancelBtn" onclick="evalsCancel()" hidden>Cancel</button>
+    </div>
+  </div>
+  <p class="hint">Scripted replays canned model answers: it checks the harness, the parsers and the API, and needs no model. Live sends the same prompts to the loaded model and adapter; it refuses while anything else is generating.</p>
+  <div class="field-row"><span class="field-label" id="evalsSuitesLabel">Suites</span>
+    <div class="field-control cap-grid" id="evalsSuites" role="group" aria-labelledby="evalsSuitesLabel">
+      <label class="check"><input type="checkbox" value="tool_calling" checked><span>Tool calling: picks the right tool with valid arguments</span></label>
+      <label class="check"><input type="checkbox" value="rag" checked><span>Knowledge base: answers from the documents and cites them</span></label>
+      <label class="check"><input type="checkbox" value="multi_turn" checked><span>Multi-turn: edits, continue after a cut-off, no language drift</span></label>
+      <label class="check"><input type="checkbox" value="routing" checked><span>Routing: each message gets the right intent, lane, tools and retrieval</span></label>
+      <label class="check"><input type="checkbox" value="parsers" checked><span>Parsers: every model family's tool-call format (no model)</span></label>
+      <label class="check"><input type="checkbox" value="api" checked><span>API: /v1 OpenAI and Anthropic response shapes (no model)</span></label>
+    </div>
+  </div>
+  <div class="field-row"><label class="field-label" for="evalsSaveBaseline">Save as baseline</label>
+    <div class="field-control"><label class="switch"><input type="checkbox" id="evalsSaveBaseline" aria-label="Save the run as the baseline"><span class="slider"></span></label><span class="hint">Keep this run as the reference for its model and adapter.</span></div>
+  </div>
+  <div class="row nowrap" id="evalsJobBox" hidden><span class="pill running" id="evalsJobPill">running</span><span class="hint mono grow ellipsis" id="evalsJobText"></span></div>
+  <dl class="kv" id="evalsActive"></dl>
+</div>
+<div class="panel-block card" data-panel="evalscores">
+  <div class="card-header"><h3 class="h3">Scores against the baseline</h3>
+    <div class="card-actions">
+      <button type="button" class="btn btn-sm" id="evalsBaselineBtn" onclick="evalsSaveBaseline()" title="Keep the selected run as the baseline for its model and adapter" disabled>Make baseline</button>
+    </div>
+  </div>
+  <p class="hint" id="evalsSummary">No run yet.</p>
+  <div id="evalsChart"></div>
+  <div class="ops-scroll"><table class="table"><thead><tr><th>Suite</th><th>Score</th><th>Passed</th><th>Baseline</th><th>Change</th><th>Latency</th><th>Tokens</th></tr></thead><tbody id="evalsCompare"></tbody></table></div>
+</div>
+<div class="panel-block card" data-panel="evalruns">
+  <div class="card-header"><h3 class="h3">Runs</h3>
+    <div class="card-actions">
+      <button type="button" class="btn btn-sm" onclick="evalsLoad()" title="Refresh the runs">Refresh</button>
+    </div>
+  </div>
+  <div class="ops-scroll"><table class="table"><thead><tr><th>When</th><th>Mode</th><th>Model and adapter</th><th>Score</th><th>Passed</th><th>Result</th><th>Trigger</th><th></th></tr></thead><tbody id="evalsRuns"></tbody></table></div>
+</div>
+<div class="panel-block card" data-panel="evalcases">
+  <div class="card-header"><h3 class="h3" id="evalsCasesTitle">Cases</h3>
+    <div class="card-actions">
+      <div class="seg" role="radiogroup" id="evalsCaseFilter" aria-label="Which cases">
+        <button type="button" class="btn-sm active" data-value="failed" aria-pressed="true">Failed</button>
+        <button type="button" class="btn-sm" data-value="all" aria-pressed="false">All</button>
+      </div>
+    </div>
+  </div>
+  <div class="ops-scroll"><table class="table"><thead><tr><th>Suite</th><th>Case</th><th>Score</th><th>Failed checks</th><th>Latency</th><th>Tokens</th></tr></thead><tbody id="evalsCases"></tbody></table></div>
+</div>
+"""
+
+
+def _uis_evals_merge() -> None:
+    """Put the evaluation cards in Admin > Evals, above its settings."""
+    old_before, old_after = _UIS_PANELS.get(("admin", "evals"), ("", ""))
+    _UIS_PANELS[("admin", "evals")] = (old_before.strip() + _UIS_EVALS_PANEL.strip(),
+                                       old_after.strip())
+
+
+_uis_evals_merge()
+# ---- evals end -------------------------------------------------------------- #
+
+
 def _uis_body(section: str, sub: str, fields: list[dict[str, Any]]) -> str:
     before, after = _UIS_PANELS.get((section, sub), ("", ""))
     return before.strip() + _uis_groups(fields) + after.strip()
@@ -667,8 +1112,11 @@ def _uis_section(sec: dict[str, Any], first: bool) -> str:
     ]
     tabs = SETTINGS_SUBTABS.get(key)
     if tabs:
+        # A sub-tab flagged admin (Tools > MCP) is gated like admin-only
+        # sections: cosmetic here, its routes are ADMIN on the server.
         buttons = "".join(
-            f'<button type="button" class="btn-sm{" active" if i == 0 else ""}"'
+            f'<button type="button" class="btn-sm{" active" if i == 0 else ""}'
+            f'{" admin-only" if t.get("admin") else ""}"'
             f' data-sub="{t["key"]}" role="tab"'
             f' aria-pressed="{"true" if i == 0 else "false"}">{_uis_esc(t["label"])}</button>'
             for i, t in enumerate(tabs))
@@ -677,6 +1125,7 @@ def _uis_section(sec: dict[str, Any], first: bool) -> str:
         for i, t in enumerate(tabs):
             sub_fields = [f for f in fields if settings_field_sub(f) == t["key"]]
             hidden = "" if i == 0 else " hidden"
+            hidden += " admin-only" if t.get("admin") else ""
             parts.append(f'<div class="sub-panel{hidden}" data-sub="{t["key"]}">'
                          f'{_uis_body(key, t["key"], sub_fields)}</div>')
     else:
