@@ -967,6 +967,15 @@ class Config:
     # Per-role rules, JSON: {"user": {"risk:exec": "deny"}, "admin": {"*": "allow"}}.
     tool_approval_roles: str = field(default_factory=lambda: os.environ.get(
         "TOOL_APPROVAL_ROLES", "").strip())
+    # Per-user approvals (policy.py, the header's Approvals control): the mode
+    # a user gets until they choose one. all = ask before every tool call, risky
+    # = ask before writes, code, sends and deletes, off = never ask. The rule
+    # this implements is "always ask for every action unless the user changes
+    # the setting the header always shows", so the default is all.
+    # TOOL_APPROVAL_MODE above stays the administrator's floor: when it is
+    # stricter than a user's choice, it wins.
+    approval_default_mode: str = field(default_factory=lambda: os.environ.get(
+        "APPROVAL_DEFAULT_MODE", "all").strip().lower())
     # OpenAI / Anthropic compatible API (openai_compat.py, anthropic_compat.py).
     # What a /v1 request whose model is a plain alias or repo id runs as:
     # "agent" (this app's agent with its server-side tools, today's
@@ -1091,6 +1100,57 @@ class Config:
     # 0 = no cap.
     cloud_max_tokens_per_user_month: int = field(default_factory=lambda: int(
         os.environ.get("CLOUD_MAX_TOKENS_PER_USER_MONTH", "0")))
+    # Evaluation and regression suite (evals.py). EVAL_ON_PROMOTE=1 runs the
+    # live tool-calling, RAG and multi-turn suites after a retrain promoted an
+    # adapter and restarted the server, and rolls the adapter back when any
+    # suite scores more than EVAL_MAX_REGRESSION (a 0..1 fraction) below the
+    # previous adapter's baseline. Off by default: training is unchanged.
+    eval_on_promote: bool = field(default_factory=lambda: os.environ.get(
+        "EVAL_ON_PROMOTE", "0") == "1")
+    eval_max_regression: float = field(default_factory=lambda: float(
+        os.environ.get("EVAL_MAX_REGRESSION", "0.05")))
+    # File-tool safety and generated documents (tools.py, Phase B of
+    # upgrade/ROUTING_AND_TOOLING.md). PROJECT_DIR may be this app's own
+    # checkout, where read_file could read .env and write_file could rewrite
+    # data/feedback.db under the running server. FILE_DENY_GLOBS is the list of
+    # paths, relative to the active root, that no file tool, @reference,
+    # download or create_document may read or write: gitignore-style, a
+    # pattern with a slash is anchored at the root, one without matches at any
+    # depth, and a matching directory protects everything below it. Matched
+    # case-insensitively (APFS would otherwise open .ENV as .env). Restart-only:
+    # a web setting that can lift the guard is a guard one stolen admin session
+    # removes. OUTPUTS_DIR is where create_document writes a bare file name
+    # (relative to the root, created on demand; empty keeps the root), so a
+    # generated report never lands among the source files.
+    file_deny_globs: str = field(default_factory=lambda: os.environ.get(
+        "FILE_DENY_GLOBS", ".env,.env.*,data/**,logs/**,adapters/**,.venv/**,*.db,"
+        "*.db-wal,*.db-shm,*.key,*.pem,secrets/**,.git/**").strip())
+    outputs_dir: str = field(default_factory=lambda: os.environ.get(
+        "OUTPUTS_DIR", "outputs").strip())
+    # Agent routing, retrieval relevance and reasoning budget (agent.py, llm.py;
+    # upgrade/ROUTING_AND_TOOLING.md P2 and P6).
+    # A knowledge-base query word found in more than this fraction of the
+    # indexed documents says nothing about which one is relevant ("skills" was
+    # in 3467 of 3473 paths) and is ignored by the retrieval overlap test.
+    # Applies once the index holds at least 20 documents; 1.0 turns it off.
+    rag_df_ceiling: float = field(default_factory=lambda: float(
+        os.environ.get("RAG_DF_CEILING", "0.2")))
+    # When the "think before you answer" instruction is appended (under
+    # REASONING_VISIBLE): auto = only for a model the catalogue marks as a
+    # thinking model, always = every model (the old behaviour), never = none.
+    reasoning_prompt: str = field(default_factory=lambda: os.environ.get(
+        "REASONING_PROMPT", "auto").strip().lower())
+    # Reasoning tokens one agent step may spend before the stream is stopped
+    # and the model is asked for the answer only (once, then what it has is
+    # salvaged). 0 = no cap.
+    think_max_tokens: int = field(default_factory=lambda: int(
+        os.environ.get("THINK_MAX_TOKENS", "384")))
+    # UI-term intent lexicon (intents.py): read the app's own vocabulary ("add
+    # this to skills", "check the codebase", "use the knowledge base to make a
+    # pdf") as an instruction before the router runs, so those turns get the
+    # right tools and retrieval. 0 leaves every turn to the router as before.
+    intent_lexicon_enabled: bool = field(default_factory=lambda: os.environ.get(
+        "INTENT_LEXICON_ENABLED", "1") == "1")
     # ---- extension fields: feature blocks above this line ---- #
 
     seed_demo: bool = False
@@ -1196,6 +1256,9 @@ class Config:
         # to the next call.
         "tool_approval_mode", "tool_approval_unattended", "tool_approval_timeout_s",
         "tool_approval_taint", "tool_approval_roles",
+        # Per-user approvals: the default for users who never chose a mode,
+        # read on every tool call, so a change applies to the next call.
+        "approval_default_mode",
         # OpenAI / Anthropic compatible API: read per request, so a change
         # applies to the next /v1 call.
         "v1_default_mode", "v1_raw_enabled",
@@ -1209,6 +1272,15 @@ class Config:
         # next one. Provider, endpoint, model and key stay restart-only.
         "cloud_fallback_enabled", "cloud_consent", "cloud_min_prefill_s",
         "cloud_min_prompt_tokens", "cloud_allowed_roles", "cloud_max_tokens_per_user_month",
+        # Evaluation suite: read when a retrain promotes and when a run is
+        # compared, so a change applies to the next one.
+        "eval_on_promote", "eval_max_regression",
+        # Agent routing, retrieval relevance and reasoning budget: read per
+        # turn, so a change applies to the next message.
+        "rag_df_ceiling", "reasoning_prompt", "think_max_tokens",
+        # Intent lexicon: read at the start of every turn, so a change applies
+        # to the next message.
+        "intent_lexicon_enabled",
         # ---- extension mutable settings: one commented group per feature, above this line ---- #
     )
 
@@ -1745,6 +1817,19 @@ class Config:
             self.tool_approval_roles = self.__dict__.get("_policy_roles_ok", "")
             if "tool_approval_roles" in changed:
                 changed.remove("tool_approval_roles")
+        # --- Per-user approvals --- #
+        # Same aliases as TOOL_APPROVAL_MODE, but an unknown value becomes
+        # "all": this is the setting that promises users are asked, so a typo
+        # must fail towards asking every time.
+        _apr_mode = str(self.approval_default_mode or "").strip().lower()
+        _apr_mode = {"0": "off", "false": "off", "none": "off", "never": "off",
+                     "1": "all", "true": "all", "on": "all", "ask": "all",
+                     "changes": "risky"}.get(_apr_mode, _apr_mode)
+        if _apr_mode not in ("off", "risky", "all"):
+            log(f"Unknown APPROVAL_DEFAULT_MODE {_apr_mode[:40]!r}; using 'all'.",
+                logging.WARNING)
+            _apr_mode = "all"
+        self.approval_default_mode = _apr_mode
 
         # --- OpenAI / Anthropic compatible API ---
         _v1_mode = str(self.v1_default_mode or "").strip().lower()
@@ -1845,6 +1930,41 @@ class Config:
             if part.strip())[:2000]
         self.cloud_max_tokens_per_user_month = min(
             1_000_000_000_000, max(0, int(self.cloud_max_tokens_per_user_month)))
+        # --- Evaluation suite --- #
+        self.eval_on_promote = bool(self.eval_on_promote)
+        self.eval_max_regression = min(1.0, max(0.0, float(self.eval_max_regression)))
+        # --- File-tool deny-list and generated documents --- #
+        # Blank entries dropped and whitespace trimmed, so ".env, data/**" is
+        # two patterns; capped so a pasted file cannot become the regex.
+        self.file_deny_globs = ",".join(
+            part.strip() for part in str(self.file_deny_globs or "").split(",")
+            if part.strip())[:4000]
+        # Relative to the active root and confined to it: an absolute path or a
+        # ".." would put generated documents outside every root's resolver, so
+        # either falls back to the default with a warning.
+        _out_dir = str(self.outputs_dir or "").strip().replace("\\", "/")
+        while _out_dir.startswith("./"):
+            _out_dir = _out_dir[2:]
+        _out_dir = _out_dir.rstrip("/")
+        if (_out_dir.startswith(("/", "~")) or ".." in _out_dir.split("/")
+                or re.match(r"^[A-Za-z]:", _out_dir) or len(_out_dir) > 200):
+            log(f"Ignoring invalid OUTPUTS_DIR {_out_dir[:60]!r} (expected a folder "
+                "relative to the project root); using outputs.", logging.WARNING)
+            _out_dir = "outputs"
+        self.outputs_dir = "" if _out_dir == "." else _out_dir
+        # --- Agent routing, retrieval relevance and reasoning budget --- #
+        self.rag_df_ceiling = min(1.0, max(0.01, float(self.rag_df_ceiling)))
+        # An unknown mode becomes auto: the instruction then follows the
+        # catalogue, which is the setting this field exists to make the default.
+        _rp_mode = str(self.reasoning_prompt or "").strip().lower()
+        if _rp_mode not in ("auto", "always", "never"):
+            log(f"Ignoring invalid REASONING_PROMPT {_rp_mode[:40]!r} (expected auto, "
+                "always or never); using auto.", logging.WARNING)
+            _rp_mode = "auto"
+        self.reasoning_prompt = _rp_mode
+        self.think_max_tokens = min(8192, max(0, int(self.think_max_tokens)))
+        # --- Intent lexicon --- #
+        self.intent_lexicon_enabled = bool(self.intent_lexicon_enabled)
         # ---- extension clamps: one `# --- <Feature> ---` block per feature, above this line ---- #
 
         for name, old in before.items():
@@ -1883,7 +2003,10 @@ CAPABILITY_GROUPS = {
     "knowledge": {
         "label": "Knowledge base",
         "description": "Retrieve answers from the user's indexed documents (RAG).",
-        "tools": [],  # RAG is a retrieval flag, not a tool; see rag_for_capabilities().
+        # RAG itself is a retrieval flag (rag_for_capabilities()); the tools are
+        # what lets a "Knowledge base" profile actually look things up and
+        # answer "what is in my knowledge base", which RAG alone never could.
+        "tools": ["search_docs", "kb_overview"],
     },
     "memory": {
         "label": "Memory",

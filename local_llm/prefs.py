@@ -64,6 +64,16 @@ def _prefs_schema(conn) -> None:
 register_schema(PREFS_SCHEMA_NAME, _prefs_schema)
 
 
+def _prefs_delete_user(db, user_id: str) -> None:
+    """Database.delete_user hook: a deleted account's preferences go with it."""
+    db.ensure_schema(PREFS_SCHEMA_NAME)
+    db.execute("DELETE FROM user_preferences WHERE user_id = ?", (str(user_id),))
+    db.commit()
+
+
+register_user_cleanup(PREFS_SCHEMA_NAME, _prefs_delete_user)
+
+
 class PreferenceStore:
     """Read and write one user's preferences. Stateless apart from the db handle,
     so building one per call is cheap (the schema check is cached on the db)."""
@@ -192,4 +202,5 @@ __all__ = [
     'user_generation_prefs',
     'register_prefs',
     '_prefs_schema',
+    '_prefs_delete_user',
 ]

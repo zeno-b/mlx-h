@@ -22,6 +22,12 @@ openSettings(section, sub) is the one way in (gear button, palette, buttons
 in other panels); toggleSettings(), loadConfig() and saveConfig() remain as
 shims for older callers. Sub-tab loaders and polling live in
 ui_script_admin.py (ADMIN_TABS).
+
+The header's Approvals control lives here too (the appr* block at the end):
+it is the same per-user preference as Settings > Tools > Approvals > My
+approvals, so one script keeps both in step. It loads when the app is
+revealed, changes the preference with one click and shows the effective mode,
+including a minimum the administrator set.
 """
 
 from __future__ import annotations
@@ -30,6 +36,7 @@ UI_JS_SETTINGS = r"""   // -----------------------------------------------------
 
    var settingsSection = null;        // section on screen (or to show on open)
    var settingsSubs = {};             // section -> sub-tab last shown
+   var settingsShownKey = "";         // section/sub on screen, to reset the scroll on a switch
    var settingsLoaded = {};           // "scope:key" -> value as the server reported it
    var settingsReturnView = "chat";   // where closeSettings() goes back to
    var settingsRestartKeys = [];      // labels of applied settings that need a restart
@@ -266,6 +273,9 @@ UI_JS_SETTINGS = r"""   // -----------------------------------------------------
 
    function settingsAdoptPrefs(prefs) {
      settingsAdopt(["user"], prefs || {});
+     // approval_mode is null until the user chooses (the installation default
+     // applies), which would leave My approvals with no button pressed.
+     apprAdoptPrefs(prefs);
    }
 
    async function loadSettings() {
@@ -346,6 +356,7 @@ UI_JS_SETTINGS = r"""   // -----------------------------------------------------
      var ignored = [];
      var clamped = [];
      var failures = [];
+     var serverRestart = false;          // the server says the model server must restart
      if (Object.keys(globals).length) {
        try {
          var out = await postJSON("/api/config", globals);
@@ -369,6 +380,7 @@ UI_JS_SETTINGS = r"""   // -----------------------------------------------------
            ignored.push(el ? settingsLabelOf(el) : key);
          });
          settingsAdoptValues(cfg);
+         serverRestart = d.restart_required === true;
        } catch (err) {
          failures.push("installation settings: " + err.message);
        }
@@ -395,7 +407,8 @@ UI_JS_SETTINGS = r"""   // -----------------------------------------------------
      if (failures.length) uiToast("Could not save " + failures.join("; "), "error");
      if (ignored.length) uiToast("Not applied (invalid value): " + ignored.join(", "), "warn");
      if (clamped.length) uiToast("Adjusted to the allowed range: " + clamped.join(", "), "warn");
-     if (saved.length) uiToast("Saved: " + saved.join(", "), "ok");
+     if (saved.length) uiToast("Saved: " + saved.join(", ") + (serverRestart
+       ? ". The model server uses them after its next restart." : ""), "ok");
      else if (!failures.length && !ignored.length) uiToast("No settings changed.", "info");
    }
 
@@ -456,6 +469,8 @@ UI_JS_SETTINGS = r"""   // -----------------------------------------------------
      // Chat-side preferences (enter to send, code wrap, reasoning display,
      // metrics, default mode) belong to the chat script.
      if (typeof applyChatPrefs === "function") applyChatPrefs(prefs);
+     // My approvals autosaves through here: the header shows it at once.
+     apprAdoptPrefs(prefs);
    }
 
    // Pre-paint: the cached choice, before any request returns.
@@ -515,6 +530,17 @@ UI_JS_SETTINGS = r"""   // -----------------------------------------------------
      return !!secEl && (settingsIsAdmin() || !secEl.classList.contains("admin-only"));
    }
 
+   // On a phone the rail and the sub-tab bar scroll sideways; a tab chosen by a
+   // deep link or a restored section could sit off-screen. Centre it in its own
+   // bar only (never scrollIntoView, which would also move the page).
+   function settingsRevealTab(tab) {
+     var bar = tab && tab.parentNode;
+     if (!bar || bar.scrollWidth <= bar.clientWidth) return;
+     var tr = tab.getBoundingClientRect();
+     var br = bar.getBoundingClientRect();
+     bar.scrollLeft += (tr.left + tr.width / 2) - (br.left + br.width / 2);
+   }
+
    // Show settingsSection (and its sub-tab), then hand the tab to the
    // lazy-load registry so its loader runs and its poll starts.
    function settingsActivate() {
@@ -533,6 +559,7 @@ UI_JS_SETTINGS = r"""   // -----------------------------------------------------
        var on = item.getAttribute("data-section") === section;
        item.classList.toggle("active", on);
        item.setAttribute("aria-selected", on ? "true" : "false");
+       if (on) settingsRevealTab(item);
      });
      var title = document.getElementById("settingsTitle");
      var desc = document.getElementById("settingsDesc");
@@ -552,8 +579,18 @@ UI_JS_SETTINGS = r"""   // -----------------------------------------------------
          var on = b.getAttribute("data-sub") === sub;
          b.classList.toggle("active", on);
          b.setAttribute("aria-pressed", on ? "true" : "false");
+         // The buttons are role="tab", so assistive tech reads aria-selected.
+         b.setAttribute("aria-selected", on ? "true" : "false");
+         if (on) settingsRevealTab(b);
        });
        tabKey = section + "/" + sub;
+     }
+     // A different section or sub-tab starts at its top: the scroller is shared,
+     // so it kept the previous page's offset and opened the next one mid-way.
+     if (tabKey !== settingsShownKey) {
+       var scroller = root.querySelector(".settings-main");
+       if (scroller) scroller.scrollTop = 0;
+       settingsShownKey = tabKey;
      }
      try { localStorage.setItem("llm_settings_section", section); } catch (err) { /* private mode */ }
      if (typeof adminTabShown === "function") adminTabShown(tabKey);
@@ -751,8 +788,220 @@ UI_JS_SETTINGS = r"""   // -----------------------------------------------------
      settingsUpdateBar();
    }
 
+   // ------------------------------------------------ approvals (header) ---
+   // The header's Approvals control. policy.py asks the user before every
+   // tool call unless they pick a looser mode, and the rule behind that
+   // ("always ask, unless overwritten with a setting that is always visible")
+   // only holds if the setting is on screen everywhere: this control sits in
+   // the header on every view, role and width. GET /api/me/approval-mode says
+   // what rules (the user's choice, the installation default, the
+   // administrator's floor); a choice is saved through POST
+   // /api/me/preferences like every other preference, shown at once and then
+   // confirmed by reading the state again. Settings > Tools > Approvals shows
+   // the same preference (prefApprovalMode); both stay in step through
+   // apprAdoptPrefs.
+   var apprState = null;      // the last GET /api/me/approval-mode answer
+   var apprBusy = false;
+   var apprLoadedAt = 0;      // 0 = not loaded for this session yet
+   var APPR_RANK = { off: 0, risky: 1, all: 2 };
+   // Fallback words for a server that sent none (policy.APPROVAL_MODE_INFO).
+   var APPR_TEXT = {
+     all: { label: "Ask every action", short: "Ask all",
+            help: "Every tool call, even reading a file or listing a folder, waits for your yes." },
+     risky: { label: "Ask for changes", short: "Ask changes",
+              help: "Reading and searching run on their own; writing or deleting files, running code and sending anything wait for your yes." },
+     off: { label: "Don't ask", short: "Don't ask",
+            help: "Tools run without asking you; administrator rules still apply." }
+   };
+
+   function apprRank(mode) {
+     return Object.prototype.hasOwnProperty.call(APPR_RANK, mode) ? APPR_RANK[mode] : 2;
+   }
+
+   function apprText(mode) {
+     var modes = (apprState && apprState.modes) || [];
+     for (var i = 0; i < modes.length; i++) {
+       if (modes[i] && modes[i].value === mode) return modes[i];
+     }
+     return APPR_TEXT[mode] || APPR_TEXT.all;
+   }
+
+   function apprOptions() {
+     return { all: document.getElementById("apprOptAll"),
+              risky: document.getElementById("apprOptRisky"),
+              off: document.getElementById("apprOptOff") };
+   }
+
+   // The effective mode after a choice made in this page: the stricter of the
+   // user's choice (or the installation default) and the administrator floor.
+   function apprDerive() {
+     if (!apprState) return;
+     var chosen = apprState.preference || apprState["default"] || "all";
+     var floor = apprState.admin_floor || "off";
+     apprState.chosen = chosen;
+     apprState.locked = apprRank(floor) > apprRank(chosen);
+     apprState.effective = apprState.locked ? floor : chosen;
+     apprState.source = apprState.locked ? "admin" : (apprState.preference ? "user" : "default");
+   }
+
+   function apprRender() {
+     var btn = document.getElementById("apprBtn");
+     if (!btn || !apprState) return;
+     var s = apprState;
+     var mode = s.effective || "all";
+     var text = apprText(mode);
+     var floorRank = apprRank(s.admin_floor || "off");
+     btn.setAttribute("data-mode", mode);
+     btn.classList.toggle("locked", !!s.locked);
+     btn.setAttribute("data-tip", "Approvals: " + text.label + ". " + text.help
+       + (s.locked ? " Set by your administrator." : " Click to change."));
+     btn.setAttribute("aria-label", "Approvals: " + text.label
+       + (s.locked ? " (set by your administrator)" : ""));
+     var label = document.getElementById("apprLabel");
+     if (label) label.textContent = text.label;
+     var shortLabel = document.getElementById("apprShort");
+     if (shortLabel) shortLabel.textContent = text.short || text.label;
+     var opts = apprOptions();
+     Object.keys(opts).forEach(function(value) {
+       var el = opts[value];
+       if (!el) return;
+       var t = apprText(value);
+       var title = el.querySelector(".appr-opt-title");
+       var help = el.querySelector(".appr-opt-help");
+       if (title) title.textContent = t.label + (value === s["default"] ? " (default)" : "");
+       if (help) help.textContent = t.help;
+       var on = value === mode;
+       el.classList.toggle("active", on);
+       el.setAttribute("aria-checked", on ? "true" : "false");
+       // Looser than the administrator's minimum: shown, not selectable.
+       el.disabled = apprRank(value) < floorRank;
+     });
+     var lock = document.getElementById("apprLockNote");
+     if (lock) {
+       lock.classList.toggle("hidden", floorRank === 0);
+       lock.textContent = floorRank === 0 ? "" : ("Set by your administrator: every account asks at least as "
+         + "much as " + apprText(s.admin_floor).label + "."
+         + (s.locked ? " Your own choice, " + apprText(s.chosen).label + ", applies if they change it." : ""));
+     }
+     var unattended = document.getElementById("apprUnattended");
+     if (unattended) {
+       unattended.textContent = s.unattended === "allow"
+         ? "Scheduled tasks, API and MCP clients cannot show a prompt; your administrator lets them run what would ask."
+         : "Scheduled tasks, API and MCP clients cannot show a prompt, so what would ask is refused there.";
+     }
+     // Settings > Tools > Approvals: the same preference, the same answer.
+     var seg = document.getElementById("prefApprovalMode");
+     if (seg) {
+       uiSeg(seg, mode);
+       Array.prototype.forEach.call(seg.querySelectorAll("button[data-value]"), function(b) {
+         b.disabled = apprRank(b.getAttribute("data-value")) < floorRank;
+       });
+     }
+   }
+
+   // A preferences object from anywhere (Settings load, autosave, a save
+   // response): adopt its approval_mode when it carries one.
+   function apprAdoptPrefs(prefs) {
+     if (!apprState || !prefs || !Object.prototype.hasOwnProperty.call(prefs, "approval_mode")) return;
+     apprState.preference = prefs.approval_mode || null;
+     apprDerive();
+     apprRender();
+   }
+
+   async function apprLoad() {
+     if (apprBusy) return;
+     apprBusy = true;
+     try {
+       var out = await fetchJSON("/api/me/approval-mode");
+       if (out.data && out.data.effective) apprState = out.data;
+     } catch (err) {
+       // Keep what is on screen (the markup says Ask every action, the
+       // default); the next focus of the window tries again.
+       if (window.console) console.warn("approvals state not loaded:", err);
+     } finally {
+       apprBusy = false;
+       apprLoadedAt = Date.now();
+     }
+     apprRender();
+   }
+
+   function apprToggle(force) {
+     var pop = document.getElementById("apprPop");
+     var btn = document.getElementById("apprBtn");
+     if (!pop) return;
+     var open = (typeof force === "boolean") ? force : pop.classList.contains("hidden");
+     pop.classList.toggle("hidden", !open);
+     if (btn) btn.setAttribute("aria-expanded", open ? "true" : "false");
+     // An administrator may have moved the floor since the page loaded.
+     if (open && Date.now() - apprLoadedAt > 5000) apprLoad();
+   }
+
+   async function apprChoose(mode) {
+     if (!Object.prototype.hasOwnProperty.call(APPR_RANK, mode)) return;
+     if (!apprState) apprState = { "default": "all", admin_floor: "off", modes: [] };
+     var before = apprState.preference || null;
+     apprState.preference = mode;
+     apprDerive();
+     apprRender();
+     apprToggle(false);
+     try {
+       var out = await postJSON("/api/me/preferences", { approval_mode: mode });
+       var d = out.data || {};
+       if ((d.ignored || []).indexOf("approval_mode") >= 0) throw new Error("the server did not accept " + mode);
+       // Only this key: adopting every preference would reset an unapplied
+       // edit elsewhere in Settings.
+       settingsAdoptPrefs({ approval_mode: (d.preferences || {}).approval_mode || mode });
+       uiToast("Approvals: " + apprText(mode).label
+         + (apprState.locked ? ". Your administrator's minimum still applies." : "."), "ok");
+     } catch (err) {
+       apprState.preference = before;
+       apprDerive();
+       apprRender();
+       uiToast("Approvals not changed: " + err.message, "error");
+       return;
+     }
+     apprLoad();
+   }
+
+   function apprOpenSettings() {
+     apprToggle(false);
+     openSettings("tools", "approvals");
+   }
+
+   // Load once the app is revealed (authBoot drops booting/locked from
+   // <body>), forget on logout, refresh when the window regains focus.
+   function apprWatchSession() {
+     var body = document.body;
+     function check() {
+       if (body.classList.contains("booting") || body.classList.contains("locked")) {
+         apprState = null;
+         apprLoadedAt = 0;
+         return;
+       }
+       if (!apprLoadedAt && !apprBusy) apprLoad();
+     }
+     if (window.MutationObserver) {
+       new MutationObserver(check).observe(body, { attributes: true, attributeFilter: ["class"] });
+     }
+     check();
+     window.addEventListener("focus", function() {
+       if (apprLoadedAt && Date.now() - apprLoadedAt > 30000) apprLoad();
+     });
+     document.addEventListener("click", function(e) {
+       var pop = document.getElementById("apprPop");
+       if (!pop || pop.classList.contains("hidden")) return;
+       if (!e.target.closest || !e.target.closest("#apprMenu")) apprToggle(false);
+     });
+     document.addEventListener("keydown", function(e) {
+       if (e.key !== "Escape") return;
+       var pop = document.getElementById("apprPop");
+       if (pop && !pop.classList.contains("hidden")) apprToggle(false);
+     });
+   }
+
    initTheme();
    wireSettings();
+   apprWatchSession();
 """
 
 __all__ = ["UI_JS_SETTINGS"]

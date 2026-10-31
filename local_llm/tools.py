@@ -100,6 +100,218 @@ def resolve_in_workspace(path: str) -> Path:
     return candidate
 
 
+# --------------------------------------------------------------------------- #
+# Protected paths (FILE_DENY_GLOBS)
+# --------------------------------------------------------------------------- #
+# PROJECT_DIR can be this app's own checkout, and then read_file(".env") handed
+# the model every secret the server holds, while write_file("data/feedback.db")
+# could rewrite the database under the running process. ToolRegistry._resolve
+# is the one door every file tool, @reference, the download route and
+# create_document already go through, so the deny-list is checked there; the
+# directory walks (list_files, search_files, index_docs) skip protected entries
+# through _is_ignored, so a search for "TOKEN=" cannot read .env sideways.
+#
+# gitignore-style, relative to the active root: a pattern with a slash in it is
+# anchored at the root ("data/**"), one without matches a name at any depth
+# ("*.db", ".env"), "**" crosses directories and "*" does not, and a matching
+# directory protects everything below it ("data/**" also refuses "data" itself,
+# so list_files("data") is refused, not just its files). Case-insensitive
+# because APFS is: on a Mac, ".ENV" opens .env.
+_FILE_DENY_CACHE: dict[str, Any] = {}
+
+
+def _file_deny_body(pattern: str) -> str:
+    """One glob as an unanchored regex body."""
+    out: list[str] = []
+    i = 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    return "".join(out)
+
+
+def file_deny_regex(globs: str) -> "re.Pattern[str] | None":
+    """The compiled deny-list for a FILE_DENY_GLOBS value; None when it is empty.
+
+    Cached by the raw value: the walks call this once per file, and the value
+    only changes with a restart (or a test's own Config)."""
+    key = str(globs or "")
+    if key in _FILE_DENY_CACHE:
+        return _FILE_DENY_CACHE[key]
+    bodies: list[str] = []
+    for raw in key.split(","):
+        pattern = raw.strip().replace("\\", "/")
+        while pattern.startswith("./"):
+            pattern = pattern[2:]
+        # Decided before "/**" is stripped: "data/**" is anchored, "logs/" is not.
+        anchored = "/" in pattern.rstrip("/")
+        if pattern.endswith("/**"):
+            pattern = pattern[:-3]
+        pattern = pattern.strip("/")
+        if not pattern:
+            continue
+        bodies.append(("^" if anchored else "(?:^|/)") + _file_deny_body(pattern))
+    compiled = (re.compile("(?:" + "|".join(bodies) + r")(?:/.*)?$", re.IGNORECASE)
+                if bodies else None)
+    if len(_FILE_DENY_CACHE) > 32:
+        _FILE_DENY_CACHE.clear()
+    _FILE_DENY_CACHE[key] = compiled
+    return compiled
+
+
+def file_denied(rel: str, globs: str) -> bool:
+    """True when `rel`, a path relative to the active root, is protected."""
+    regex = file_deny_regex(globs)
+    rel = str(rel or "").replace("\\", "/").strip("/")
+    return bool(regex is not None and rel and regex.search(rel))
+
+
+def _diff_header_paths(header: str) -> list[str]:
+    """Every path a "diff --git a/X b/Y" line could name.
+
+    git does not quote a path with spaces, so the line cannot be split on
+    whitespace: when X and Y are the same (no rename) the line is two equal
+    halves; otherwise each " b/" is a candidate split. Over-matching only
+    means a section is judged twice, which suits a deny-list."""
+    rest = header[len("diff --git "):].rstrip("\r")
+    if not rest.startswith(("a/", '"a/')):
+        return []
+    n = (len(rest) - 1) // 2
+    if len(rest) % 2 == 1 and rest[n] == " " and rest[:n].strip('"')[2:] == \
+            rest[n + 1:].strip('"')[2:]:
+        return [rest[:n].strip('"')[2:]]
+    out: list[str] = []
+    for m in re.finditer(r' "?b/', rest):
+        out += [rest[:m.start()].strip('"')[2:], rest[m.end():].rstrip('"')]
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# kb_overview helpers
+# --------------------------------------------------------------------------- #
+_KB_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
+_KB_FRONT_KEY = re.compile(r"^\s*(name|title|description)\s*:\s*(.*)$", re.IGNORECASE)
+_KB_PROSE_EXTS = frozenset({"", ".md", ".markdown", ".mdx", ".txt", ".rst"})
+
+
+def _kb_size(chars: Any) -> str:
+    n = int(chars or 0)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M chars"
+    if n >= 1000:
+        return f"{n / 1000:.1f}k chars"
+    return f"{n} chars"
+
+
+def _kb_title(head: str, title: Any, path: str) -> str:
+    """A document's title from the start of its first passage.
+
+    SKILL.md frontmatter (name: description) first, because a skill's
+    description is the one line that says what it is for; then the first
+    markdown heading; then the title it was indexed with, unless that is just
+    the file name; then the file name."""
+    base = str(path).rstrip("/").rsplit("/", 1)[-1]
+    text = str(head or "").lstrip("﻿").lstrip()
+    name = desc = ""
+    if text.startswith("---"):
+        body = text[3:]
+        end = body.find("\n---")
+        lines = (body[:end] if end >= 0 else body).splitlines()
+        for i, line in enumerate(lines):
+            m = _KB_FRONT_KEY.match(line)
+            if not m:
+                continue
+            key, value = m.group(1).lower(), m.group(2).strip().strip("\"'")
+            if value in (">", "|", ">-", "|-", ">+", "|+"):
+                # A folded YAML block: the value is the indented lines below.
+                more = []
+                for follow in lines[i + 1:]:
+                    if follow[:1] not in (" ", "\t"):
+                        break
+                    more.append(follow.strip())
+                value = " ".join(more)
+            if key in ("name", "title") and not name:
+                name = value
+            elif key == "description" and not desc:
+                desc = value
+    if name or desc:
+        label = f"{name}: {desc}" if name and desc else (name or desc)
+    else:
+        # A "# ..." line is a heading only in prose: in a .py or .sh file it
+        # is a comment, and "Folders that are never skill content." is not
+        # the title of harness_manifest_builder.py.
+        prose = "://" in str(path) or Path(base).suffix.lower() in _KB_PROSE_EXTS
+        m = _KB_HEADING.search(text) if prose else None
+        given = str(title or "").strip()
+        label = (m.group(1) if m else
+                 given if given and given not in (base, str(path)) else base)
+    label = re.sub(r"\s+", " ", label).strip()
+    return label[:87] + "..." if len(label) > 90 else label
+
+
+def _kb_groups(paths: list[str], base: str, top: int = 8) -> list[tuple[str, int]]:
+    """(folder, documents under it) below `base`, at an adaptive depth.
+
+    Depth 2 to 4 path segments at the top (1 to 3 below a folder): the first
+    depth that splits the documents into at least two groups with none holding
+    more than 80% of them. One imported repository is the whole knowledge base
+    on a typical install, and "claude-files/local (3473)" says nothing. A web
+    page indexed by URL is grouped by its site."""
+    rels: list[list[str]] = []
+    for path in paths:
+        if "://" in path:
+            scheme, rest = path.split("://", 1)
+            rels.append([f"{scheme}://{rest.split('/', 1)[0]}"])
+            continue
+        rel = path[len(base) + 1:] if base else path
+        dirs = rel.split("/")[:-1]
+        if dirs:
+            rels.append(dirs)
+    if not rels:
+        return []
+    chosen: dict[str, int] = {}
+    for depth in ((1, 2, 3) if base else (2, 3, 4)):
+        counts: dict[str, int] = {}
+        for parts in rels:
+            key = "/".join(parts[:depth])
+            counts[key] = counts.get(key, 0) + 1
+        chosen = counts
+        if len(counts) >= 2 and max(counts.values()) <= 0.8 * len(rels):
+            break
+    ranked = sorted(chosen.items(), key=lambda kv: (-kv[1], kv[0]))[:top]
+    prefix = f"{base}/" if base else ""
+    return [(key if "://" in key else prefix + key, n) for key, n in ranked]
+
+
+def _kb_common_dir(paths: list[str]) -> str:
+    """The deepest folder every path sits in ("" when they share none)."""
+    split = [p.split("/")[:-1] for p in paths if "://" not in p]
+    if not split or len(split) != len(paths):
+        return ""
+    common = split[0]
+    for parts in split[1:]:
+        n = 0
+        while n < min(len(common), len(parts)) and common[n] == parts[n]:
+            n += 1
+        common = common[:n]
+        if not common:
+            break
+    return "/".join(common)
+
+
 @dataclass
 class Tool:
     name: str
@@ -162,6 +374,10 @@ class ToolRegistry:
         "old": "find", "old_str": "find", "new": "replace", "new_str": "replace",
         "regex": "pattern", "tz": "timezone", "name": "key", "note": "value",
         "response": "answer", "result": "answer", "final": "answer",
+        # read_file paging: the names a model reaches for when it continues
+        # from the offset a partial-read marker gave it.
+        "start": "offset", "skip": "offset", "start_char": "offset", "from_char": "offset",
+        "length": "limit", "chars": "limit", "num_chars": "limit", "max_length": "limit",
     }
 
     def __init__(self, config: Config, db: Database | None = None):
@@ -383,8 +599,14 @@ class ToolRegistry:
             description=("Read a file from the project directory. Handles text and code, and also "
                          "previews structured and document types: .csv/.tsv (columns + sample rows), "
                          ".json (pretty or shape), .ipynb (cells), .pdf and .docx (extracted text if "
-                         "the reader library is installed). Binary files are described, not dumped."),
-            parameters={"path": "file path relative to the project"},
+                         "the reader library is installed). Binary files are described, not dumped. "
+                         "A large file comes back one page at a time: the result then starts and "
+                         "ends with a line saying which characters you got and the offset to "
+                         "continue from."),
+            parameters={"path": "file path relative to the project",
+                        "offset": "character to start from, default 0 (use the offset the "
+                                  "previous page gave)",
+                        "limit": "most characters to return, default as many as fit"},
             required=["path"],
             handler=self._read_file,
             routable=bool(self.config.project_dir),
@@ -419,6 +641,37 @@ class ToolRegistry:
                 parameters={"query": "what to look for", "limit": "max passages (default 5)"},
                 required=["query"],
                 handler=self._search_docs,
+                # On the router menu so "what do my notes say about X" reaches
+                # the knowledge base when the intent lexicon does not fire;
+                # before this the router could only answer from weights or
+                # search the web for the user's own documents.
+                routable=True,
+                route_hint=('{"action":"search_docs","query":"<key terms>"} if the user '
+                            "asks what their own documents or knowledge base say."),
+                seed_directive=("Answer my original question from these passages and "
+                                "cite the [path] you rely on. If they do not answer it, "
+                                "say so rather than guessing."),
+            ))
+            # The question full-text search cannot answer: "what is in my
+            # knowledge base". search_docs returns four passages for any query,
+            # so a turn asked for an overview built it from whichever single
+            # file matched and invented the rest. Same registration condition
+            # as search_docs; read-only and owner-scoped like it.
+            self._add(Tool(
+                name="kb_overview",
+                description=(
+                    "Overview of the knowledge base: totals, folders with document "
+                    "counts, and document titles with sizes, newest first. Use it for "
+                    "\"what is in my knowledge base\" or before writing about it; "
+                    "search_docs finds passages."
+                ),
+                parameters={"folder": "optional folder (path prefix) to list",
+                            "limit": "documents per page, default 40",
+                            "offset": "documents to skip, for the next page"},
+                required=[],
+                handler=self._kb_overview,
+                risk="read",
+                capability="knowledge",
             ))
             self._add(Tool(
                 name="index_docs",
@@ -432,7 +685,15 @@ class ToolRegistry:
             ))
         self._add(Tool(
             name="write_file",
-            description="Create or overwrite a text file in the project directory. Edits happen in place; review with git before pushing.",
+            # The description carries the overwrite rule so the model plans
+            # around it instead of discovering it as an error: edit_file for a
+            # change, outputs/<name> for a new version of an existing file.
+            description=(
+                "Create a new text file in the project directory. To change an existing "
+                "file use edit_file. Replacing a whole existing file is shown to the user "
+                "first, and a write that would remove most of an existing file is refused: "
+                "write a new version to outputs/<name> instead unless the user asked to "
+                "replace it. Review changes with git before pushing."),
             parameters={"path": "file path relative to the workspace", "content": "full file contents"},
             required=["path", "content"],
             handler=self._write_file,
@@ -512,6 +773,13 @@ class ToolRegistry:
                         "limit": "how many notes, default 10"},
             required=[],
             handler=self._recall_memory,
+            # Routable: "what do you remember about me" was routed "answer",
+            # and the model then claimed memories it never looked up.
+            routable=True,
+            route_hint=('{"action":"recall_memory","query":"<topic>"} if the user asks '
+                        "what you remember about them or their saved notes."),
+            seed_directive=("Answer my original question from these notes. If none "
+                            "apply, say you have nothing stored about it."),
         ))
         self._add(Tool(
             name="forget",
@@ -545,6 +813,11 @@ class ToolRegistry:
                 parameters={"query": "what you are trying to do"},
                 required=["query"],
                 handler=self._search_skills,
+                routable=True,
+                route_hint=('{"action":"search_skills","query":"<task>"} if the user '
+                            "asks for one of their saved skills or procedures."),
+                seed_directive=("These are the matching skills. Load the one that fits "
+                                "with load_skill before following it, or say none fits."),
             ))
             self._add(Tool(
                 name="save_skill",
@@ -572,6 +845,10 @@ class ToolRegistry:
                 parameters={"query": "words to look for in past messages"},
                 required=["query"],
                 handler=self._search_past,
+                routable=True,
+                route_hint=('{"action":"search_past_conversations","query":"<key terms>"} '
+                            'if the user refers to an earlier chat ("last time", "we '
+                            'discussed").'),
                 seed_directive=(
                     "Use these earlier exchanges to answer the question. Say which "
                     "one you are relying on if it matters."
@@ -963,10 +1240,48 @@ class ToolRegistry:
         try:
             proc = subprocess.run(args, capture_output=True, text=True, timeout=10)
             if proc.returncode == 0:
-                return proc.stdout[:limit]
+                # Filtered before the cut, so a protected file's section never
+                # costs the budget the files that may be shown need.
+                return self._diff_without_protected(root, proc.stdout)[:limit]
         except Exception:
             pass      # no git, or not a repo: fall back to the plain search below
         return ""
+
+    def _diff_without_protected(self, root: Path, diff: str) -> str:
+        """`diff` without the sections of files FILE_DENY_GLOBS protects.
+
+        @diff and the end-of-turn diff print every tracked change under the
+        root without passing _resolve, so a tracked data/ file or a modified
+        .env.example reached the model as diff lines. git prints paths from
+        the repository top and the deny-list is relative to the active root,
+        so the root's prefix inside the repository is stripped first; a path
+        outside the root is judged as written."""
+        globs = getattr(self.config, "file_deny_globs", "")
+        if not diff or file_deny_regex(globs) is None:
+            return diff
+        prefix = ""
+        try:
+            got = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-prefix"],
+                                 capture_output=True, text=True, timeout=5)
+            if got.returncode == 0:
+                prefix = got.stdout.strip()
+        except Exception:  # noqa: BLE001 - no prefix: paths are judged as printed
+            pass
+        kept: list[str] = []
+        dropped = 0
+        for section in re.split(r"(?m)^(?=diff --git )", diff):
+            if section.startswith("diff --git ") and any(
+                    file_denied(p[len(prefix):] if prefix and p.startswith(prefix) else p,
+                                globs)
+                    for p in _diff_header_paths(section.split("\n", 1)[0])):
+                dropped += 1
+                continue
+            kept.append(section)
+        if not dropped:
+            return diff
+        out = "".join(kept)
+        note = f"[{dropped} protected file(s) left out of this diff (FILE_DENY_GLOBS)]"
+        return f"{out.rstrip(chr(10))}\n{note}\n" if out.strip() else note + "\n"
 
     def _root(self) -> Path:
         """The directory the file tools operate in: the configured project, or the
@@ -1000,6 +1315,15 @@ class ToolRegistry:
         parts = candidate.relative_to(root).parts if candidate != root else ()
         if ".git" in parts:
             raise ValueError("refusing to touch the .git directory")
+        # FILE_DENY_GLOBS, on the resolved path (a symlink named notes.txt that
+        # points at .env is .env) and on the path as written (a "secrets" link
+        # into a public folder is still what the user called secrets).
+        rel = "/".join(parts)
+        written = os.path.normpath(str(path).replace("\\", "/").lstrip("/"))
+        globs = getattr(self.config, "file_deny_globs", "")
+        for shown in (rel, written):
+            if shown not in ("", ".") and file_denied(shown, globs):
+                raise ValueError(f"{shown} is protected (FILE_DENY_GLOBS)")
         # With per-user roots on, the bare workspace directory (an admin with no
         # PROJECT_DIR) CONTAINS everyone's users/<id> roots. An admin's turn
         # tidying "the workspace" must not wander into them.
@@ -1237,6 +1561,7 @@ class ToolRegistry:
         until somebody adds a third write path and forgets, and the failure mode
         of forgetting is silent: the edit succeeds and only the undo is missing.
         """
+        self._note_size_before(target)
         if self.config.checkpoints_enabled and self.checkpoint_id:
             self.checkpoints.capture(self.checkpoint_id, self._root(), target,
                                      self.conversation_id)
@@ -1250,11 +1575,158 @@ class ToolRegistry:
         overwrites last week's report.pdf, the undo has to be able to bring it
         back.
         """
+        self._note_size_before(target)
         if self.config.checkpoints_enabled and self.checkpoint_id:
             self.checkpoints.capture(self.checkpoint_id, self._root(), target,
                                      self.conversation_id)
         target.write_bytes(data)
         self._note_change(target)
+
+    # ------------------------------------------------------ file safety ----
+    # The registry half of the overwrite guard and the "Changes" footer (the
+    # module-level helpers near the end of this file hold the wording). Sizes
+    # before a write are recorded per turn and per checkpoint, at the same
+    # single write point the checkpoint uses, so the footer can say
+    # "103,363 -> 841 bytes" from facts rather than from the model's account.
+    def _note_size_before(self, target: Path) -> None:
+        try:
+            state = self._ws_state()
+            book = state.__dict__.setdefault("fs_size_before", {})
+            sizes = book.setdefault(self.checkpoint_id or "", {})
+            rel = self._rel(target)
+            if rel not in sizes:
+                sizes[rel] = target.stat().st_size if target.is_file() else None
+        except Exception as exc:  # noqa: BLE001 - the footer is a report, never a reason to fail a write
+            log(f"could not record the size of {target} before a write: {exc}", logging.DEBUG)
+
+    def change_report(self, paths: list[str]) -> list[dict]:
+        """{path, kind, before, after} (sizes in bytes) for files changed this turn.
+
+        kind is created, modified or removed. `before` comes from the write
+        record, else from the turn's checkpoint manifest; `after` is the file
+        on disk now, so a later step that deleted or rewrote it is reported
+        as it really is.
+        """
+        try:
+            state = self._ws_state()
+            sizes = dict(state.__dict__.get("fs_size_before", {}).get(self.checkpoint_id or "", {}))
+        except Exception:  # noqa: BLE001
+            sizes = {}
+        manifest: dict[str, dict] = {}
+        if self.checkpoint_id and any(rel not in sizes for rel in paths):
+            try:
+                saved = self.checkpoints.get(self.checkpoint_id)
+                manifest = {e.get("path"): e for e in (saved.entries if saved else [])}
+            except Exception:  # noqa: BLE001
+                manifest = {}
+        root = self._root()
+        rows: list[dict] = []
+        for rel in paths:
+            target = root / rel
+            try:
+                after = target.stat().st_size if target.is_file() else None
+            except OSError:
+                after = None
+            if rel in sizes:
+                before, known = sizes[rel], True
+            elif rel in manifest:
+                entry = manifest[rel]
+                known = True
+                before = None
+                if entry.get("existed"):
+                    blob = self.checkpoints.root / str(self.checkpoint_id) / "blobs" / str(
+                        entry.get("blob") or "")
+                    before = blob.stat().st_size if entry.get("blob") and blob.is_file() else None
+                    known = before is not None
+            else:
+                before, known = None, False
+            if after is None:
+                kind = "removed"
+            elif known and before is None:
+                kind = "created"
+            else:
+                kind = "modified"
+            rows.append({"path": rel, "kind": kind, "before": before, "after": after})
+        return rows
+
+    def _alternative_path(self, target: Path) -> str:
+        """Where a new version of an existing file goes: outputs/<name>.
+
+        Inside the outputs folder already (or with outputs off), a sibling
+        named <stem>-new<suffix>, so the suggestion never points at the file
+        it is meant to protect.
+        """
+        rel = self._rel(target).replace("\\", "/")
+        outputs = str(getattr(self.config, "outputs_dir", "") or "").strip().strip("/")
+        if outputs and not (rel == outputs or rel.startswith(outputs + "/")):
+            return f"{outputs}/{target.name}"
+        parent = str(Path(rel).parent).replace("\\", "/")
+        name = f"{target.stem}-new{target.suffix}"
+        return name if parent in ("", ".") else f"{parent}/{name}"
+
+    @staticmethod
+    def _overwrite_key(rel: str, content: str) -> str:
+        import hashlib
+        return rel + "\x00" + hashlib.sha256(str(content).encode("utf-8", "replace")).hexdigest()
+
+    def overwrite_preview(self, args: dict) -> dict | None:
+        """What a write_file call would do to an EXISTING file, or None.
+
+        None when the target does not exist yet, cannot be resolved (the
+        handler reports that itself) or already holds exactly this content.
+        Otherwise {path, before, after, lines..., destructive, card}: the
+        agent turns it into the approval card.
+        """
+        tool = self.get("write_file")
+        if tool is None or not isinstance(args, dict):
+            return None
+        clean = self.normalise_args(tool, args)
+        path, content = clean.get("path"), clean.get("content")
+        if not path or content is None:
+            return None
+        try:
+            target = self._resolve(str(path))
+            if not target.is_file():
+                return None
+            old = target.read_text(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 - the handler will say what is wrong
+            return None
+        new = str(content)
+        if old == new:
+            return None
+        rel = self._rel(target)
+        stat = overwrite_stat(old, new)
+        alternative = self._alternative_path(target)
+        checkpointed = bool(self.config.checkpoints_enabled and self.checkpoint_id)
+        return {"path": rel, **stat, "alternative": alternative,
+                "card": overwrite_card_text(rel, stat, alternative, checkpointed)}
+
+    def approve_overwrite(self, args: dict, turn: Any = None) -> None:
+        """Record that the user said yes to this exact overwrite on a card.
+
+        Kept on the turn (TurnContext.extras), keyed by path and a hash of
+        the content that will run, so the handler, which runs in a worker
+        thread that sees the same turn, lets this one write through and
+        nothing else: an edited or a different call needs its own yes.
+        """
+        turn = turn if turn is not None else current_turn()
+        extras = getattr(turn, "extras", None)
+        tool = self.get("write_file")
+        if not isinstance(extras, dict) or tool is None or not isinstance(args, dict):
+            return
+        clean = self.normalise_args(tool, args)
+        try:
+            rel = self._rel(self._resolve(str(clean.get("path") or "")))
+        except Exception:  # noqa: BLE001
+            return
+        extras.setdefault("filesafety_overwrites", set()).add(
+            self._overwrite_key(rel, str(clean.get("content") or "")))
+
+    def _overwrite_approved(self, rel: str, content: str) -> bool:
+        extras = getattr(current_turn(), "extras", None)
+        if not isinstance(extras, dict):
+            return False
+        return self._overwrite_key(rel, content) in extras.get("filesafety_overwrites", ())
 
     # Directory names never worth walking for listing/search.
     _IGNORE_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__",
@@ -1282,12 +1754,40 @@ class ToolRegistry:
         self._ignore_cache = (str(root), now, result)
         return result
 
+    def _walk_denied(self, item: Path, root: Path | None = None) -> bool:
+        """True when a walked entry is protected by FILE_DENY_GLOBS (or is a
+        symlink that leaves the root or lands on a protected path). `root` is
+        passed by the walks so a 10,000-file tree does not resolve it per file."""
+        root = root if root is not None else self._root()
+        globs = getattr(self.config, "file_deny_globs", "")
+        try:
+            rel = item.relative_to(root).as_posix() if item != root else ""
+        except ValueError:
+            return True
+        if file_denied(rel, globs):
+            return True
+        if item.is_symlink():
+            try:
+                target = item.resolve()
+                landed = target.relative_to(root).as_posix() if target != root else ""
+            except (OSError, ValueError, RuntimeError):
+                return True
+            return file_denied(landed, globs) or ".git" in landed.split("/")
+        return False
+
     def _is_ignored(self, item: Path, ignored: set[str] | None) -> bool:
-        parts = set(item.relative_to(self._root()).parts) if item != self._root() else set()
+        root = self._root()
+        parts = set(item.relative_to(root).parts) if item != root else set()
         if parts & self._IGNORE_DIRS:
             return True
+        # Protected paths are not walked into either: search_files reads every
+        # file it lists, so without this a pattern like "TOKEN=" read .env
+        # through the back door. A symlink is judged by where it lands, and one
+        # that lands outside the root is skipped like a protected path.
+        if self._walk_denied(item, root):
+            return True
         if ignored:
-            rel = str(item.relative_to(self._root()))
+            rel = str(item.relative_to(root))
             if rel in ignored or any(rel.startswith(ig + "/") for ig in ignored):
                 return True
         return False
@@ -1311,7 +1811,10 @@ class ToolRegistry:
                 for item in entries[:400]
             ]
             return "\n".join(lines) or "Empty directory."
-        entries = sorted(target.iterdir())
+        # Protected entries are left out of the flat listing too: a small model
+        # that sees .env listed spends its next step trying to read it.
+        root = self._root()
+        entries = sorted(e for e in target.iterdir() if not self._walk_denied(e, root))
         if not entries:
             return "Empty directory."
         return "\n".join(
@@ -1319,50 +1822,130 @@ class ToolRegistry:
             for entry in entries[:200]
         )
 
-    def _read_file(self, path: str) -> str:
+    # Room the partial-read markers need inside tool_raw_chars. ToolRegistry.call
+    # cuts every result at tool_raw_chars, and a bottom marker cut off there is
+    # exactly the silence the markers exist to end.
+    _READ_MARKER_ROOM = 400
+    # Past this size a text file is paged by byte offset instead of decoded
+    # whole: counting the characters of a 2 GB log to print "of N" is not
+    # worth reading 2 GB.
+    _READ_DECODE_MAX = 16_000_000
+    # A rendered document (PDF, DOCX, notebook, workbook) is extracted up to
+    # this many characters, so its total is known and its pages line up.
+    _READ_RENDER_MAX = 4_000_000
+
+    @staticmethod
+    def _read_int(value: Any, default: int | None) -> int | None:
+        if value in (None, ""):
+            return default
+        try:
+            return max(0, int(float(str(value).strip().replace(",", ""))))
+        except (TypeError, ValueError):
+            return default
+
+    def _read_file(self, path: str, offset: Any = None, limit: Any = None, *,
+                   marked: bool = True) -> str:
+        """read_file: a file's text, paged when it is larger than one result.
+
+        A read that returns part of a file says so on its first and last line
+        ("[README.md: showing characters 1-1500 of 103,363. Call read_file
+        with offset=1500 to continue.]"). Without that, a small model took the
+        first page of a 103 KB README for the whole file and rewrote it from
+        that page. A file that fits is returned exactly as before, unmarked.
+        `marked=False` is the plain first page for internal readers (the
+        knowledge-base indexer), which must not index the marker text.
+        """
         target = self._resolve(path)
         if target.is_dir():
             raise ValueError(f"{path} is a directory, not a file. Use list_files to see what is inside.")
         if not target.is_file():
             raise ValueError(f"no such file: {path}")
         cap = self.config.tool_raw_chars
+        paged = offset not in (None, "") or limit not in (None, "")
+        start = self._read_int(offset, 0) or 0
+        room = cap - min(self._READ_MARKER_ROOM, cap // 2) if marked else cap
+        window = max(1, min(room, self._read_int(limit, room) or room))
         ext = target.suffix.lower()
+        label = self._rel(target)
         try:
             if ext == ".ipynb":
-                return self._read_notebook(target, cap)
-            if ext in (".csv", ".tsv"):
+                text = self._read_notebook(target, self._READ_RENDER_MAX)
+            elif ext in (".csv", ".tsv") and not paged:
                 return self._read_tabular(target, cap, "\t" if ext == ".tsv" else ",")
-            if ext == ".json":
-                return self._read_json(target, cap)
-            if ext == ".pdf":
-                return self._read_pdf(target, cap)
-            if ext in (".docx",):
-                return self._read_docx(target, cap)
-            if ext in (".xlsx", ".xlsm"):
-                return self._read_xlsx(target, cap)
-            if ext in (".yaml", ".yml"):
-                return self._read_yaml(target, cap)
-            if ext == ".toml":
-                return self._read_toml(target, cap)
-            try:
-                raw = target.read_bytes()[:cap * 2]
-            except PermissionError:
-                raise ValueError(f"no permission to read {path}") from None
-            except OSError as exc:
-                raise ValueError(f"could not read {path}: {exc}") from None
-            if b"\x00" in raw[:4096]:
-                kb = target.stat().st_size / 1024
-                return (f"[binary file: {target.name}, {kb:.1f} KB, type {ext or 'unknown'}]. "
-                        "Not shown as text. Use file_info for details.")
-            return raw.decode("utf-8", errors="replace")[:cap]
+            elif ext == ".json" and not paged:
+                # On top, inside the cap: a note at the bottom would be cut off
+                # by ToolRegistry.call along with the rest of the overflow.
+                hint = ("[a preview of the JSON, not all of it: call read_file with "
+                        "offset=0 to page through the raw text.]")
+                shown = self._read_json(target, max(200, cap - len(hint) - 1))
+                return f"{hint}\n{shown}" if shown.startswith("[json too large") else shown
+            elif ext == ".pdf":
+                text = self._read_pdf(target, self._READ_RENDER_MAX)
+            elif ext == ".docx":
+                text = self._read_docx(target, self._READ_RENDER_MAX)
+            elif ext in (".xlsx", ".xlsm"):
+                text = self._read_xlsx(target, self._READ_RENDER_MAX)
+            elif (ext in (".yaml", ".yml", ".toml") and not paged
+                  and target.stat().st_size <= window):
+                # Small enough to show whole: the parse summary line stays.
+                return (self._read_yaml(target, cap) if ext != ".toml"
+                        else self._read_toml(target, cap))
+            else:
+                try:
+                    size = target.stat().st_size
+                    with target.open("rb") as handle:
+                        head = handle.read(4096)
+                        if b"\x00" in head:
+                            return (f"[binary file: {target.name}, {size / 1024:.1f} KB, type "
+                                    f"{ext or 'unknown'}]. Not shown as text. Use file_info "
+                                    "for details.")
+                        if size > self._READ_DECODE_MAX:
+                            # Paged by bytes: the offset is a byte offset here.
+                            if start >= size:
+                                raise _ReadRefusal(
+                                    f"offset={start} is past the end of {label} "
+                                    f"({size:,} bytes).")
+                            handle.seek(start)
+                            chunk = handle.read(window)
+                            piece = chunk.decode("utf-8", errors="replace")
+                            if not marked:
+                                return piece
+                            marker = partial_read_marker(label, start, start + len(chunk),
+                                                         size, "bytes")
+                            return f"{marker}\n{piece}\n{marker}"
+                        text = (head + handle.read()).decode("utf-8", errors="replace")
+                except PermissionError:
+                    raise ValueError(f"no permission to read {path}") from None
+                except OSError as exc:
+                    raise ValueError(f"could not read {path}: {exc}") from None
+            return self._read_window(label, text, start, window, marked)
+        except _ReadRefusal:
+            raise
         except Exception as exc:
             # Never fail a read outright: fall back to raw text with a note.
             try:
-                return (f"[could not parse {ext or 'file'} ({type(exc).__name__}: {exc}); "
-                        "showing raw text]\n\n"
-                        + target.read_text(encoding="utf-8", errors="replace")[:cap])
+                raw = target.read_text(encoding="utf-8", errors="replace")
             except Exception:
                 raise ValueError(f"could not read {path}: {exc}") from exc
+            note = (f"[could not parse {ext or 'file'} ({type(exc).__name__}: {exc}); "
+                    "showing raw text]\n\n")
+            return note + self._read_window(label, raw, start, max(1, window - len(note)),
+                                            marked)
+
+    @staticmethod
+    def _read_window(label: str, text: str, start: int, window: int, marked: bool) -> str:
+        """`window` characters of `text` from `start`, marked when partial."""
+        total = len(text)
+        if total and start >= total:
+            raise _ReadRefusal(
+                f"offset={start} is past the end of {label} ({total:,} characters). "
+                f"The last page starts at offset={max(0, total - window)}.")
+        piece = text[start:start + window]
+        end = start + len(piece)
+        if (start == 0 and end >= total) or not marked:
+            return piece
+        marker = partial_read_marker(label, start, end, total)
+        return f"{marker}\n{piece}\n{marker}"
 
     def _read_notebook(self, target: Path, cap: int) -> str:
         nb = json.loads(target.read_text(encoding="utf-8", errors="replace"))
@@ -1521,6 +2104,89 @@ class ToolRegistry:
             out.append(f"[{h['path']}]\n{h['chunk']}")
         return "\n\n".join(out)[:self.config.tool_raw_chars]
 
+    def _kb_overview(self, folder: Any = "", limit: Any = None, offset: Any = None) -> str:
+        """Totals, folders and document titles of the knowledge base, paged.
+
+        Capped at TOOL_RESULT_CHARS on purpose: the agent condenses a longer
+        result with a model call, and a condensed inventory is the invented
+        overview this tool exists to replace. What does not fit is paged, and
+        the last line says which offset to ask for next. Owner-scoped like
+        search_docs: the acting user's own documents plus shared ones.
+        """
+        if self.db is None or not getattr(self.db, "fts_enabled", False):
+            return "Knowledge base unavailable (SQLite FTS5 not enabled)."
+        try:
+            lim = min(100, max(1, int(limit)))
+        except (TypeError, ValueError):
+            lim = 40
+        try:
+            off = max(0, int(offset))
+        except (TypeError, ValueError):
+            off = 0
+        asked = str(folder or "").strip()
+        data = self.db.document_overview(get_acting_user(), asked, lim, off)
+        rows = data.get("rows") or []
+        if not rows:
+            return "The knowledge base is empty: nothing has been indexed yet."
+        budget = max(400, int(self.config.tool_result_chars))
+        chunks = sum(int(r.get("chunks") or 0) for r in rows)
+        chars = sum(int(r.get("chars") or 0) for r in rows)
+        head = [f"Knowledge base: {len(rows)} documents, {chunks} passages, "
+                f"{_kb_size(chars)} of text."]
+        used = str(data.get("folder") or "")
+        scoped = data.get("scoped") or []
+        page = data.get("page") or []
+        if asked and not scoped:
+            head.append(f"No documents under {asked!r}.")
+        # Every path is printed relative to a prefix stated once: one imported
+        # repository's 40-character prefix on every line was a third of the
+        # budget. Folders are relative to what the whole scope shares (a
+        # relative name works as `folder`: document_overview resolves it),
+        # documents to what this page shares.
+        scope_paths = [str(r["path"]) for r in (scoped or rows)]
+        base = _kb_common_dir(scope_paths)
+        groups = _kb_groups(scope_paths, base)
+        if groups:
+            cut = len(base) + 1 if base else 0
+            line = (f"Folders{f' under {base}/' if base else ''} (documents): "
+                    + ", ".join(f"{g[cut:] if '://' not in g else g} ({n})"
+                                for g, n in groups))
+            head.append(line if len(line) <= budget // 2 else line[:budget // 2 - 3] + "...")
+        if not scoped:
+            return "\n".join(head)
+        if not page:
+            head.append(f"No documents at offset {off}: {used or 'the knowledge base'} "
+                        f"has {len(scoped)}.")
+            return "\n".join(head)
+        common = _kb_common_dir([str(r["path"]) for r in page])
+        lines: list[str] = []
+        for r in page:
+            path = str(r["path"])
+            rel = path[len(common) + 1:] if common and path.startswith(common + "/") else path
+            title = _kb_title(r.get("head") or "", r.get("title"), path)
+            size = _kb_size(r.get("chars"))
+            lines.append((f"- {rel} ({size})" if title == rel.rsplit("/", 1)[-1]
+                          else f"- {rel}: {title} ({size})")[:200])
+        where = f" in {used}" if used else ""
+        under = f", paths under {common}/" if common else ""
+
+        def render(n: int) -> str:
+            end = off + n
+            out = head + [f"Documents{where}, newest first ({off + 1}-{end} of "
+                          f"{len(scoped)}){under}:"] + lines[:n]
+            if end < len(scoped):
+                more = f"kb_overview offset={end}" + (f' folder="{used}"' if used else "")
+                out.append(f"More: call {more}.")
+            return "\n".join(out)
+
+        # As many documents as fit; the "More" line then names the next offset.
+        shown = len(lines)
+        text = render(shown)
+        while len(text) > budget and shown > 1:
+            shown -= 1
+            text = render(shown)
+        return text if len(text) <= budget else text[:budget - 3] + "..."
+
     def _index_docs(self, path: str) -> str:
         """Index a file or directory into the knowledge base, reusing the
         type-aware readers so PDFs, notebooks and spreadsheets are handled."""
@@ -1535,7 +2201,8 @@ class ToolRegistry:
         indexed, skipped, chunks = 0, 0, 0
         for f in files[:200]:
             try:
-                text = self._read_file(self._rel(f))
+                # Unmarked: the paging marker is for a model, not for the index.
+                text = self._read_file(self._rel(f), marked=False)
             except Exception:
                 skipped += 1
                 continue
@@ -1578,20 +2245,49 @@ class ToolRegistry:
         return "\n".join(info)
 
     def _write_file(self, path: str, content: str) -> str:
+        """write_file: create a file, or replace one only with care.
+
+        An existing file is never replaced silently any more. In an
+        interactive turn the agent put the call to the user as an approval
+        card first (Agent._dispatch, overwrite_preview); a "yes" there is
+        recorded on the turn and lets exactly that write through here. Without
+        one (Approvals set to Don't ask, an unattended run, a call path that
+        cannot ask), a write that would shrink the file by more than half or
+        by more than 2,000 characters is refused with a message naming
+        edit_file and outputs/<name>, so the model can recover in one step.
+        Smaller replacements go through; the checkpoint keeps the original.
+        """
         target = self._resolve(path)
         if target.is_dir():
             raise ValueError(f"{path} is a directory; give a file path to write to.")
         existed = target.is_file()
+        new = str(content)
+        stat = None
+        if existed:
+            try:
+                old = target.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                old = None             # unreadable: the write below reports why
+            if old is not None and old != new:
+                stat = overwrite_stat(old, new)
+                rel = self._rel(target)
+                if stat["destructive"] and not self._overwrite_approved(rel, new):
+                    log_event(get_logger("tools"), logging.INFO, "write.refused",
+                              path=rel, before=stat["before"], after=stat["after"])
+                    raise ValueError(write_refusal_text(rel, stat,
+                                                        self._alternative_path(target)))
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            self._save_text(target, str(content))
+            self._save_text(target, new)
         except PermissionError:
             raise ValueError(f"no permission to write {path}") from None
         except OSError as exc:
             raise ValueError(f"could not write {path}: {exc}") from None
+        note = self._validate_written(target, new)
+        if stat is not None:
+            return f"Updated {self._rel(target)}: {describe_overwrite(stat)}{note}"
         verb = "Updated" if existed else "Created"
-        note = self._validate_written(target, str(content))
-        return f"{verb} {self._rel(target)} ({len(str(content))} characters){note}"
+        return f"{verb} {self._rel(target)} ({len(new)} characters){note}"
 
     def _create_document(self, path: str, content: str, title: Any = None) -> str:
         """Render Markdown into a real .pdf/.docx/.xlsx/.pptx/... in the workspace.
@@ -1601,7 +2297,25 @@ class ToolRegistry:
         needs, and a document is the opposite -- the model writes prose and the
         app decides the bytes. Merging them would mean write_file silently
         rewriting content whenever the path happened to end in .pdf.
+
+        A bare file name ("report.pdf") goes into OUTPUTS_DIR under the root:
+        with PROJECT_DIR on a source tree, generated reports landed among the
+        source files (one turn left knowledge-base-craft-pdf.pdf in this repo's
+        root). A path with a folder in it is the model or the user choosing
+        where it goes, and is kept as written.
         """
+        raw = str(path or "").strip()
+        # The format is judged on the name as written, before the resolver:
+        # "deck.key" is a format this tool cannot write, and saying so beats
+        # reporting that *.key files are protected.
+        suffix = Path(raw).suffix.lower()
+        if suffix not in _DOC_FORMATS:
+            raise ValueError(
+                f"I cannot write {suffix or 'a file with no extension'}. Ask for one of: "
+                + ", ".join(sorted(_DOC_FORMATS)) + ".")
+        outputs = str(getattr(self.config, "outputs_dir", "") or "").strip().strip("/")
+        if outputs and raw and "/" not in raw and "\\" not in raw:
+            path = f"{outputs}/{raw}"
         target = self._resolve(path)
         if target.is_dir():
             raise ValueError(f"{path} is a directory; give a file name to write to.")
@@ -1619,6 +2333,10 @@ class ToolRegistry:
                 f"could not build the {_DOC_FORMATS[suffix]}: "
                 f"{type(exc).__name__}: {exc}") from None
         existed = target.is_file()
+        # A regenerated document replaces the previous one by design (the
+        # checkpoint keeps it); the result says so with both sizes, so a
+        # replacement is never mistaken for a first write.
+        before = target.stat().st_size if existed else 0
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             self._save_bytes(target, data)
@@ -1629,7 +2347,8 @@ class ToolRegistry:
         rel = self._rel(target)
         self.documents_written.append(rel)
         verb = "Updated" if existed else "Created"
-        return (f"{verb} {rel} — a {_DOC_FORMATS[suffix]}, {len(data):,} bytes. "
+        replaced = f" (replaced the previous {before:,}-byte file)" if existed else ""
+        return (f"{verb} {rel}: a {_DOC_FORMATS[suffix]}, {len(data):,} bytes{replaced}. "
                 "The user can download it from the link under your answer; do not "
                 "paste the file contents into your reply.")
 
@@ -1673,7 +2392,10 @@ class ToolRegistry:
         updated = original.replace(find, str(replace), max(1, limit))
         self._save_text(target, updated)
         replaced = min(occurrences, max(1, limit))
-        return f"Replaced {replaced} of {occurrences} occurrence(s) in {self._rel(target)}"
+        # The size change, so a targeted edit that removed far more than meant
+        # is visible in the result the model reads next.
+        return (f"Replaced {replaced} of {occurrences} occurrence(s) in {self._rel(target)} "
+                f"({len(original):,} -> {len(updated):,} characters)")
 
     def _search_files(self, pattern: str, path: str = "", max_results: Any = None) -> str:
         root = self._resolve(path)
@@ -2568,6 +3290,339 @@ class ToolRegistry:
         return result, error
 
 
+# --------------------------------------------------------------------------- #
+# File safety: overwrite guard, partial-read markers, answer hygiene, footer
+# --------------------------------------------------------------------------- #
+# Why this block exists: one turn on a 3B model listed the project, read a
+# 103 KB README.md of which it saw about 1,500 characters (nothing said it was
+# a part), replaced the whole file with 841 characters through write_file
+# (approvals were off and nothing guarded an overwrite), and then answered that
+# the README "is not available", echoing "TOOL RESULT" labels and never saying
+# it had overwritten anything. Each helper here closes one link of that chain:
+# the read says what it left out, the write refuses or asks before it throws
+# most of a file away, and the reply ends with what really changed, written by
+# code rather than by the model.
+
+# A write_file that shrinks an existing file by more than this share of it, or
+# by more than OVERWRITE_MAX_LOSS characters, is destructive: it needs the
+# user's yes on the approval card, and is refused where nobody can give one.
+OVERWRITE_MAX_SHARE = 0.5
+OVERWRITE_MAX_LOSS = 2000
+# Below this many characters removed the share rule does not apply. Halving a
+# 12-character scratch file is not "most of the file" in any sense a person
+# cares about, the checkpoint covers it, and refusing would only cost the
+# model a step (and break every small fixture that rewrites "v1" over "v0").
+OVERWRITE_MIN_LOSS = 256
+# Line diffs past this many lines a side fall back to a multiset count: the
+# exact diff of two 100k-line files is not worth a stalled tool call.
+_OVERWRITE_DIFF_LINES = 20000
+
+# Every partial read_file result starts and ends with this marker, and
+# cut_for_context re-renders it when the context budget cuts a result again.
+# One format, parsed in one place, so the model is never told "1-20000" when
+# it was shown 1-1380.
+_READ_MARKER_RE = re.compile(
+    r"\A\[(?P<label>[^\n\]]+?): showing (?P<unit>characters|bytes) "
+    r"(?P<a>\d+)-(?P<b>\d+) of (?P<total>[\d,]+)[^\n]*\]\n")
+
+
+class _ReadRefusal(ValueError):
+    """A read_file argument error (an offset past the end) that must reach the
+    model as such, not be swallowed by the reader's raw-text fallback."""
+
+
+def partial_read_marker(label: str, start: int, end: int, total: int,
+                        unit: str = "characters") -> str:
+    """The line that brackets a partial read: what was shown, and how to go on.
+
+    `start` is the 0-based offset of the first character shown and `end` the
+    offset just past the last, so the "continue" offset is `end` exactly and
+    the visible range is 1-based like a person would say it.
+    """
+    shown = f"[{label}: showing {unit} {start + 1}-{end} of {total:,}"
+    if end < total:
+        return f"{shown}. Call read_file with offset={end} to continue.]"
+    return f"{shown}, the end of the file. The beginning is at offset=0.]"
+
+
+def cut_for_context(name: str, result: str, budget: int) -> str:
+    """Cut a tool result to `budget` characters, saying so at the top and bottom.
+
+    A bare "[truncated]" at the end of 1,500 characters read to a small model
+    as "that was the file". A read_file result that already carries a
+    partial-read marker gets the marker re-rendered for the range that is
+    actually kept, so the offset it offers continues from what the model saw.
+    """
+    text = str(result or "")
+    budget = max(1, int(budget))
+    if len(text) <= budget:
+        return text
+    match = _READ_MARKER_RE.match(text)
+    if match:
+        label, unit = match.group("label"), match.group("unit")
+        start = int(match.group("a")) - 1
+        total = int(match.group("total").replace(",", ""))
+        body = text[match.end():]
+        tail = body.rfind("\n[")
+        if tail != -1 and _READ_MARKER_RE.match(body[tail + 1:] + "\n"):
+            body = body[:tail]
+        sample = partial_read_marker(label, start, start + len(body), total, unit)
+        keep = body[:max(budget // 2, budget - 2 * len(sample) - 4)]
+        width = len(keep.encode("utf-8")) if unit == "bytes" else len(keep)
+        marker = partial_read_marker(label, start, start + width, total, unit)
+        return f"{marker}\n{keep}\n{marker}"
+    if name == "read_file":
+        head = (f"[read_file: showing characters 1-{{n}} of the {len(text):,} returned. "
+                f"Call read_file with the same path and offset={{n}} to continue.]")
+        keep = text[:max(budget // 2, budget - 2 * len(head) - 8)]
+        marker = head.format(n=len(keep))
+        return f"{marker}\n{keep}\n{marker}"
+    top = f"[{name} result cut to fit the context: showing characters 1-{{n}} of {len(text):,}.]"
+    keep = text[:max(budget // 2, budget - len(top) - 90)]
+    return (top.format(n=len(keep)) + "\n" + keep + "\n"
+            + f"[{len(text) - len(keep):,} more characters of this {name} result were not shown.]")
+
+
+def overwrite_stat(old: str, new: str) -> dict:
+    """Before/after size and a line diff stat of replacing `old` with `new`.
+
+    `destructive` is the guard's verdict: the write shrinks the file by more
+    than OVERWRITE_MAX_SHARE of it (and by at least OVERWRITE_MIN_LOSS
+    characters), or by more than OVERWRITE_MAX_LOSS characters. `most` is the
+    plainer fact the card states: more than half of the file goes.
+    """
+    import difflib
+    from collections import Counter
+    before, after = len(old), len(new)
+    shrink = max(0, before - after)
+    share = (shrink / before) if before else 0.0
+    a, b = old.splitlines(), new.splitlines()
+    added = removed = 0
+    if len(a) <= _OVERWRITE_DIFF_LINES and len(b) <= _OVERWRITE_DIFF_LINES:
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b).get_opcodes():
+            if tag in ("replace", "delete"):
+                removed += i2 - i1
+            if tag in ("replace", "insert"):
+                added += j2 - j1
+    else:
+        ca, cb = Counter(a), Counter(b)
+        removed, added = sum((ca - cb).values()), sum((cb - ca).values())
+    destructive = (shrink > OVERWRITE_MAX_LOSS
+                   or (share > OVERWRITE_MAX_SHARE and shrink >= OVERWRITE_MIN_LOSS))
+    return {"before": before, "after": after, "delta": after - before,
+            "shrink": shrink, "share": round(share, 4),
+            "lines_before": len(a), "lines_after": len(b),
+            "lines_added": added, "lines_removed": removed,
+            "destructive": destructive, "most": share > OVERWRITE_MAX_SHARE}
+
+
+def describe_overwrite(stat: dict) -> str:
+    """"103,363 -> 841 characters (-102,522; lines +18 -2,950)"."""
+    delta = stat["delta"]
+    sign = "+" if delta >= 0 else "-"
+    return (f"{stat['before']:,} -> {stat['after']:,} characters ({sign}{abs(delta):,}; "
+            f"lines +{stat['lines_added']:,} -{stat['lines_removed']:,})")
+
+
+def overwrite_card_text(rel: str, stat: dict, alternative: str,
+                        checkpointed: bool = True) -> str:
+    """What the approval card says about replacing an existing file."""
+    text = f"Overwrite {rel}: {describe_overwrite(stat)}."
+    if stat["most"]:
+        text += (f" This removes most of the file ({round(stat['share'] * 100)}% of it)."
+                 " The content below replaces ALL of it.")
+    elif stat["shrink"] > OVERWRITE_MAX_LOSS:
+        text += f" This removes {stat['shrink']:,} characters of the file."
+    else:
+        text += " The content below replaces the whole file."
+    text += (f" Check or edit the content before allowing it; deny to keep {rel} as it is"
+             f" (a new version could go to {alternative} instead).")
+    text += (" The original is kept in this turn's checkpoint." if checkpointed
+             else " Checkpoints are off, so this cannot be undone from the app.")
+    return text
+
+
+def write_refusal_text(rel: str, stat: dict, alternative: str) -> str:
+    """The tool error for a destructive write_file nobody approved.
+
+    Written so a small model recovers in ONE step: it names both ways forward
+    (edit_file for a change, the outputs path for a new version) with the
+    exact argument to use, and says what to do when the user really meant to
+    replace the file, which is to tell them rather than retry.
+    """
+    if stat["most"]:
+        loss = f"removing {round(stat['share'] * 100)}% of it"
+    else:
+        loss = f"removing {stat['shrink']:,} characters of it"
+    return (f"write_file refused: {rel} already exists ({stat['before']:,} characters) and "
+            f"this call would replace it with {stat['after']:,} characters, {loss}. "
+            "Nothing was written. To change part of the file, read it and call edit_file "
+            "with the exact text to replace. To save a new version (for example a new "
+            f"README while one exists), call write_file with path=\"{alternative}\". If the "
+            f"user explicitly asked you to replace {rel}, do not retry: tell them this "
+            "overwrite was blocked because it would remove most of the file, and that "
+            "they can allow it by setting Approvals in the header to Ask for changes, "
+            "which shows them the change before it is made.")
+
+
+def approval_mode_in_force(config: Any, turn: Any = None, db: Any = None,
+                           policy_module: Any = None) -> str:
+    """off | risky | all: the approvals mode this turn's calls run under.
+
+    The policy module owns the answer (policy._policy_turn_mode: the user's
+    choice in the header's Approvals control, with TOOL_APPROVAL_MODE as the
+    administrator's floor), so the guard follows the very setting the user
+    sees. A policy module without it (a test's stand-in) leaves the
+    installation's TOOL_APPROVAL_MODE.
+    """
+    if policy_module is None:
+        try:
+            from . import policy as policy_module
+        except Exception:  # noqa: BLE001
+            policy_module = None
+    modes = ("off", "risky", "all")
+    turn_mode = getattr(policy_module, "_policy_turn_mode", None)
+    if callable(turn_mode):
+        try:
+            value = turn_mode(config, db, turn)
+            value = value[0] if isinstance(value, (tuple, list)) and value else value
+            if isinstance(value, str) and value in modes:
+                return value
+        except Exception as exc:  # noqa: BLE001 - fall back to the installation's mode
+            log(f"approvals mode lookup failed ({exc}); using TOOL_APPROVAL_MODE.",
+                logging.DEBUG)
+    mode = str(getattr(config, "tool_approval_mode", "off") or "off").strip().lower()
+    return mode if mode in modes else "all"
+
+
+# Scratch-protocol labels the loop writes into the model's context. A small
+# model echoes them into its reply ("TOOL RESULT [read_file]: the README is
+# not available"), where they mean nothing to the reader. Matched only at the
+# start of a line, upper case as the loop writes them, and never inside a
+# code fence, where an answer about this protocol may quote them on purpose.
+_PROTOCOL_LABEL_RE = re.compile(
+    # Kept: a quote or list marker the label sat behind. Dropped: a heading
+    # or bold wrapper around the label itself, and its colon.
+    r"^(?P<lead>[ \t]*(?:>[ \t]*)*(?:[-*+][ \t]+)?)(?:#{1,6}[ \t]*)?(?:\*\*|__)?"
+    r"(?:TOOL RESULT|TOOL OUTPUT|HELPER RESULT|PAGE TEXT|REFERENCED CONTENT)"
+    r"(?:[ \t]*\[[^\]\n]*\])?[ \t]*(?:\*\*|__)?[ \t]*:?[ \t]*(?:\*\*|__)?[ \t]*",
+    re.MULTILINE)
+CHANGES_FOOTER_HEAD = "**Changes made this turn**"
+# Only a footer-shaped tail is removed (the head line, its "- `path`: ..."
+# rows and the correction note), so a reply that merely mentions the heading
+# mid-text loses nothing after it.
+_CHANGES_FOOTER_RE = re.compile(
+    r"\n*(?:-{3,}[ \t]*\n)?[ \t]*\*\*Changes made this turn\*\*[^\n]*"
+    r"(?:\n(?:[ \t]*- `[^\n]*|[ \t]*|Note: the reply above[^\n]*))*\s*\Z")
+# A reply that says nothing was written. The footer tells the truth either
+# way; these only decide whether it also says, in so many words, that the
+# reply above is wrong.
+_DENIES_WRITING_RE = re.compile(
+    r"(?i)\b(?:i|we)\s+(?:did not|didn't|have not|haven't|could not|couldn't|"
+    r"was unable to|wasn't able to|was not able to)\s+(?:write|create|save|modify|"
+    r"change|update|overwrite|edit)\b"
+    r"|\bno (?:files?|changes?) (?:were|was|have been|has been) (?:made|written|"
+    r"created|changed|modified|saved)\b"
+    r"|\bnothing (?:was|has been) (?:written|changed|modified|saved|created)\b")
+_DENIES_FILE_RE = (r"(?:is not available|isn't available|is unavailable|does not exist|"
+                   r"doesn't exist|could not (?:be )?found|couldn't (?:be )?found|"
+                   r"could not find|couldn't find|was not found|not found)")
+
+
+def strip_protocol_labels(text: str) -> str:
+    """Remove echoed scratch labels from a final answer, outside code fences."""
+    raw = str(text or "")
+    if not raw:
+        return raw
+    parts = re.split(r"(^[ \t]*(?:```|~~~)[^\n]*$)", raw, flags=re.MULTILINE)
+    fenced = False
+    out: list[str] = []
+    for part in parts:
+        if re.match(r"^[ \t]*(?:```|~~~)", part):
+            fenced = not fenced
+            out.append(part)
+            continue
+        out.append(part if fenced else _PROTOCOL_LABEL_RE.sub(
+            lambda m: m.group("lead"), part))
+    cleaned = re.sub(r"\n{3,}", "\n\n", "".join(out)).strip()
+    return cleaned or raw.strip()
+
+
+def strip_changes_footer(text: str) -> str:
+    """Drop a "Changes made this turn" footer from text.
+
+    The footer is the code's account of a turn, so one the model wrote (by
+    imitating a previous turn's) is removed before the real one is appended.
+    """
+    return _CHANGES_FOOTER_RE.sub("", str(text or "")).rstrip()
+
+
+def answer_denies_changes(answer: str, changes: list[dict]) -> str | None:
+    """The path the reply says was not written (or "" for a general denial).
+
+    None when the reply does not contradict the changes. Used only to add an
+    explicit correction line to the footer; the footer itself is always true.
+    """
+    text = str(answer or "")
+    if not text or not changes:
+        return None
+    for row in changes:
+        if row.get("kind") == "removed":
+            continue
+        name = Path(str(row.get("path") or "")).name
+        if not name:
+            continue
+        # "the README is not available" names README.md by its stem.
+        stem = Path(name).stem
+        who = re.escape(name) + (r"|\b" + re.escape(stem) + r"\b" if len(stem) >= 4 else "")
+        near = re.compile(
+            r"(?is)(?:" + who + r")[^.\n]{0,80}?" + _DENIES_FILE_RE
+            + r"|" + _DENIES_FILE_RE + r"[^.\n]{0,40}?(?:" + who + r")")
+        if near.search(text):
+            return str(row.get("path"))
+    return "" if _DENIES_WRITING_RE.search(text) else None
+
+
+def changes_footer(changes: list[dict], checkpoint_id: str | None,
+                   denied: str | None = None) -> str:
+    """The deterministic account of what a turn did to files.
+
+    One line per path with its kind and its size before and after, then the
+    checkpoint that can undo it. Generated from the filesystem and the write
+    record, never by the model, so it is right even when the reply above it
+    is not.
+    """
+    if not changes:
+        return ""
+    def num(value: Any) -> str:
+        return f"{value:,}" if isinstance(value, int) else "?"
+
+    lines = []
+    for row in changes:
+        before, after, kind = row.get("before"), row.get("after"), row.get("kind")
+        if kind == "created":
+            size = f"{num(after)} bytes"
+        elif kind == "removed":
+            size = f"was {num(before)} bytes" if before is not None else "no longer on disk"
+        elif before is None and after is None:
+            size = "size not recorded"
+        elif before is None:
+            size = f"now {num(after)} bytes"
+        else:
+            size = f"{num(before)} -> {num(after)} bytes"
+        lines.append(f"- `{row.get('path')}`: {kind}, {size}")
+    if checkpoint_id:
+        undo = (f"checkpoint `{checkpoint_id}`; Undo under the changed files puts them "
+                "back as they were before this turn")
+    else:
+        undo = "no checkpoint was recorded, so this turn has no undo"
+    out = f"\n\n---\n{CHANGES_FOOTER_HEAD} ({undo}):\n" + "\n".join(lines)
+    if denied is not None:
+        what = f"`{denied}`" if denied else "these files"
+        out += (f"\n\nNote: the reply above says {what} was not written or is not "
+                "there, but the list above is what this turn actually changed.")
+    return out
+
 
 # Re-exported explicitly: the original file was one flat namespace, so private
 # helpers (leading underscore) must cross module boundaries too.
@@ -2579,4 +3634,32 @@ __all__ = [
     'ToolRegistry',
     'guarded_thread',
     'resolve_in_workspace',
+    '_FILE_DENY_CACHE',
+    '_file_deny_body',
+    'file_deny_regex',
+    'file_denied',
+    '_diff_header_paths',
+    '_KB_HEADING',
+    '_KB_FRONT_KEY',
+    '_KB_PROSE_EXTS',
+    '_kb_size',
+    '_kb_title',
+    '_kb_groups',
+    '_kb_common_dir',
+    # File safety (overwrite guard, partial reads, answer hygiene, footer).
+    'OVERWRITE_MAX_SHARE',
+    'OVERWRITE_MAX_LOSS',
+    'OVERWRITE_MIN_LOSS',
+    'partial_read_marker',
+    'cut_for_context',
+    'overwrite_stat',
+    'describe_overwrite',
+    'overwrite_card_text',
+    'write_refusal_text',
+    'approval_mode_in_force',
+    'strip_protocol_labels',
+    'strip_changes_footer',
+    'answer_denies_changes',
+    'changes_footer',
+    'CHANGES_FOOTER_HEAD',
 ]

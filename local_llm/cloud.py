@@ -279,8 +279,14 @@ def revoke_cloud_consents(db: Any, user_id: str, consent_id: int | None = None) 
     return int(cur.rowcount or 0)
 
 
-def standing_cloud_consent(db: Any, user_id: str, conversation_id: str | None) -> str | None:
-    """"conversation" or "always" when a live grant covers this turn, else None."""
+def standing_cloud_consent(db: Any, user_id: str, conversation_id: str | None,
+                           scopes: tuple = ("conversation", "always")) -> str | None:
+    """"conversation" or "always" when a live grant covers this turn, else None.
+
+    The narrower grant wins when both exist, so the logged scope says what the
+    user granted for this conversation. `scopes` limits what may answer (an
+    unattended run passes ("always",)).
+    """
     if db is None:
         return None
     db.ensure_schema(CLOUD_SCHEMA_NAME)
@@ -289,6 +295,8 @@ def standing_cloud_consent(db: Any, user_id: str, conversation_id: str | None) -
                       (user_id,)).fetchall()
     found = None
     for row in rows:
+        if row["scope"] not in scopes:
+            continue
         if row["scope"] == "conversation" and conversation_id \
                 and row["conversation_id"] == conversation_id:
             return "conversation"
@@ -383,10 +391,21 @@ def cloud_measured_prefill_tps(db: Any) -> float | None:
     if hit is not None and now - hit[0] < _CLOUD_TPS_TTL_S:
         return hit[1]
     value = None
+    base = ("SELECT prompt_tokens, ttft_ms FROM metrics m WHERE prompt_tokens >= ? "
+            "AND ttft_ms > 0 {skip} ORDER BY id DESC LIMIT 40")
+    # A turn the cloud answered writes its (fast) time to first token into the
+    # same metrics table; leave those out, or every offload would make local
+    # prefill look quicker and the trigger fire less. Rows of the conversation
+    # within two minutes of a cloud call are skipped (losing a local sample or
+    # two is harmless).
+    skip = ("AND NOT EXISTS (SELECT 1 FROM cloud_usage c WHERE c.conversation_id = "
+            "m.conversation_id AND ABS(julianday(c.created_at) - julianday(m.timestamp)) "
+            "< 2.0 / 1440)")
     try:
-        rows = db.execute(
-            "SELECT prompt_tokens, ttft_ms FROM metrics WHERE prompt_tokens >= ? "
-            "AND ttft_ms > 0 ORDER BY id DESC LIMIT 40", (_CLOUD_TPS_MIN_PROMPT,)).fetchall()
+        try:
+            rows = db.execute(base.format(skip=skip), (_CLOUD_TPS_MIN_PROMPT,)).fetchall()
+        except Exception:  # noqa: BLE001 - no cloud_usage table yet
+            rows = db.execute(base.format(skip=""), (_CLOUD_TPS_MIN_PROMPT,)).fetchall()
         rates = sorted(float(r["prompt_tokens"]) / (float(r["ttft_ms"]) / 1000.0)
                        for r in rows)
         if rates:
@@ -983,9 +1002,14 @@ CONSENT = CloudConsentBroker()
 
 
 def resolve_consent(consent_id: str, user_id: str | None, decision: str,
-                    scope: str = "once") -> bool:
-    """The consent route's resolver (streams.chat_turn_consent looks it up)."""
-    return CONSENT.resolve(consent_id, user_id, decision, scope)
+                    scope: str = "once", turn_id: str | None = None) -> bool:
+    """The consent route's resolver (streams.chat_turn_consent looks it up).
+
+    `turn_id` is the turn named in the URL: a consent id of another turn of the
+    same user is not answered through this one's URL (the approval route makes
+    the same check).
+    """
+    return CONSENT.resolve(consent_id, user_id, decision, scope, turn_id=turn_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -1081,6 +1105,10 @@ class CloudOffload:
                                 "message": f"The cloud model is unavailable ({self.error}); "
                                            "continuing on the local model."})
         finally:
+            # A consumer that leaves after output (the agent stops at a
+            # completed tool call) was still served by the cloud.
+            if produced:
+                self.served = True
             self._account(safe, dropped, started, first_at, usage, finish, out_chars,
                           outcome, stats)
 
@@ -1204,6 +1232,23 @@ async def cloud_offload(config: Any, messages: list[dict], max_tokens: int | Non
         return None
 
 
+async def cloud_preflight(config: Any, messages: list[dict], max_tokens: int | None = None,
+                          kind: str = "agent", conversation_id: str | None = None) -> bool:
+    """Settle the cloud question BEFORE a caller reshapes an oversized prompt.
+
+    The agent splits an input too large for one local prefill into parts
+    (CHUNK_LARGE_PROMPTS) before its first model call, so no single request
+    would look oversized to cloud_offload and the user would never be offered
+    the cloud for the very prompts it exists for. A caller about to split asks
+    here first. True: this turn goes to the cloud (the user said yes, or a
+    standing grant covers it), so keep the prompt whole; the model call that
+    follows finds the answer remembered on the turn and does not ask again.
+    False (off, not allowed, capped, unattended, declined): split as today.
+    Never raises, and costs one attribute read when the feature is off.
+    """
+    return await cloud_offload(config, messages, max_tokens, kind, conversation_id) is not None
+
+
 async def _cloud_route(config: Any, messages: list[dict], max_tokens: int | None,
                        kind: str, conversation_id: str | None) -> CloudOffload | None:
     db = _CLOUD_BOUND["db"]
@@ -1266,10 +1311,11 @@ async def _cloud_consent_for(config: Any, settings: dict, trigger: CloudTrigger,
     per_user = str(getattr(config, "cloud_consent", "per_request")) == "per_user"
     interactive = bool(turn is not None and turn.interactive and turn.emit is not None)
     if per_user:
-        standing = standing_cloud_consent(db, user_id, conv)
         # Unattended runs honour only "always": nobody is there to notice a
         # conversation grant being used from a scheduled task.
-        if standing == "always" or (standing == "conversation" and interactive):
+        standing = standing_cloud_consent(
+            db, user_id, conv, ("conversation", "always") if interactive else ("always",))
+        if standing is not None:
             _cloud_remember(turn, "allow", standing, settings)
             if turn is not None:
                 turn.send({"type": "notice", "info": True,
@@ -1395,6 +1441,7 @@ __all__ = [
     'resolve_consent',
     'CloudOffload',
     'cloud_offload',
+    'cloud_preflight',
     'register_cloud',
     '_CLOUD_BOUND',
     '_CLOUD_HOOKS',

@@ -19,6 +19,9 @@ from .llm import *  # noqa: F401,F403
 from .toolparse import *  # noqa: F401,F403
 from .nodesec import *  # noqa: F401,F403
 from .backends import *  # noqa: F401,F403
+# Optional cloud fallback for oversized prefill: cloud_offload is None (one
+# attribute read) unless CLOUD_FALLBACK_ENABLED and the user consented.
+from .cloud import *  # noqa: F401,F403
 
 
 class ModelClient:
@@ -405,6 +408,16 @@ class ModelClient:
     ) -> tuple[str, GenerationStats]:
         import httpx
         import uuid as _uuid
+        # Cloud fallback (cloud.py): a consented oversized prompt is answered
+        # there; None, or a cloud failure before any output, runs the local path.
+        offload = await cloud_offload(self.config, messages, max_tokens, kind,
+                                      conversation_id, extra)
+        if offload is not None:
+            cloud_stats = GenerationStats()
+            cloud_text = await offload.complete(messages, max_tokens, temperature,
+                                                cloud_stats, extra)
+            if cloud_text is not None:
+                return cloud_text, cloud_stats
         targets = self._targets(kind)
         task_id = _uuid.uuid4().hex[:16]
         cid = get_correlation_id()
@@ -619,6 +632,19 @@ class ModelClient:
         bracketing and stats, yielding raw typed events (see stream_events)."""
         import httpx
         import uuid as _uuid
+        # Cloud fallback (cloud.py): the same typed events from a consented
+        # cloud model; a failure before the first output falls through to local.
+        offload = await cloud_offload(self.config, messages, max_tokens, kind,
+                                      conversation_id, extra)
+        if offload is not None:
+            cloud_events = offload.events(messages, max_tokens, temperature, stats, extra)
+            try:
+                async for cloud_event in cloud_events:
+                    yield cloud_event
+            finally:
+                await cloud_events.aclose()
+            if offload.served:
+                return
         targets = self._targets(kind)
         task_id = _uuid.uuid4().hex[:16]
         cid = get_correlation_id()

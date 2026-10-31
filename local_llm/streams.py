@@ -605,7 +605,8 @@ def register_streams(app: Any, ctx: Any) -> None:
         if not callable(resolver):
             return JSONResponse({"error": "consent not available"}, status_code=404)
         try:
-            ok = resolver(consent_id, user["id"], decision, scope)
+            # The turn id binds the answer to THIS turn, like the approval route.
+            ok = resolver(consent_id, user["id"], decision, scope, turn_id=turn.turn_id)
         except Exception as exc:  # noqa: BLE001
             return JSONResponse({"error": redact_text(str(exc))}, status_code=400)
         if not ok:

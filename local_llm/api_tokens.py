@@ -114,6 +114,9 @@ _TOK_ROUTES: tuple = tuple(
         ("status", ("GET",), r"/api/runs/.*"),
         ("status", ("GET",), r"/api/approvals/pending"),
         ("status", ("GET",), r"/api/auth/me"),
+        # The menu-bar companion's one-call summary (companion.py), which
+        # also checks the status scope itself.
+        ("status", ("GET",), r"/api/status/summary"),
         # control: the few levers a menu-bar app pulls (the routes themselves
         # are ADMIN routes, so the role check still applies on top).
         ("control", ("POST",), r"/api/model/restart"),
@@ -161,6 +164,23 @@ def _tok_schema(conn: Any) -> None:
 
 
 register_schema("api_tokens", _tok_schema)
+
+
+def _tok_delete_user(db: Any, user_id: str) -> None:
+    """Database.delete_user hook: drop the account's tokens outright.
+
+    Revoking would keep rows that point at a user who no longer exists; the
+    tokens can never authenticate again, so nothing is lost by deleting them.
+    """
+    db.ensure_schema("api_tokens")
+    cur = db.execute("DELETE FROM api_tokens WHERE user_id = ?", (str(user_id),))
+    db.commit()
+    if cur.rowcount:
+        log_event(_tok_log, logging.INFO, "auth.tokens_deleted", user_id=str(user_id),
+                  count=cur.rowcount, reason="user deleted")
+
+
+register_user_cleanup("api_tokens", _tok_delete_user)
 
 
 # --------------------------------------------------------------------------- #
@@ -660,6 +680,7 @@ __all__ = [
     "API_TOKEN_SCOPES",
     "DEFAULT_API_TOKEN_SCOPES",
     "_TokThrottle",
+    "_tok_delete_user",
     "_tok_hash",
     "_tok_login_limit",
     "_tok_safe_user",

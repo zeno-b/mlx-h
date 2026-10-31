@@ -34,7 +34,6 @@ UI_JS_ADMIN = r"""   // ------------------------------------------------------- 
      { key: "performance", load: function() { return loadPerf(); },
        poll: [function() { return loadPerf(); }, 10000] },
      { key: "memory", load: function() { return loadMemory(); } },
-     { key: "tools", load: function() { return loadToolsTab(); } },
      { key: "admin/users", load: function() { return loadUsers(); } },
      { key: "admin/agents", load: function() { return loadAgents(); } },
      { key: "admin/cluster", load: function() { return loadCluster(); },
@@ -251,11 +250,6 @@ UI_JS_ADMIN = r"""   // ------------------------------------------------------- 
    }
 
    // ------------------------------------------------------------ tools ---
-
-   function loadToolsTab() {
-     loadToolsCatalogue();
-     if (document.body.getAttribute("data-role") === "admin") loadMcpStatus();
-   }
 
    async function loadToolsCatalogue() {
      var host = document.getElementById("toolsList");

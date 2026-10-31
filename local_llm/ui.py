@@ -20,6 +20,11 @@ from .ui_script_auth import UI_JS_AUTH
 from .ui_script_kit import UI_JS_KIT
 from .ui_script_admin import UI_JS_ADMIN
 from .ui_script_settings import UI_JS_SETTINGS
+from .ui_script_charts import UI_JS_CHARTS
+from .ui_script_ops import UI_JS_OPS
+from .ui_script_integrations import UI_JS_INTEGRATIONS
+from .ui_script_dashboards import UI_JS_DASHBOARDS
+from .ui_script_evals import UI_JS_EVALS
 from .ui_settings import UI_SETTINGS_HTML
 
 
@@ -203,6 +208,17 @@ HTML_PAGE = (
     + "\n" + UI_JS_TASKS
     + "\n" + UI_JS_MODELS
     + "\n" + UI_JS_ADMIN
+    # uiChart (one chart primitive), then the ops panels: their top-level
+    # opsTabHook() edits ADMIN_TABS, so they must follow ui_script_admin.
+    + "\n" + UI_JS_CHARTS
+    + "\n" + UI_JS_OPS
+    # The integrations panels register their loaders in ADMIN_TABS at top
+    # level too (Tools sub-tabs, Admin > Audit, Agent > Projects).
+    + "\n" + UI_JS_INTEGRATIONS
+    # Admin > Dashboards: registers its ADMIN_TABS entry at top level as well.
+    + "\n" + UI_JS_DASHBOARDS
+    # Admin > Evals: registers its ADMIN_TABS entry at top level too.
+    + "\n" + UI_JS_EVALS
     + "\n" + UI_JS_SETTINGS
     + "\n" + UI_JS_AUTH
     + "\n" + UI_JS_PANELS

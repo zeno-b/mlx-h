@@ -35,6 +35,20 @@ def register_schema(name: str, fn) -> None:
     SCHEMA_EXTENSIONS[name] = fn
 
 
+# Feature modules that keep per-user rows or files outside the core tables
+# (preferences, attachments, API tokens) register a cleanup here, the same way
+# they register a schema, so Database.delete_user removes everything the
+# account owned without database.py importing them. fn(db, user_id) must be
+# idempotent. Audit tables (tool_decisions) deliberately register nothing:
+# what a deleted account's tools did stays on the record.
+USER_CLEANUP_HOOKS: dict = {}
+
+
+def register_user_cleanup(name: str, fn) -> None:
+    """Register (or replace) a per-user cleanup run by Database.delete_user."""
+    USER_CLEANUP_HOOKS[name] = fn
+
+
 class Database:
     """Thread-safe SQLite manager with one connection per thread."""
 
@@ -889,6 +903,117 @@ class Database:
         return {"enabled": True, "documents": len(items),
                 "chunks": sum(int(i["chunks"] or 0) for i in items), "items": items[:50],
                 "search_mode": getattr(self, "search_mode", "fts5")}
+
+    def document_overview(self, user_id: str | None = None, folder: str = "",
+                          limit: int = 40, offset: int = 0,
+                          head_chars: int = 800) -> dict:
+        """Read-only inventory behind the kb_overview tool.
+
+        document_stats() answers "is anything indexed" (50 newest rows, no
+        character total); "what is in my knowledge base" needs every row the
+        user may see (own plus shared, newest first) to count and group, the
+        rows under `folder` paged by limit/offset, and, for that page only, the
+        start of each document's first passage, which is where a markdown
+        heading or SKILL.md frontmatter sits. Nothing here writes.
+
+        `folder` is a path prefix. A small model often names only the last
+        part ("skills" for imports/repo/skills), so when nothing starts with it
+        exactly the match is retried case-insensitively and then as the most
+        common full prefix ending in that folder; `folder` in the result is the
+        prefix actually used.
+        """
+        out: dict[str, Any] = {"enabled": False, "rows": [], "folder": "", "scoped": [],
+                               "page": [], "search_mode": getattr(self, "search_mode", "fts5")}
+        if not getattr(self, "fts_enabled", False):
+            return out
+        where, params = "", []
+        if user_id is not None:
+            where = "WHERE user_id IN (?, ?)"
+            params = [user_id, SHARED_OWNER]
+        rows = [dict(r) for r in self.execute(
+            f"SELECT path, title, chars, chunks, indexed_at FROM documents {where} "
+            "ORDER BY indexed_at DESC, id DESC", tuple(params)).fetchall()]
+        prefix = str(folder or "").replace("\\", "/").strip().strip("/")
+        scoped = rows
+        if prefix:
+            scoped, prefix = self._overview_scope(rows, prefix)
+        try:
+            limit = max(1, min(200, int(limit)))
+        except (TypeError, ValueError):
+            limit = 40
+        try:
+            offset = max(0, int(offset))
+        except (TypeError, ValueError):
+            offset = 0
+        page = [dict(r) for r in scoped[offset:offset + limit]]
+        heads = self._document_heads([str(r["path"]) for r in page], user_id,
+                                     max(80, int(head_chars or 800))) if page else {}
+        for r in page:
+            r["head"] = heads.get(str(r["path"]), "")
+        out.update(enabled=True, rows=rows, folder=prefix, scoped=scoped, page=page)
+        return out
+
+    @staticmethod
+    def _overview_scope(rows: list[dict], prefix: str) -> tuple[list[dict], str]:
+        """(rows under `prefix`, the prefix used); see document_overview."""
+        def under(path: str, pre: str) -> bool:
+            return path == pre or path.startswith(pre + "/")
+
+        exact = [r for r in rows if under(str(r["path"]), prefix)]
+        if exact:
+            return exact, prefix
+        low = prefix.lower()
+        folded = [r for r in rows if under(str(r["path"]).lower(), low)]
+        if folded:
+            return folded, str(folded[0]["path"])[:len(prefix)]
+        counts: dict[str, int] = {}
+        for r in rows:
+            path = str(r["path"])
+            at = path.lower().find("/" + low + "/")
+            if at >= 0:
+                key = path[:at + 1 + len(prefix)]
+                counts[key] = counts.get(key, 0) + 1
+        if not counts:
+            return [], prefix
+        best = max(counts.items(), key=lambda kv: (kv[1], -len(kv[0])))[0]
+        return [r for r in rows if under(str(r["path"]), best)], best
+
+    def _document_heads(self, paths: list[str], user_id: str | None,
+                        head_chars: int) -> dict[str, str]:
+        """The first passage of each path (truncated), owner-scoped.
+
+        On FTS5 a plain `path IN (...)` is a scan of every chunk's content, so
+        the paths are first narrowed through the index with one column phrase
+        per path (path:"tok tok ...") and only then compared exactly. The plain
+        fallback table has an index on path and needs no help."""
+        if not paths:
+            return {}
+        table = self._chunk_table()
+        marks = ",".join("?" for _ in paths)
+        sql = f"SELECT path, chunk, MIN(rowid) AS first FROM {table} WHERE "
+        params: list[Any] = []
+        if table == "doc_chunks":
+            phrases = []
+            for path in paths:
+                tokens = re.findall(r"[^\W_]+", path)
+                if tokens:
+                    phrases.append('path:"' + " ".join(tokens) + '"')
+            if not phrases:
+                return {}
+            sql += "doc_chunks MATCH ? AND "
+            params.append(" OR ".join(phrases))
+        sql += f"path IN ({marks})"
+        params.extend(paths)
+        if user_id is not None:
+            sql += " AND user_id IN (?, ?)"
+            params.extend([user_id, SHARED_OWNER])
+        sql += " GROUP BY path"
+        try:
+            got = self.execute(sql, tuple(params)).fetchall()
+        except sqlite3.OperationalError as exc:
+            log(f"kb_overview: first passages unavailable ({exc}).", logging.DEBUG)
+            return {}
+        return {str(r["path"]): str(r["chunk"] or "")[:head_chars] for r in got}
 
     def clear_documents(self) -> int:
         if not getattr(self, "fts_enabled", False):
@@ -1903,7 +2028,17 @@ class Database:
         cur = self.execute("DELETE FROM users WHERE id = ?", (user_id,))
         self.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
         self.commit()
-        return cur.rowcount > 0
+        deleted = cur.rowcount > 0
+        if deleted:
+            # Each feature's own rows and files; one failing must not stop the
+            # rest, and the account itself is already gone either way.
+            for name, fn in list(USER_CLEANUP_HOOKS.items()):
+                try:
+                    fn(self, user_id)
+                except Exception as exc:  # noqa: BLE001
+                    log(f"Deleting user {user_id}: {name} cleanup failed "
+                        f"({redact_text(str(exc))}).", logging.WARNING)
+        return deleted
 
     # ------------------------------------------------------------ agents --
 
@@ -2095,5 +2230,7 @@ class Database:
 __all__ = [
     'Database',
     'SCHEMA_EXTENSIONS',
+    'USER_CLEANUP_HOOKS',
     'register_schema',
+    'register_user_cleanup',
 ]

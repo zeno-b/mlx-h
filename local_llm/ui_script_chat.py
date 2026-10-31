@@ -10,6 +10,19 @@ renderMarkdown, stopStream). Settings load/save moved to ui_script_settings.py;
 what stays here is the chat surface itself: the composer (mode switch, Enter
 handling, context meter), the per-user display preferences it honours, the
 overflow menu, the glass-box trace and the health pill.
+
+The stream is one run object per turn (chatRun) read by readSSE, a parser
+that follows the SSE grammar (CRLF, multi-line data, id: lines, keepalive
+comments). Every request sends X-Stream-Ids: 1, so frames are numbered and a
+turn survives a dropped connection: chatFollow re-attaches from the last
+sequence number, and boot re-attaches to a turn still running for the open
+conversation (GET /api/chat/active, then /api/chat/turns/{id}/events?after=N).
+Stop cancels the turn on the server before it aborts the connection. The
+trace renders tool calls as they stream (keyed by call id), inline decision
+cards for tool approvals and cloud consent, queue position, injected project
+context and live speed figures. The composer carries the project and agent
+pickers, attachments (paperclip, drop, paste) and dictation; the header
+carries the notifications bell.
 """
 
 from __future__ import annotations
@@ -88,8 +101,27 @@ UI_JS_CHAT = r"""
      input.style.height = Math.min(200, input.scrollHeight) + "px";
    });
 
-   function stopStream() {
+   // Let go of the turn this tab is streaming, now. New chat, opening another
+   // conversation and deleting this one call it before clearing the page, so
+   // the late frames of the old turn must not land in the new one: the run
+   // is marked detached (its frames are ignored) and the controls are reset
+   // here rather than when the aborted fetch gets round to failing. The turn
+   // is also cancelled on the server, because a stream opened with
+   // X-Stream-Ids only detaches on abort and would keep generating; with
+   // {detach: true} it is left running (reopening the same conversation
+   // re-attaches to it). The Stop button goes through chatStop() instead.
+   function stopStream(opts) {
+     var run = chatRun;
+     if (run) {
+       run.detached = true;
+       if (!(opts && opts.detach) && !run.ended) chatCancelTurn(run);
+       chatRun = null;
+     }
      if (controller) controller.abort();
+     controller = null;
+     busy = false;
+     sendBtn.disabled = false;
+     stopBtn.disabled = true;
    }
 
    // ------------------------------------------------------- composer ---
@@ -156,6 +188,10 @@ UI_JS_CHAT = r"""
        // the current values. The chat must never depend on this request.
        applyChatPrefs(null);
      }
+     // The rest of the per-user composer state rides on the same boot call:
+     // the project and agent pickers, the paperclip and mic, the bell.
+     chatLoadComposerOptions();
+     chatPollNotifications(true);
    }
 
    // Scrolling used to be one forced layout per token. `chat.scrollTop =
@@ -661,7 +697,7 @@ UI_JS_CHAT = r"""
      if (t.activity && t.turn.lastChild !== t.activity) t.turn.appendChild(t.activity);
    }
 
-   function traceRouter(t, name, args) {
+   function traceRouter(t, name, args, before) {
      var node = document.createElement("div");
      node.className = "gnode router";
      var head = document.createElement("div");
@@ -669,7 +705,10 @@ UI_JS_CHAT = r"""
      var loc = args && (args.location || args.query);
      head.textContent = "router → " + name + (loc ? " (" + String(loc).slice(0, 60) + ")" : "");
      node.appendChild(head);
-     t.trace.appendChild(node);
+     // Above the tool card it routed to: with streamed tool calls the card
+     // exists before the call is final.
+     if (before && before.parentNode === t.trace) t.trace.insertBefore(node, before);
+     else t.trace.appendChild(node);
      scrollDown();
    }
 
@@ -702,7 +741,7 @@ UI_JS_CHAT = r"""
      head.onclick = function() { node.classList.toggle("open"); };
      t.trace.appendChild(node);
      scrollDown();
-     return { node: node, pill: pill, body: body };
+     return { node: node, pill: pill, body: body, label: label, argsEl: argsEl };
    }
 
    function traceThinking(t) {
@@ -964,41 +1003,295 @@ UI_JS_CHAT = r"""
      }
    }
 
-   async function send() {
-     if (busy) return;
-     var message = input.value.trim();
-     if (!message) return;
+   // ------------------------------------------------------- streaming ---
 
-     input.value = "";
-     input.style.height = "auto";
+   // The turn this tab is streaming (null when idle). One object per turn
+   // instead of closure variables inside send(), because the same turn can
+   // now be picked up again by a later request: after a dropped connection,
+   // or after a reload, from GET /api/chat/turns/{id}/events?after=N.
+   var chatRun = null;
+
+   // Read a text/event-stream body and call onFrame({id, data}) per event.
+   // The old reader split on a blank line and kept only lines starting with
+   // "data: ", which is right for exactly one server: a proxy that rewrites
+   // line ends to CRLF, a frame split over several data: lines, or the id:
+   // line X-Stream-Ids puts in front of every frame all lost events without
+   // a trace. This follows the SSE grammar: CR, LF or CRLF end a line, a
+   // leading ":" is a comment (the server's keepalive), data lines join with
+   // a newline, and a blank line dispatches the event.
+   async function readSSE(res, onFrame) {
+     var reader = res.body.getReader();
+     var decoder = new TextDecoder();
+     var buf = "";
+     var data = [];
+     var hasData = false;
+     var id = null;
+     function chatSseLine(text) {
+       if (text === "") {
+         if (hasData) onFrame({ id: id, data: data.join("\n") });
+         data = []; hasData = false; id = null;
+         return;
+       }
+       if (text.charAt(0) === ":") return;
+       var colon = text.indexOf(":");
+       var field = colon < 0 ? text : text.slice(0, colon);
+       var value = colon < 0 ? "" : text.slice(colon + 1);
+       if (value.charAt(0) === " ") value = value.slice(1);
+       if (field === "data") { data.push(value); hasData = true; }
+       else if (field === "id" && value.indexOf("\u0000") < 0) id = value;
+     }
+     function chatSseDrain(atEnd) {
+       while (buf) {
+         var cut = buf.search(/[\r\n]/);
+         if (cut < 0) return;
+         // A CR as the very last character may be the first half of a CRLF
+         // whose LF is still in flight: wait for the next chunk.
+         if (buf.charAt(cut) === "\r" && cut === buf.length - 1 && !atEnd) return;
+         var width = (buf.charAt(cut) === "\r" && buf.charAt(cut + 1) === "\n") ? 2 : 1;
+         chatSseLine(buf.slice(0, cut));
+         buf = buf.slice(cut + width);
+       }
+     }
+     while (true) {
+       var chunk = await reader.read();
+       if (chunk.done) break;
+       buf += decoder.decode(chunk.value, { stream: true });
+       chatSseDrain(false);
+     }
+     buf += decoder.decode();
+     chatSseDrain(true);
+     // An event without its closing blank line is incomplete by the spec (and
+     // the old reader dropped it too): nothing more to dispatch.
+   }
+
+   function chatAbortError() {
+     var err = new Error("aborted");
+     err.name = "AbortError";
+     return err;
+   }
+
+   function chatSleep(ms, signal) {
+     return new Promise(function(resolve, reject) {
+       if (signal && signal.aborted) { reject(chatAbortError()); return; }
+       var timer = setTimeout(resolve, ms);
+       if (signal) signal.addEventListener("abort", function() {
+         clearTimeout(timer);
+         reject(chatAbortError());
+       });
+     });
+   }
+
+   function chatBeginRun(message, opts) {
+     opts = opts || {};
      busy = true;
      sendBtn.disabled = true;
      stopBtn.disabled = false;
      controller = new AbortController();
-     clearRegenerate();
-     addMessage("user", message);
-     updateContextMeter(estimateTokens(message));
-
-     var trace = startTrace();
+     var run = {
+       trace: startTrace(), message: message || "", conversationId: conversationId,
+       turnId: opts.turnId || null, projectId: opts.projectId || "", lastSeq: 0,
+       controller: controller, answered: false, ended: false, done: false, gone: false,
+       firstTool: true, tools: {}, lastTool: null, sawThinking: false,
+       firstUsage: null, usage: null, stopping: false, detached: false,
+       cancelSent: false, cancelAccepted: false, resumed: !!opts.resumed, reattached: false, events: 0
+     };
+     chatRun = run;
      // Re-arm the follow: having scrolled up to read the last turn must not
      // leave the next one streaming off-screen.
      scrollDown(true);
-     var answered = false;
-     var firstTool = true;
+     return run;
+   }
+
+   function chatEndRun(run) {
+     // A run stopStream() already let go of must not reset the controls a
+     // newer run now owns.
+     if (chatRun !== run) return;
+     chatRun = null;
+     busy = false;
+     controller = null;
+     sendBtn.disabled = false;
+     stopBtn.disabled = true;
+   }
+
+   // One SSE response into the run. With X-Stream-Ids every frame carries its
+   // sequence number, so a frame at or below the last one rendered is the
+   // overlap of a resume and is skipped: nothing renders twice.
+   async function chatPump(run, res) {
+     await readSSE(res, function(frame) {
+       if (run.detached) return;
+       if (frame.data === "[DONE]") { run.done = true; return; }
+       if (frame.id !== null && frame.id !== "") {
+         var seq = parseInt(frame.id, 10);
+         if (!isNaN(seq)) {
+           if (seq <= run.lastSeq) return;
+           run.lastSeq = seq;
+         }
+       }
+       var event;
+       try { event = JSON.parse(frame.data); } catch (err) { return; }
+       if (!event || typeof event !== "object") return;
+       run.events += 1;
+       handleEvent(run, event);
+     });
+   }
+
+   // The turn a conversation is running on the server, for a run that lost
+   // its connection before the start event named it (or for a Stop pressed
+   // while the turn was still queued).
+   async function chatFindTurn(run) {
+     try {
+       var out = await fetchJSON("/api/chat/active?conversation_id=" + encodeURIComponent(run.conversationId));
+       var snap = out.data && out.data.turn;
+       if (snap && snap.turn_id) run.turnId = snap.turn_id;
+     } catch (err) { /* an older server, or offline: nothing to find */ }
+     return run.turnId;
+   }
+
+   // Re-attach to a running turn from the event after the last one rendered.
+   // null (and run.gone) when the turn no longer exists: it finished long
+   // enough ago to be pruned, or the server restarted.
+   async function chatOpenEvents(run) {
+     var res = await fetch("/api/chat/turns/" + encodeURIComponent(run.turnId)
+                           + "/events?after=" + run.lastSeq,
+                           { headers: { "X-Stream-Ids": "1" }, signal: run.controller.signal });
+     if (res.status === 401 && typeof onUnauthorized === "function") {
+       onUnauthorized(); run.gone = true; return null;
+     }
+     if (res.status === 404) { run.gone = true; return null; }
+     if (!res.ok || !res.body) return null;
+     run.reattached = true;
+     return res;
+   }
+
+   // Follow a turn to its end. A connection that drops before the turn ended
+   // (no final, cancelled or error, no [DONE]) is picked up again from the
+   // last sequence number instead of being reported as a failure: the server
+   // keeps a turn streamed with X-Stream-Ids running for a grace period so a
+   // flaky network or a laptop lid does not cost the answer.
+   async function chatFollow(run, res) {
+     var attempts = 0;
+     var lastErr = null;
+     while (true) {
+       if (res) {
+         var seen = run.events;
+         try {
+           await chatPump(run, res);
+         } catch (err) {
+           if (err && err.name === "AbortError") throw err;
+           lastErr = err;
+         }
+         if (run.events > seen) attempts = 0;
+       }
+       if (run.ended || run.done || run.detached) return;
+       if (run.gone || attempts >= 6) {
+         if (lastErr) throw lastErr;
+         return;
+       }
+       attempts += 1;
+       setActivity(run.trace, "connection lost, reconnecting (try " + attempts + ")…");
+       await chatSleep(Math.min(8000, 500 * Math.pow(2, attempts - 1)), run.controller.signal);
+       res = null;
+       try {
+         if (!run.turnId && !(await chatFindTurn(run))) { run.gone = true; continue; }
+         res = await chatOpenEvents(run);
+       } catch (err) {
+         if (err && err.name === "AbortError") throw err;
+         lastErr = err;
+       }
+     }
+   }
+
+   // The stream ended without an error: settle what is on screen.
+   function chatSettleRun(run) {
+     chatDropStartedTools(run);
+     if (run.resumed && !run.events && !run.answered) {
+       // Re-attached to a turn that finished in between: its answer is in
+       // the conversation already, so an empty trace would only add noise.
+       stopActivity(run.trace);
+       if (run.trace.turn.parentNode) run.trace.turn.parentNode.removeChild(run.trace.turn);
+       return;
+     }
+     if (!run.answered) {
+       var a = traceAnswer(run.trace);
+       a.node.classList.remove("pending");
+       if (!a.text.textContent) {
+         a.text.textContent = run.gone
+           ? "The connection dropped and this turn is no longer running. Reopen the conversation from History to see what was stored."
+           : "(no response)";
+       }
+     }
+     stopActivity(run.trace);
+   }
+
+   function chatFailRun(run, err) {
+     chatDropStartedTools(run);
+     if (err && err.name === "AbortError") {
+       // Stop pressed. Settle whatever streamed; if nothing did, leave no
+       // bubble at all. traceAnswer used to be called unconditionally here,
+       // so stopping before the first token CREATED an answer node and then
+       // left it empty: a bordered, padded box with nothing in it, which
+       // reads as something having gone wrong. A turn whose own `cancelled`
+       // event already arrived has said "stopped" once.
+       if (!run.ended) {
+         settleAnswer(run.trace, false);
+         traceNotice(run.trace, "stopped", false);
+       }
+     } else {
+       var a2 = traceAnswer(run.trace);
+       a2.node.classList.remove("pending");
+       // A broken stream on a local single-box setup almost always means the
+       // model server ran out of memory and dropped the connection. Say that
+       // plainly instead of showing a raw stream error.
+       if (!a2.text.textContent) {
+         a2.text.textContent = "The connection dropped, most likely the local "
+           + "model server ran low on memory. Try a shorter request, or lower "
+           + "AUTO_FETCH_RESULTS / the context size.";
+       }
+       a2.node.classList.add("failed");
+     }
+     stopActivity(run.trace);
+   }
+
+   async function send() {
+     if (busy) return;
+     var message = input.value.trim();
+     if (chatAttBusy()) { uiToast("Wait for the attachment upload to finish.", "warn"); return; }
+     var atts = chatAttReady();
+     if (!message) {
+       if (atts.length) uiToast("Add a message to send with the attachment.", "warn");
+       return;
+     }
+
+     input.value = "";
+     input.style.height = "auto";
+     clearRegenerate();
+     var userDiv = addMessage("user", message);
+     if (atts.length) chatRenderMsgAtts(userDiv, atts);
+     chatAttClear(false);
+     updateContextMeter(estimateTokens(message));
+
+     var projectId = chatSelectValue("projectSel");
+     var agentId = chatSelectValue("agentSel");
+     var run = chatBeginRun(message, { projectId: projectId });
+     // max_tokens and temperature are deliberately absent: the server fills
+     // them from this user's preferences, so the web UI, the CLI and API
+     // clients all get the same per-user defaults. The optional fields go
+     // out only when chosen, so a turn without a project, an agent profile
+     // or attachments is exactly the request it always was.
+     var body = { message: message, conversation_id: conversationId, agent: modeAgentFlag() };
+     if (projectId) body.project_id = projectId;
+     if (agentId) body.agent_id = agentId;
+     if (atts.length) body.attachments = atts.map(function(a) { return a.id; });
 
      try {
        var res = await fetch("/api/chat/stream", {
          method: "POST",
-         headers: { "Content-Type": "application/json" },
-         signal: controller.signal,
-         // max_tokens and temperature are deliberately absent: the server
-         // fills them from this user's preferences, so the web UI, the CLI
-         // and API clients all get the same per-user defaults.
-         body: JSON.stringify({
-           message: message,
-           conversation_id: conversationId,
-           agent: modeAgentFlag()
-         })
+         // X-Stream-Ids: 1 numbers every frame and keeps the turn running
+         // through a dropped connection, which is what makes Stop (an
+         // explicit cancel) and resume (events?after=N) possible.
+         headers: { "Content-Type": "application/json", "X-Stream-Ids": "1" },
+         signal: run.controller.signal,
+         body: JSON.stringify(body)
        });
 
        if (!res.ok || !res.body) {
@@ -1006,337 +1299,1010 @@ UI_JS_CHAT = r"""
          // Session ended mid-chat (this is a raw fetch, not fetchJSON): return
          // to the login screen instead of showing a cryptic error.
          if (res.status === 401 && typeof onUnauthorized === "function") {
-           onUnauthorized(); stopActivity(trace); return;
+           onUnauthorized(); stopActivity(run.trace); return;
          }
          // Show the clean message, not the raw {"error": ...} JSON envelope.
          var msg = text;
          try { msg = httpErrorText(JSON.parse(text), res.status); } catch (e) { msg = text || ("HTTP " + res.status); }
-         var a0 = traceAnswer(trace);
+         var a0 = traceAnswer(run.trace);
          a0.text.textContent = "Error: " + String(msg).slice(0, 400);
          a0.node.classList.remove("pending");
          a0.node.classList.add("failed");
-         stopActivity(trace);
+         stopActivity(run.trace);
          return;
        }
 
-       var reader = res.body.getReader();
-       var decoder = new TextDecoder();
-       var buffer = "";
-
-       while (true) {
-         var chunk = await reader.read();
-         if (chunk.done) break;
-         buffer += decoder.decode(chunk.value, { stream: true });
-         var parts = buffer.split("\n\n");
-         buffer = parts.pop();
-
-         for (var i = 0; i < parts.length; i++) {
-           var line = parts[i].trim();
-           if (line.indexOf("data: ") !== 0) continue;
-           var payload = line.slice(6);
-           if (payload === "[DONE]") continue;
-           var event;
-           try {
-             event = JSON.parse(payload);
-           } catch (err) {
-             continue;
-           }
-           handleEvent(event);
-         }
-       }
-
-       function handleEvent(event) {
-         if (event.type === "start") {
-           conversationId = event.conversation_id || conversationId;
-           safeStorageSet("llm_conversation", conversationId);
-         } else if (event.type === "detail") {
-           traceDetail(trace, event.message || "");
-           bumpActivity(trace);
-         } else if (event.type === "phase") {
-           setActivity(trace, event.label || "working…");
-           bumpActivity(trace);
-         } else if (event.type === "reason_step") {
-           trace.reason = traceReasonStep(trace, event.step, event.total, event.label);
-           bumpActivity(trace);
-           setActivity(trace, "reasoning " + event.step + "/" + event.total + "…");
-         } else if (event.type === "reason_token") {
-           if (trace.reason) {
-             trace.reason.body.textContent += event.token;
-             // Follow the newest line inside the step's own box as well as the
-             // page: the box caps at 160px, so without this the step froze
-             // visibly after eight lines while the page went on jerking.
-             pinBottom(trace.reason.body);
-           }
-         } else if (event.type === "reason_done") {
-           if (trace.reason) {
-             // conclusion is a 200-character digest of text that has ALREADY
-             // streamed into this body. Swapping it in collapsed a full pane
-             // to two lines, mid-word and without an ellipsis, and yanked
-             // everything below it up the page -- once per step. Keep what the
-             // user watched arrive; the digest is only needed when nothing
-             // streamed, which is the non-streaming fallback in the agent.
-             if (!trace.reason.body.textContent && event.conclusion) {
-               trace.reason.body.textContent = event.conclusion;
-             }
-             trace.reason.node.classList.add("done");
-             trace.reason = null;
-           }
-         } else if (event.type === "context") {
-           // "kept 1 of 16" is the number that matters: "trimmed 15" reads as
-           // routine housekeeping right up to the point where nothing of the
-           // conversation is left in front of the model.
-           var kept = (typeof event.kept === "number") ? event.kept : null;
-           var total = (typeof event.total === "number") ? event.total : null;
-           var line = (kept !== null && total !== null)
-             ? ("context window full: kept " + kept + " of " + total + " earlier messages")
-             : ("trimmed " + event.dropped + " old messages to fit the context window");
-           traceNotice(trace, line, kept !== 0);
-           bumpActivity(trace);
-         } else if (event.type === "step") {
-           // Only label the step once the turn is genuinely multi-step. Four
-           // out of five turns end at step 1, so a permanent "step 1/6" prefix
-           // carries no information and reads like a counter that is stuck.
-           trace.stepLabel = event.step > 1
-             ? "step " + event.step + (event.max_steps ? "/" + event.max_steps : "")
-             : "";
-           setActivity(trace, "thinking…");
-           // A new step supersedes whatever streamed during the last one: a
-           // draft about to be revised, or a tool call the model printed
-           // before deciding. Remove the bubble rather than emptying it --
-           // emptying left a bordered, padded, background-filled box standing
-           // empty on the page while the next step spun up, which reads worse
-           // than no box at all, and an empty styled box is exactly what the
-           // eye reads as something going wrong.
-           if (trace.answer && trace.answer.node.classList.contains("pending")) {
-             dropAnswer(trace);
-           }
-         } else if (event.type === "think_token") {
-           // reasoning_display "hidden": no reasoning pane at all, only the
-           // activity line says the model is thinking.
-           if (chatPrefs.reasoning_display !== "hidden") {
-             traceThinking(trace).body.textContent += event.token;
-             bumpActivity(trace);
-           }
-           setActivity(trace, "thinking…");
-           scrollDown();
-         } else if (event.type === "token") {
-           // First answer token: the thinking phase is over, collapse it so the
-           // answer is the focus but the reasoning stays one click away
-           // (unless the user asked for reasoning to stay expanded).
-           if (trace.thinking && !trace.thinking.done) {
-             trace.thinking.done = true;
-             if (chatPrefs.reasoning_display !== "expanded") trace.thinking.node.classList.remove("open");
-           }
-           var ansNode = traceAnswer(trace);
-           ansNode.raw = (ansNode.raw || "") + event.token;
-           // Only write the growing raw text while markdown has not rendered yet
-           // (or a code fence is open). Once rendered, leave the formatted DOM in
-           // place and let the debounced renderMarkdown update it: writing raw
-           // text every token here is what made the answer flicker.
-           if (!ansNode.rendered) ansNode.text.textContent = ansNode.raw;
-           scheduleMarkdown(ansNode);
-           bumpActivity(trace);
-           setActivity(trace, "generating…");
-           scrollDown();
-         } else if (event.type === "tool_call") {
-           if (firstTool) { traceRouter(trace, event.name, event.args); firstTool = false; }
-           trace.tool = traceTool(trace, event.name, event.args);
-           trace.tool.node.classList.add("running");
-           bumpActivity(trace);
-           setActivity(trace, "running " + event.name + "…");
-         } else if (event.type === "tool_result") {
-           if (trace.tool) {
-             trace.tool.node.classList.remove("running");
-             trace.tool.body.textContent = event.result || "";
-             if (event.error) {
-               trace.tool.node.classList.add("failed");
-               trace.tool.pill.textContent = "failed";
-             } else {
-               trace.tool.node.classList.add("ok");
-               trace.tool.pill.textContent = "ok";
-             }
-             trace.tool = null;
-           }
-           dropAnswer(trace);
-           trace.thinking = null;
-           setActivity(trace, "thinking…");
-         } else if (event.type === "notice") {
-           traceNotice(trace, event.message || "", !!event.info);
-           bumpActivity(trace);
-           setActivity(trace, event.message || "working…");
-         } else if (event.type === "final") {
-           var ans = traceAnswer(trace);
-           if (ans.mdTimer) { clearTimeout(ans.mdTimer); ans.mdTimer = null; }
-           // Streaming re-renders on a debounce; the final pass is
-           // authoritative. But when the bubble ALREADY shows exactly the
-           // final answer -- now the common case, since the plain lane splits
-           // <think> out as it streams instead of dumping it into this bubble
-           // -- rebuilding the whole message buys nothing and costs a visible
-           // re-layout at the moment the user starts reading.
-           //
-           // The test is what the DOM last rendered, not what the raw buffer
-           // holds. Comparing raw against the final text looked equivalent and
-           // is not: the line above just cancelled a pending debounce, so when
-           // the last tokens arrived inside that 250ms window the raw buffer
-           // matches while the DOM is still a render or two behind, and
-           // skipping here would drop the tail of every answer that finished
-           // mid-debounce.
-           var finalText = event.answer || "(no answer)";
-           if (ans.lastRendered !== finalText) {
-             renderMarkdown(finalText, ans.text);
-             ans.lastRendered = finalText;
-             ans.raw = event.answer || "";
-             ans.rendered = true;
-           }
-           ans.node.classList.remove("pending");
-           answered = true;
-           updateContextMeter(estimateTokens(event.answer || ""));
-           var bits = [];
-           if (event.tools_used && event.tools_used.length) bits.push(event.tools_used.join(", "));
-           if (chatPrefs.show_metrics) {
-             bits.push((event.steps || 1) + " step" + ((event.steps || 1) === 1 ? "" : "s"));
-             // Cost of the turn, in the shape a local runner prints it:
-             // "2048 tok - 100.4s - 20 tok/s". tok is what the model generated
-             // across every step, and the rate is against wall-clock, so on an
-             // agent turn it includes the time tools took -- which is the
-             // number you actually waited, not the decode speed of one step
-             // (that is in the usage rows under Performance).
-             var secs = (event.elapsed_ms || 0) / 1000;
-             var tok = event.completion_tokens || 0;
-             if (tok) bits.push(tok + " tok");
-             bits.push(secs.toFixed(1) + "s");
-             if (tok && secs > 0) {
-               var tps = tok / secs;
-               bits.push((tps >= 10 ? Math.round(tps) : tps.toFixed(1)) + " tok/s");
-             }
-           }
-           if (event.truncated) bits.push("continued from summary");
-           stopActivity(trace);
-           if (bits.length) {
-             var meta = document.createElement("div");
-             meta.className = "gmeta";
-             meta.textContent = bits.join(" · ");
-             trace.turn.appendChild(meta);
-           }
-           if (event.documents && event.documents.length) {
-             // A generated document is the deliverable, not a diff to review, so
-             // it gets its own row of download links above the changed-files
-             // node -- which would otherwise present a .docx as an edit to
-             // inspect with git before pushing.
-             var docs = document.createElement("div");
-             docs.className = "docrow";
-             event.documents.forEach(function(rel) {
-               var name = rel.split("/").pop();
-               var a = document.createElement("a");
-               a.className = "docdl";
-               a.href = "/api/files/download?path=" + encodeURIComponent(rel);
-               a.setAttribute("download", name);
-               a.textContent = "⬇︎  " + name;
-               a.title = "Download " + rel;
-               // Fetched, not navigated: an expired session or a moved file
-               // shows a toast instead of replacing the app with an error body.
-               a.onclick = function(e) { e.preventDefault(); downloadFile(a.href, name); };
-               docs.appendChild(a);
-             });
-             trace.turn.appendChild(docs);
-           }
-           // The document files are already offered above as downloads; listing
-           // them again as "changed files (review before push)" reads as a
-           // warning about the very thing the user asked for.
-           var changed = (event.changed_files || []).filter(function(f) {
-             return (event.documents || []).indexOf(f) === -1;
-           });
-           if (changed.length) {
-             var wrap = document.createElement("div");
-             wrap.className = "gnode diff open";
-             var head = document.createElement("div");
-             head.className = "ghead";
-             var tag = document.createElement("span");
-             tag.className = "gtool";
-             tag.textContent = "changed " + changed.length + " file"
-               + (changed.length === 1 ? "" : "s") + " (review before push)";
-             var caret = document.createElement("span");
-             caret.className = "gcaret";
-             caret.textContent = "▸";
-             head.appendChild(tag); head.appendChild(caret);
-             var body = document.createElement("pre");
-             body.className = "gbody gdiff";
-             body.textContent = event.diff && event.diff.trim()
-               ? event.diff
-               : (changed.join("\n") + "\n\n(new files, not yet tracked by git)");
-             head.onclick = function() { wrap.classList.toggle("open"); };
-             wrap.appendChild(head); wrap.appendChild(body);
-             trace.turn.appendChild(wrap);
-           }
-           setRegenerateTarget(addFeedbackBar(message, event.answer || ""));
-           // Both routes are ADMIN. Every non-admin answer used to fire two
-           // requests that could only ever come back 403.
-           if (roleIsAdmin()) {
-             loadRunCurve(conversationId);
-             loadPerf();
-           }
-         } else if (event.type === "cancelled") {
-           // settleAnswer, not a bare notice. This branch and the one below
-           // it were both `event.type === "cancelled"`, so the second was
-           // unreachable and the settling it was added to do never ran: a
-           // server-side cancel (agent.py yields `cancelled` from five
-           // places, and api.py forwards every event) left the partial
-           // answer classed `pending` for good -- greyed out at 0.75 opacity
-           // with no `.failed` marking, the same permanently-unsettled
-           // bubble the error branch below was fixed for.
-           settleAnswer(trace, false);
-           traceNotice(trace, "stopped", false);
-           stopActivity(trace);
-           answered = true;
-         } else if (event.type === "error") {
-           traceNotice(trace, "error: " + event.error, false);
-           // Settle whatever streamed before the error. Marking the turn
-           // answered skips the cleanup below, so without this the partial
-           // text sat at the pending opacity for good -- a half-written answer
-           // permanently greyed out, with none of the .failed styling the
-           // AbortError path twenty lines down applies for the same situation.
-           // The two failure paths disagreed about what a dead turn looks like.
-           settleAnswer(trace, true);
-           stopActivity(trace);
-           answered = true;
-         }
-       }
-
-       if (!answered) {
-         var a = traceAnswer(trace);
-         a.node.classList.remove("pending");
-         if (!a.text.textContent) a.text.textContent = "(no response)";
-       }
-       stopActivity(trace);
+       await chatFollow(run, res);
+       chatSettleRun(run);
      } catch (err) {
-       if (err.name === "AbortError") {
-         // Stop pressed. Settle whatever streamed; if nothing did, leave no
-         // bubble at all. traceAnswer used to be called unconditionally here,
-         // so stopping before the first token CREATED an answer node and then
-         // left it empty -- a bordered, padded, background-filled box with
-         // nothing in it, which reads as something having gone wrong.
-         settleAnswer(trace, false);
-         traceNotice(trace, "stopped", false);
-       } else {
-         var a2 = traceAnswer(trace);
-         a2.node.classList.remove("pending");
-         // A broken stream on a local single-box setup almost always means the
-         // model server ran out of memory and dropped the connection. Say that
-         // plainly instead of showing a raw stream error.
-         if (!a2.text.textContent) {
-           a2.text.textContent = "The connection dropped, most likely the local "
-             + "model server ran low on memory. Try a shorter request, or lower "
-             + "AUTO_FETCH_RESULTS / the context size.";
-         }
-         a2.node.classList.add("failed");
-       }
-       stopActivity(trace);
+       chatFailRun(run, err);
      } finally {
-       busy = false;
-       controller = null;
-       sendBtn.disabled = false;
-       stopBtn.disabled = true;
+       chatEndRun(run);
        input.focus();
+     }
+   }
+
+   // After a reload (or reopening the conversation) a turn may still be
+   // running on the server. Re-attach to it from its first buffered event,
+   // so the page shows the same live trace instead of a question with no
+   // answer that silently appears in History later.
+   async function chatResumeActive(cid, lastUserText) {
+     if (busy || chatRun) return;
+     var snap = null;
+     try {
+       var out = await fetchJSON("/api/chat/active?conversation_id=" + encodeURIComponent(cid));
+       snap = out.data && out.data.turn;
+     } catch (err) { return; }
+     if (!snap || !snap.turn_id || snap.done || cid !== conversationId || busy || chatRun) return;
+     var run = chatBeginRun(lastUserText || "", { turnId: snap.turn_id, resumed: true });
+     setActivity(run.trace, "reconnecting to the running turn…");
+     try {
+       var res = await chatOpenEvents(run);
+       await chatFollow(run, res);
+       chatSettleRun(run);
+     } catch (err) {
+       chatFailRun(run, err);
+     } finally {
+       chatEndRun(run);
+     }
+   }
+
+   // POST /api/chat/turns/{turn_id}/cancel. True when the server took it.
+   async function chatCancelTurn(run) {
+     if (run.cancelSent) return run.cancelAccepted;
+     run.cancelSent = true;
+     try {
+       var tid = run.turnId || (await chatFindTurn(run));
+       if (!tid) return false;
+       var out = await postJSON("/api/chat/turns/" + encodeURIComponent(tid) + "/cancel", {});
+       run.cancelAccepted = !!(out.data && out.data.cancelled);
+     } catch (err) {
+       run.cancelAccepted = false;
+     }
+     return run.cancelAccepted;
+   }
+
+   // The Stop button. Cancel the turn on the server first, then give its
+   // `cancelled` event (which carries the partial answer the server stored)
+   // a moment to arrive; abort the connection only if it does not. Aborting
+   // first no longer stops anything: a stream opened with X-Stream-Ids only
+   // detaches, and the turn would go on generating for the grace period.
+   async function chatStop() {
+     var run = chatRun;
+     if (!run || run.ended || run.stopping) { stopStream(); return; }
+     run.stopping = true;
+     setActivity(run.trace, "stopping…");
+     var accepted = await chatCancelTurn(run);
+     if (accepted) {
+       var waited = 0;
+       while (chatRun === run && !run.ended && !run.done && waited < 2500) {
+         await chatSleep(100);
+         waited += 100;
+       }
+     }
+     if (chatRun === run && !run.ended) stopStream();
+   }
+
+   // ------------------------------------------------------ stream events ---
+
+   function handleEvent(run, event) {
+     var trace = run.trace;
+     if (event.type === "start") {
+       conversationId = event.conversation_id || conversationId;
+       run.conversationId = conversationId;
+       if (event.turn_id) run.turnId = event.turn_id;
+       safeStorageSet("llm_conversation", conversationId);
+     } else if (event.type === "queued") {
+       // Every generation slot is busy: say where this turn is in the line
+       // instead of a spinner that looks hung.
+       setActivity(trace, chatQueuedLabel(event));
+       bumpActivity(trace);
+     } else if (event.type === "detail") {
+       traceDetail(trace, event.message || "");
+       bumpActivity(trace);
+     } else if (event.type === "phase") {
+       setActivity(trace, event.label || "working…");
+       bumpActivity(trace);
+     } else if (event.type === "reason_step") {
+       trace.reason = traceReasonStep(trace, event.step, event.total, event.label);
+       bumpActivity(trace);
+       setActivity(trace, "reasoning " + event.step + "/" + event.total + "…");
+     } else if (event.type === "reason_token") {
+       if (trace.reason) {
+         trace.reason.body.textContent += event.token;
+         // Follow the newest line inside the step's own box as well as the
+         // page: the box caps at 160px, so without this the step froze
+         // visibly after eight lines while the page went on jerking.
+         pinBottom(trace.reason.body);
+       }
+     } else if (event.type === "reason_done") {
+       if (trace.reason) {
+         // conclusion is a 200-character digest of text that has ALREADY
+         // streamed into this body. Swapping it in collapsed a full pane
+         // to two lines, mid-word and without an ellipsis, and yanked
+         // everything below it up the page, once per step. Keep what the
+         // user watched arrive; the digest is only needed when nothing
+         // streamed, which is the non-streaming fallback in the agent.
+         if (!trace.reason.body.textContent && event.conclusion) {
+           trace.reason.body.textContent = event.conclusion;
+         }
+         trace.reason.node.classList.add("done");
+         trace.reason = null;
+       }
+     } else if (event.type === "context") {
+       // "kept 1 of 16" is the number that matters: "trimmed 15" reads as
+       // routine housekeeping right up to the point where nothing of the
+       // conversation is left in front of the model.
+       var kept = (typeof event.kept === "number") ? event.kept : null;
+       var total = (typeof event.total === "number") ? event.total : null;
+       var line = (kept !== null && total !== null)
+         ? ("context window full: kept " + kept + " of " + total + " earlier messages")
+         : ("trimmed " + event.dropped + " old messages to fit the context window");
+       traceNotice(trace, line, kept !== 0);
+       bumpActivity(trace);
+     } else if (event.type === "context_injected") {
+       // The project's instruction files the agent reads this turn: the
+       // model follows them, so the user gets to see that they are there.
+       traceNotice(trace, chatInjectedLabel(event), true);
+       if (event.project_id && !run.projectId) run.projectId = event.project_id;
+       bumpActivity(trace);
+     } else if (event.type === "step") {
+       // A tool card whose call never materialised (the model started
+       // printing one, then answered instead) is noise once the step is over.
+       chatDropStartedTools(run);
+       // Only label the step once the turn is genuinely multi-step. Four
+       // out of five turns end at step 1, so a permanent "step 1/6" prefix
+       // carries no information and reads like a counter that is stuck.
+       trace.stepLabel = event.step > 1
+         ? "step " + event.step + (event.max_steps ? "/" + event.max_steps : "")
+         : "";
+       setActivity(trace, "thinking…");
+       // A new step supersedes whatever streamed during the last one: a
+       // draft about to be revised, or a tool call the model printed
+       // before deciding. Remove the bubble rather than emptying it: an
+       // empty bordered, padded box standing on the page while the next
+       // step spins up is exactly what the eye reads as something wrong.
+       if (trace.answer && trace.answer.node.classList.contains("pending")) {
+         dropAnswer(trace);
+       }
+     } else if (event.type === "think_token") {
+       // reasoning_display "hidden": no reasoning pane at all, only the
+       // activity line says the model is thinking.
+       if (chatPrefs.reasoning_display !== "hidden") {
+         traceThinking(trace).body.textContent += event.token;
+         run.sawThinking = true;
+         bumpActivity(trace);
+       }
+       setActivity(trace, "thinking…");
+       scrollDown();
+     } else if (event.type === "token") {
+       // First answer token: the thinking phase is over, collapse it so the
+       // answer is the focus but the reasoning stays one click away
+       // (unless the user asked for reasoning to stay expanded).
+       if (trace.thinking && !trace.thinking.done) {
+         trace.thinking.done = true;
+         if (chatPrefs.reasoning_display !== "expanded") trace.thinking.node.classList.remove("open");
+       }
+       var ansNode = traceAnswer(trace);
+       ansNode.raw = (ansNode.raw || "") + event.token;
+       // Only write the growing raw text while markdown has not rendered yet
+       // (or a code fence is open). Once rendered, leave the formatted DOM in
+       // place and let the debounced renderMarkdown update it: writing raw
+       // text every token here is what made the answer flicker.
+       if (!ansNode.rendered) ansNode.text.textContent = ansNode.raw;
+       scheduleMarkdown(ansNode);
+       bumpActivity(trace);
+       setActivity(trace, "generating…");
+       scrollDown();
+     } else if (event.type === "tool_call_start") {
+       chatToolStart(run, event);
+       bumpActivity(trace);
+       setActivity(trace, "calling " + (event.name || "a tool") + "…");
+     } else if (event.type === "tool_call_delta") {
+       chatToolDelta(run, event);
+     } else if (event.type === "tool_call") {
+       var called = chatToolCall(run, event);
+       if (run.firstTool) { traceRouter(trace, event.name, event.args, called.node); run.firstTool = false; }
+       bumpActivity(trace);
+       setActivity(trace, "running " + event.name + "…");
+     } else if (event.type === "tool_result") {
+       chatToolResult(run, event);
+       dropAnswer(trace);
+       trace.thinking = null;
+       setActivity(trace, "thinking…");
+     } else if (event.type === "approval_required") {
+       chatApprovalCard(run, event);
+       bumpActivity(trace);
+       setActivity(trace, "waiting for your approval: " + (event.name || "tool"));
+     } else if (event.type === "approval_resolved") {
+       chatApprovalResolved(run, event);
+       setActivity(trace, "thinking…");
+     } else if (event.type === "consent_required") {
+       chatConsentCard(run, event);
+       bumpActivity(trace);
+       setActivity(trace, "waiting for your consent to use the cloud model");
+     } else if (event.type === "consent_resolved") {
+       chatDecisionResolved("consent", event);
+       setActivity(trace, "thinking…");
+     } else if (event.type === "usage") {
+       chatNoteUsage(run, event);
+     } else if (event.type === "notice") {
+       traceNotice(trace, event.message || "", !!event.info);
+       bumpActivity(trace);
+       setActivity(trace, event.message || "working…");
+     } else if (event.type === "final") {
+       chatDropStartedTools(run);
+       if (event.turn_id) run.turnId = event.turn_id;
+       // The reasoning of a turn whose thinking did not stream (the plain
+       // lane splits <think> out at the end, a cloud model returns it whole)
+       // still gets its collapsed pane, per the reasoning_display preference.
+       if (event.reasoning && !run.sawThinking && chatPrefs.reasoning_display !== "hidden") {
+         var th = traceThinking(trace);
+         th.body.textContent = event.reasoning;
+         th.done = true;
+         if (chatPrefs.reasoning_display !== "expanded") th.node.classList.remove("open");
+       }
+       var ans = traceAnswer(trace);
+       if (ans.mdTimer) { clearTimeout(ans.mdTimer); ans.mdTimer = null; }
+       // Streaming re-renders on a debounce; the final pass is
+       // authoritative. But when the bubble ALREADY shows exactly the
+       // final answer (now the common case, since the plain lane splits
+       // <think> out as it streams instead of dumping it into this bubble)
+       // rebuilding the whole message buys nothing and costs a visible
+       // re-layout at the moment the user starts reading.
+       //
+       // The test is what the DOM last rendered, not what the raw buffer
+       // holds. Comparing raw against the final text looked equivalent and
+       // is not: the line above just cancelled a pending debounce, so when
+       // the last tokens arrived inside that 250ms window the raw buffer
+       // matches while the DOM is still a render or two behind, and
+       // skipping here would drop the tail of every answer that finished
+       // mid-debounce.
+       var finalText = event.answer || "(no answer)";
+       if (ans.lastRendered !== finalText) {
+         renderMarkdown(finalText, ans.text);
+         ans.lastRendered = finalText;
+         ans.raw = event.answer || "";
+         ans.rendered = true;
+       }
+       ans.node.classList.remove("pending");
+       run.answered = true;
+       run.ended = true;
+       updateContextMeter(estimateTokens(event.answer || ""));
+       var bits = [];
+       if (event.tools_used && event.tools_used.length) bits.push(event.tools_used.join(", "));
+       if (chatPrefs.show_metrics) {
+         bits.push((event.steps || 1) + " step" + ((event.steps || 1) === 1 ? "" : "s"));
+         // Cost of the turn, in the shape a local runner prints it:
+         // "2048 tok - 100.4s - 20 tok/s". tok is what the model generated
+         // across every step, and the rate is against wall-clock, so on an
+         // agent turn it includes the time tools took: the number you
+         // actually waited. The decode speed of the model itself and the
+         // time to the first token come from the usage events after it.
+         var secs = (event.elapsed_ms || 0) / 1000;
+         var tok = event.completion_tokens || 0;
+         if (tok) bits.push(tok + " tok");
+         bits.push(secs.toFixed(1) + "s");
+         if (tok && secs > 0) bits.push(chatRate(tok / secs) + " tok/s");
+         var speed = chatUsageText(run.firstUsage, run.usage);
+         if (speed) bits.push(speed);
+       }
+       if (event.truncated) bits.push("continued from summary");
+       stopActivity(trace);
+       if (bits.length) {
+         var meta = document.createElement("div");
+         meta.className = "gmeta";
+         meta.textContent = bits.join(" · ");
+         trace.turn.appendChild(meta);
+       }
+       if (event.documents && event.documents.length) {
+         // A generated document is the deliverable, not a diff to review, so
+         // it gets its own row of download links above the changed-files
+         // node, which would otherwise present a .docx as an edit to inspect
+         // with git before pushing. A project turn wrote into the project's
+         // root, so the download names the project to resolve it there.
+         var docs = document.createElement("div");
+         docs.className = "docrow";
+         event.documents.forEach(function(rel) {
+           var name = rel.split("/").pop();
+           var a = document.createElement("a");
+           a.className = "docdl";
+           a.href = "/api/files/download?path=" + encodeURIComponent(rel)
+             + (run.projectId ? "&project_id=" + encodeURIComponent(run.projectId) : "");
+           a.setAttribute("download", name);
+           a.textContent = "⬇︎  " + name;
+           a.title = "Download " + rel;
+           // Fetched, not navigated: an expired session or a moved file
+           // shows a toast instead of replacing the app with an error body.
+           a.onclick = function(e) { e.preventDefault(); downloadFile(a.href, name); };
+           docs.appendChild(a);
+         });
+         trace.turn.appendChild(docs);
+       }
+       // The document files are already offered above as downloads; listing
+       // them again as "changed files (review before push)" reads as a
+       // warning about the very thing the user asked for.
+       var changed = (event.changed_files || []).filter(function(f) {
+         return (event.documents || []).indexOf(f) === -1;
+       });
+       if (changed.length) {
+         var wrap = document.createElement("div");
+         wrap.className = "gnode diff open";
+         var head = document.createElement("div");
+         head.className = "ghead";
+         var tag = document.createElement("span");
+         tag.className = "gtool";
+         tag.textContent = "changed " + changed.length + " file"
+           + (changed.length === 1 ? "" : "s") + " (review before push)";
+         var caret = document.createElement("span");
+         caret.className = "gcaret";
+         caret.textContent = "▸";
+         head.appendChild(tag); head.appendChild(caret);
+         var body = document.createElement("pre");
+         body.className = "gbody gdiff";
+         body.textContent = event.diff && event.diff.trim()
+           ? event.diff
+           : (changed.join("\n") + "\n\n(new files, not yet tracked by git)");
+         head.onclick = function() { wrap.classList.toggle("open"); };
+         wrap.appendChild(head); wrap.appendChild(body);
+         // The undo for exactly this turn: the checkpoint the final event
+         // names holds every file as it was before the turn wrote it.
+         if (event.checkpoint) {
+           var undoRow = document.createElement("div");
+           undoRow.className = "row mt-1";
+           var undo = makeBtn("Undo these changes",
+             "Put every file this turn changed back the way it was before the turn", null);
+           undo.onclick = function() { chatUndoTurn(event.checkpoint, event.changed_files || changed, undo, undoRow); };
+           undoRow.appendChild(undo);
+           wrap.appendChild(undoRow);
+         }
+         trace.turn.appendChild(wrap);
+       }
+       setRegenerateTarget(addFeedbackBar(run.message, event.answer || ""));
+       // Both routes are ADMIN. Every non-admin answer used to fire two
+       // requests that could only ever come back 403.
+       if (roleIsAdmin()) {
+         loadRunCurve(conversationId);
+         loadPerf();
+       }
+     } else if (event.type === "cancelled") {
+       chatShowPartial(trace, event.partial);
+       settleAnswer(trace, false);
+       // settleAnswer, not a bare notice: a server-side cancel used to leave
+       // the partial answer classed `pending` for good, greyed out with no
+       // `.failed` marking. The partial is the text the server stored, shown
+       // when nothing had streamed into the bubble yet (a resumed turn).
+       traceNotice(trace, chatStoppedLabel(event), false);
+       stopActivity(trace);
+       run.answered = true;
+       run.ended = true;
+     } else if (event.type === "error") {
+       traceNotice(trace, "error: " + event.error, false);
+       // Settle whatever streamed before the error. Marking the turn
+       // answered skips the cleanup after the stream, so without this the
+       // partial text sat at the pending opacity for good: a half-written
+       // answer permanently greyed out, with none of the .failed styling the
+       // AbortError path applies for the same situation.
+       settleAnswer(trace, true);
+       stopActivity(trace);
+       run.answered = true;
+       run.ended = true;
+     }
+   }
+
+   // ----------------------------------------------------- event helpers ---
+
+   // "Undo these changes" under a turn's changed files: after a confirm, roll
+   // the turn's checkpoint back (POST /api/checkpoints/{id}/rollback, which
+   // lets the owner undo their own turn and an admin any) and say what came
+   // back. Files the turn created are deleted; files it changed are restored.
+   async function chatUndoTurn(checkpointId, files, btn, row) {
+     var list = (files || []).filter(function(f) { return !!f; });
+     var what = list.length === 1 ? list[0] : list.length + " files";
+     var ask = "Undo this turn's changes to " + what + "? Files it created are deleted and "
+       + "files it changed go back to how they were before the turn.";
+     if (!(await uiConfirm(ask))) return;
+     btn.disabled = true;
+     btn.textContent = "Undoing…";
+     var old = row.querySelector(".hint");
+     if (old) row.removeChild(old);
+     var note = document.createElement("span");
+     try {
+       var out = await postJSON("/api/checkpoints/" + encodeURIComponent(checkpointId) + "/rollback", {});
+       var data = out.data || {};
+       var restored = data.restored || [];
+       var problems = data.problems || [];
+       note.className = "hint " + (problems.length ? "warn" : "ok");
+       note.textContent = "Undone: put back " + restored.length + " file"
+         + (restored.length === 1 ? "" : "s")
+         + (restored.length ? " (" + restored.join(", ") + ")" : "")
+         + (problems.length ? ". Not restored: " + problems.join("; ") : ".");
+       btn.textContent = "Undone";
+       uiToast(problems.length ? "Undo finished with problems." : "This turn's changes were undone.",
+               problems.length ? "warn" : "ok");
+     } catch (err) {
+       note.className = "hint error";
+       note.textContent = "Undo failed: " + ((err && err.message) || err);
+       btn.disabled = false;
+       btn.textContent = "Undo these changes";
+       uiToast("Undo failed: " + ((err && err.message) || err), "error");
+     }
+     row.appendChild(note);
+   }
+
+   function chatRate(tps) {
+     tps = Number(tps) || 0;
+     return tps >= 10 ? String(Math.round(tps)) : tps.toFixed(1);
+   }
+
+   function chatSecs(ms) {
+     ms = Number(ms) || 0;
+     return ms >= 1000 ? (ms / 1000).toFixed(1) + "s" : Math.round(ms) + "ms";
+   }
+
+   // "TTFT 180ms · decode 31 tok/s": the first step's time to first token
+   // (what the user waited before anything moved) and the latest step's
+   // decode speed (what the model itself manages on this machine).
+   function chatUsageText(first, last) {
+     var bits = [];
+     if (first && first.ttft_ms) bits.push("TTFT " + chatSecs(first.ttft_ms));
+     if (last && last.decode_tps) bits.push("decode " + chatRate(last.decode_tps) + " tok/s");
+     return bits.join(" · ");
+   }
+
+   function chatNoteUsage(run, event) {
+     var u = (event.usage && typeof event.usage === "object") ? event.usage : event;
+     if (!run.firstUsage) run.firstUsage = u;
+     run.usage = u;
+     if (!chatPrefs.show_metrics) return;
+     var meta = document.getElementById("composerMeta");
+     if (!meta) return;
+     var text = chatUsageText(run.firstUsage, u);
+     if (meta.textContent !== text) meta.textContent = text;
+     meta.setAttribute("data-tip", "Latest turn: time to first token and decode speed"
+       + (u.cached_tokens ? ", " + u.cached_tokens + " prompt tokens served from cache" : "") + ".");
+   }
+
+   function chatQueuedLabel(event) {
+     var label = "waiting for a slot: #" + (event.position || 1);
+     if (event.limit) label += " (" + (event.running || 0) + " of " + event.limit + " busy)";
+     return label;
+   }
+
+   function chatInjectedLabel(event) {
+     var files = (event.files || []).map(function(f) {
+       return typeof f === "string" ? f : ((f && (f.path || f.name)) || "");
+     }).filter(function(f) { return !!f; });
+     return "project " + (event.project || event.project_id || "") + ": read "
+       + (files.length ? files.join(", ") : "its context files")
+       + (event.chars ? " (" + compactTokens(event.chars) + " chars)" : "");
+   }
+
+   function chatStoppedLabel(event) {
+     var why = String(event.reason || "");
+     if (!why || why === "cancelled" || why.indexOf("by the user") >= 0) return "stopped";
+     return "stopped: " + why.slice(0, 120);
+   }
+
+   function chatShowPartial(trace, partial) {
+     if (!partial) return;
+     var a = traceAnswer(trace);
+     if (a.text.textContent) return;
+     renderMarkdown(partial, a.text);
+     a.raw = partial;
+     a.lastRendered = partial;
+     a.rendered = true;
+   }
+
+   // Tool cards are keyed by call id. The trace used to keep one `tool` slot,
+   // so two calls in one step (or a result arriving after the next call
+   // started) wrote the second result into the first card.
+   function chatToolKey(event) {
+     if (event.id) return String(event.id);
+     if (event.call_id) return String(event.call_id);
+     if (event.index !== undefined && event.index !== null) return "i" + event.index;
+     return "";
+   }
+
+   function chatToolStart(run, event) {
+     var key = chatToolKey(event);
+     if (key && run.tools[key]) return run.tools[key];
+     var card = traceTool(run.trace, event.name || "tool", null);
+     card.argsEl.textContent = "";
+     card.argsRaw = "";
+     card.called = false;
+     card.key = key;
+     card.node.classList.add("running");
+     card.pill.textContent = "calling";
+     if (key) run.tools[key] = card;
+     run.lastTool = card;
+     return card;
+   }
+
+   function chatToolDelta(run, event) {
+     var key = chatToolKey(event);
+     var card = key ? run.tools[key] : run.lastTool;
+     // A delta without its start: a resume that began mid-call.
+     if (!card) card = chatToolStart(run, event);
+     if (card.called) return;
+     card.argsRaw = (card.argsRaw || "") + String(event.args_delta || "");
+     card.argsEl.textContent = card.argsRaw;
+     scrollDown();
+   }
+
+   function chatToolCall(run, event) {
+     var key = chatToolKey(event);
+     var card = key ? run.tools[key] : null;
+     if (!card) {
+       card = traceTool(run.trace, event.name || "tool", event.args);
+       card.key = key;
+       if (key) run.tools[key] = card;
+     } else {
+       // The authoritative arguments replace whatever streamed in, and an
+       // `edited` call (the user changed them in the approval card) says so.
+       card.argsEl.textContent = JSON.stringify(event.args || {});
+       if (event.name) card.label.textContent = event.name;
+     }
+     card.called = true;
+     card.node.classList.add("running");
+     card.node.classList.remove("awaiting");
+     card.pill.textContent = event.edited ? "running (edited)" : "running";
+     if (event.edited) card.node.classList.add("edited");
+     run.lastTool = card;
+     return card;
+   }
+
+   function chatToolResult(run, event) {
+     var key = chatToolKey(event);
+     var card = (key && run.tools[key]) || run.lastTool;
+     if (!card) return;
+     card.called = true;
+     card.done = true;
+     card.node.classList.remove("running");
+     card.node.classList.remove("awaiting");
+     card.body.textContent = event.result || (event.error && event.error !== true ? String(event.error) : "");
+     if (event.error) {
+       card.node.classList.add("failed");
+       card.pill.textContent = "failed";
+     } else {
+       card.node.classList.add("ok");
+       card.pill.textContent = "ok";
+     }
+     if (run.lastTool === card) run.lastTool = null;
+   }
+
+   // A tool_call_start with no tool_call by the next step (or the end of the
+   // turn): the model began printing a call and then did something else.
+   function chatDropStartedTools(run) {
+     Object.keys(run.tools).forEach(function(key) {
+       var card = run.tools[key];
+       if (card.called) return;
+       if (card.node.parentNode) card.node.parentNode.removeChild(card.node);
+       if (run.lastTool === card) run.lastTool = null;
+       delete run.tools[key];
+     });
+   }
+
+   // ---------------------------------------------- approvals and consent ---
+
+   // One inline decision card for both prompts a turn can stop on: a tool
+   // call the policy wants a person to approve, and sending the turn to a
+   // cloud model. Keyed "<kind>:<id>" so a replayed event (resume, or the
+   // boot list of pending approvals) replaces its card instead of adding one.
+   var chatDecisions = {};
+   var CHAT_SCOPE_LABELS = {
+     approval: { once: "Once", conversation: "This conversation", tool: "Always for this tool" },
+     consent: { once: "Allow once", conversation: "Allow for this conversation", always: "Always allow" }
+   };
+
+   function chatRiskClass(risk) {
+     risk = String(risk || "").toLowerCase();
+     if (risk === "read" || risk === "low") return "ok";
+     if (risk === "exec" || risk === "high" || risk === "critical") return "error";
+     return risk ? "warn" : "muted";
+   }
+
+   function chatPendingHost() {
+     var host = chat.querySelector(".decision-pending");
+     if (host) return host;
+     clearChatEmpty();
+     host = document.createElement("div");
+     host.className = "decision-pending";
+     host.setAttribute("aria-label", "Waiting for your answer");
+     chat.appendChild(host);
+     return host;
+   }
+
+   function chatDecisionCard(spec) {
+     var key = spec.kind + ":" + spec.id;
+     var old = chatDecisions[key];
+     if (old) chatDecisionDiscard(old);
+     var node = document.createElement("div");
+     node.className = (spec.host ? "gnode " : "") + "decision " + spec.kind;
+     var card = document.createElement("div");
+     card.className = "card stack decision-card";
+     card.setAttribute("role", "group");
+     card.setAttribute("aria-label", spec.title);
+     node.appendChild(card);
+
+     var head = document.createElement("div");
+     head.className = "card-header";
+     var title = document.createElement("span");
+     title.className = "gtool";
+     title.textContent = spec.title;
+     head.appendChild(title);
+     if (spec.risk) {
+       var risk = document.createElement("span");
+       risk.className = "pill " + chatRiskClass(spec.risk);
+       risk.textContent = spec.risk;
+       head.appendChild(risk);
+     }
+     var timer = document.createElement("span");
+     timer.className = "decision-timer muted mono";
+     head.appendChild(timer);
+     card.appendChild(head);
+
+     (spec.lines || []).forEach(function(text) {
+       if (!text) return;
+       var el = document.createElement("div");
+       el.className = "hint";
+       el.textContent = text;
+       card.appendChild(el);
+     });
+
+     var state = { key: key, kind: spec.kind, id: spec.id, turnId: spec.turnId || "",
+                   callId: spec.callId || "", run: spec.run || null, node: node, card: card,
+                   head: head, timer: timer, buttons: [], editor: null, actions: null,
+                   tick: null, deadline: 0, closed: false, sending: false };
+
+     if (spec.args !== undefined) {
+       var shown = JSON.stringify(spec.args == null ? {} : spec.args, null, 2);
+       var pre = document.createElement("pre");
+       pre.className = "decision-args mono";
+       pre.textContent = shown;
+       card.appendChild(pre);
+       var editor = document.createElement("textarea");
+       editor.className = "input textarea decision-edit hidden";
+       editor.setAttribute("aria-label", "Tool arguments as JSON");
+       editor.spellcheck = false;
+       editor.value = shown;
+       var edit = makeBtn("Edit arguments", "Change the arguments before allowing the call", null);
+       edit.onclick = function() {
+         var opening = editor.classList.contains("hidden");
+         editor.classList.toggle("hidden", !opening);
+         pre.classList.toggle("hidden", opening);
+         edit.textContent = opening ? "Discard edits" : "Edit arguments";
+         if (opening) editor.focus(); else editor.value = shown;
+       };
+       card.appendChild(edit);
+       card.appendChild(editor);
+       state.editor = editor;
+       state.buttons.push(edit);
+     }
+
+     var row = document.createElement("div");
+     row.className = "row wrap decision-actions";
+     var labels = CHAT_SCOPE_LABELS[spec.kind] || {};
+     var scopes = (spec.scopes && spec.scopes.length) ? spec.scopes : ["once"];
+     if (spec.kind === "approval") {
+       var seg = document.createElement("div");
+       // wrap: on a phone "Always for this tool" ran past the card's edge.
+       seg.className = "seg wrap";
+       seg.setAttribute("role", "radiogroup");
+       seg.setAttribute("aria-label", "Remember the answer for");
+       scopes.forEach(function(s) {
+         var b = document.createElement("button");
+         b.type = "button";
+         b.setAttribute("data-value", s);
+         b.textContent = labels[s] || s;
+         seg.appendChild(b);
+         state.buttons.push(b);
+       });
+       uiSeg(seg, scopes[0]);
+       wireSeg(seg);
+       row.appendChild(seg);
+       var gap = document.createElement("div");
+       gap.className = "spacer";
+       row.appendChild(gap);
+       var deny = makeBtn("Deny", "Refuse this tool call; the agent is told and carries on", null, "btn-danger");
+       var allow = document.createElement("button");
+       allow.type = "button";
+       allow.className = "btn btn-sm btn-primary";
+       allow.textContent = "Allow";
+       deny.onclick = function() { chatDecide(state, "deny", uiSegValue(seg) || "once"); };
+       allow.onclick = function() { chatDecide(state, "allow", uiSegValue(seg) || "once"); };
+       row.appendChild(deny);
+       row.appendChild(allow);
+       state.buttons.push(deny, allow);
+     } else {
+       scopes.forEach(function(s, i) {
+         var b = document.createElement("button");
+         b.type = "button";
+         b.className = "btn btn-sm" + (i === 0 ? " btn-primary" : "");
+         b.textContent = labels[s] || ("Allow (" + s + ")");
+         b.onclick = function() { chatDecide(state, "allow", s); };
+         row.appendChild(b);
+         state.buttons.push(b);
+       });
+       var no = makeBtn("Deny", "Keep this turn on the local model", null, "btn-danger");
+       no.onclick = function() { chatDecide(state, "deny", "once"); };
+       row.appendChild(no);
+       state.buttons.push(no);
+     }
+     card.appendChild(row);
+     state.actions = row;
+
+     if (spec.note) {
+       var note = document.createElement("div");
+       note.className = "row wrap hint";
+       var noteText = document.createElement("span");
+       noteText.textContent = spec.note.text;
+       note.appendChild(noteText);
+       if (spec.note.action) note.appendChild(makeBtn(spec.note.label, spec.note.label, spec.note.action));
+       card.appendChild(note);
+     }
+
+     var host = spec.host || chatPendingHost();
+     host.appendChild(node);
+     chatDecisions[key] = state;
+     // The countdown starts once the card is on the page: the tick stops
+     // itself for a card that is not, so starting it first stopped it at once.
+     var secs = Number(spec.expiresIn) || 0;
+     if (secs > 0) {
+       state.deadline = Date.now() + secs * 1000;
+       state.tick = setInterval(function() { chatDecisionTick(state); }, 1000);
+       chatDecisionTick(state);
+     }
+     scrollDown();
+     return state;
+   }
+
+   function chatDecisionTick(state) {
+     if (state.closed) return;
+     if (!document.body.contains(state.node)) {
+       // The chat was cleared under the card (new chat, another conversation).
+       if (state.tick) { clearInterval(state.tick); state.tick = null; }
+       return;
+     }
+     var left = Math.max(0, Math.round((state.deadline - Date.now()) / 1000));
+     state.timer.textContent = "expires in " + Math.floor(left / 60) + ":" + (left % 60 < 10 ? "0" : "") + (left % 60);
+     if (left <= 0) chatDecisionClose(state, { decision: "timeout" });
+   }
+
+   function chatDecisionDiscard(state) {
+     if (state.tick) { clearInterval(state.tick); state.tick = null; }
+     state.closed = true;
+     var parent = state.node.parentNode;
+     if (parent) parent.removeChild(state.node);
+     // The card moved into a live trace: an emptied holder for prompts of
+     // other turns would stay behind as a blank gap in the chat.
+     if (parent && parent.classList.contains("decision-pending") && !parent.firstChild && parent.parentNode) {
+       parent.parentNode.removeChild(parent);
+     }
+     if (chatDecisions[state.key] === state) delete chatDecisions[state.key];
+   }
+
+   function chatDecisionResult(kind, result) {
+     var decision = String((result && result.decision) || "");
+     var scope = String((result && result.scope) || "once");
+     var label = (CHAT_SCOPE_LABELS[kind] || {})[scope] || scope;
+     if (result && result.by === "cancel") return { text: "stopped", cls: "muted" };
+     if (decision === "allow") return { text: "allowed" + (scope !== "once" ? " (" + label.toLowerCase() + ")" : ""), cls: "ok" };
+     if (decision === "deny") return { text: "denied", cls: "error" };
+     if (decision === "timeout") return { text: "timed out", cls: "warn" };
+     if (decision === "gone") return { text: "no longer waiting", cls: "muted" };
+     return { text: decision || "answered", cls: "muted" };
+   }
+
+   function chatDecisionClose(state, result) {
+     if (state.tick) { clearInterval(state.tick); state.tick = null; }
+     state.closed = true;
+     state.node.classList.add("resolved");
+     if (state.actions && state.actions.parentNode) state.actions.parentNode.removeChild(state.actions);
+     state.buttons.forEach(function(b) {
+       if (b.parentNode && b.parentNode !== state.actions) b.parentNode.removeChild(b);
+     });
+     if (state.editor && state.editor.parentNode) state.editor.parentNode.removeChild(state.editor);
+     var shown = state.card.querySelector(".decision-args");
+     if (shown) shown.classList.remove("hidden");
+     var r = chatDecisionResult(state.kind, result);
+     state.timer.className = "pill " + r.cls + " decision-timer";
+     state.timer.textContent = r.text;
+   }
+
+   async function chatDecide(state, decision, scope) {
+     if (state.closed || state.sending) return;
+     var body = { decision: decision, scope: scope };
+     if (state.kind === "approval" && decision === "allow" && state.editor
+         && !state.editor.classList.contains("hidden")) {
+       var parsed;
+       try { parsed = JSON.parse(state.editor.value); } catch (err) {
+         uiToast("The arguments are not valid JSON: " + err.message, "error");
+         return;
+       }
+       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+         uiToast("The arguments must be a JSON object.", "error");
+         return;
+       }
+       body.args = parsed;
+     }
+     var turnId = state.turnId || (state.run && state.run.turnId) || "";
+     if (!turnId) { uiToast("This request is not attached to a running turn any more.", "warn"); return; }
+     state.sending = true;
+     state.buttons.forEach(function(b) { b.disabled = true; });
+     var path = state.kind === "approval" ? "/approvals/" : "/consent/";
+     try {
+       await postJSON("/api/chat/turns/" + encodeURIComponent(turnId) + path + encodeURIComponent(state.id), body);
+       chatDecisionClose(state, body);
+     } catch (err) {
+       state.sending = false;
+       if (err.status === 404) {
+         chatDecisionClose(state, { decision: "gone" });
+         uiToast("That request was already answered or has expired.", "warn");
+       } else {
+         state.buttons.forEach(function(b) { b.disabled = false; });
+         uiToast("Could not send the answer: " + err.message, "error");
+       }
+     }
+   }
+
+   // approval_resolved / consent_resolved: the server's word is final (it
+   // knows about a timeout, a cancel, or an answer given in another tab).
+   function chatDecisionResolved(kind, event) {
+     var state = chatDecisions[kind + ":" + event.id];
+     if (state) chatDecisionClose(state, event);
+   }
+
+   // A card rebuilt from a replayed event (a re-attach re-sends the turn's
+   // buffered events) carries the expiry the prompt had when it was first
+   // sent, which can be minutes stale. The pending list has the time left.
+   async function chatSyncDeadline(state) {
+     if (!state || !state.tick) return;
+     var approval = state.kind === "approval";
+     try {
+       var out = await fetchJSON(approval ? "/api/approvals/pending" : "/api/cloud/consents");
+       var rows = (out.data && (approval ? out.data.approvals : out.data.pending)) || [];
+       rows.forEach(function(row) {
+         if (state.closed || String(row.id) !== String(state.id)) return;
+         var left = Number(row.expires_in) || 0;
+         if (left > 0) { state.deadline = Date.now() + left * 1000; chatDecisionTick(state); }
+       });
+     } catch (err) { /* keep the event's own countdown */ }
+   }
+
+   function chatApprovalCard(run, event) {
+     var tool = event.call_id ? run.tools[String(event.call_id)] : null;
+     if (tool) {
+       tool.node.classList.add("awaiting");
+       tool.pill.textContent = "awaiting approval";
+     }
+     var state = chatDecisionCard({
+       kind: "approval", id: event.id, run: run, turnId: run.turnId, callId: event.call_id,
+       host: run.trace.trace, title: "Allow " + (event.name || "this tool") + "?",
+       risk: event.risk, lines: [event.reason], args: event.args === undefined ? {} : event.args,
+       scopes: event.scopes, expiresIn: event.expires_in
+     });
+     if (run.reattached) chatSyncDeadline(state);
+   }
+
+   function chatApprovalResolved(run, event) {
+     chatDecisionResolved("approval", event);
+     var tool = event.call_id ? run.tools[String(event.call_id)] : null;
+     if (!tool) return;
+     tool.node.classList.remove("awaiting");
+     if (event.decision === "allow") {
+       tool.pill.textContent = "running";
+     } else {
+       tool.node.classList.remove("running");
+       tool.node.classList.add("failed");
+       tool.pill.textContent = event.decision === "timeout" ? "timed out" : "denied";
+     }
+   }
+
+   function chatConsentLines(event) {
+     var where = [event.provider, event.model].filter(function(x) { return !!x; }).join(" / ");
+     var size = event.est_prompt_tokens ? "about " + compactTokens(event.est_prompt_tokens) + " prompt tokens" : "";
+     return [event.reason, [where, size].filter(function(x) { return !!x; }).join(", ")];
+   }
+
+   function chatConsentCard(run, event) {
+     var state = chatDecisionCard({
+       kind: "consent", id: event.id, run: run, turnId: run.turnId,
+       host: run.trace.trace, title: "Send this turn to the cloud model?",
+       lines: chatConsentLines(event), scopes: event.scopes, expiresIn: event.expires_in
+     });
+     if (run.reattached) chatSyncDeadline(state);
+   }
+
+   // Approvals (and cloud consents) still waiting for this user, for turns
+   // this tab is not streaming: started before a reload, in another tab, or
+   // by a scheduled task that asks. The live stream replays its own.
+   async function chatLoadPendingDecisions() {
+     var approvals = [];
+     var consents = [];
+     try {
+       var out = await fetchJSON("/api/approvals/pending");
+       approvals = (out.data && out.data.approvals) || [];
+     } catch (err) { approvals = []; }
+     try {
+       var out2 = await fetchJSON("/api/cloud/consents");
+       consents = (out2.data && out2.data.pending) || [];
+     } catch (err) { consents = []; }
+     function chatPendingSkip(kind, row) {
+       if (chatRun && row.turn_id && row.turn_id === chatRun.turnId) return true;
+       var have = chatDecisions[kind + ":" + row.id];
+       return !!(have && !have.closed && document.body.contains(have.node));
+     }
+     function chatPendingNote(row) {
+       if (!row.conversation_id || row.conversation_id === conversationId) return null;
+       return { text: "From another conversation.", label: "Open it",
+                action: function() { openConversation(row.conversation_id); } };
+     }
+     approvals.forEach(function(row) {
+       if (chatPendingSkip("approval", row)) return;
+       chatDecisionCard({
+         kind: "approval", id: row.id, turnId: row.turn_id, callId: row.call_id,
+         title: "Allow " + (row.name || "this tool") + "?", risk: row.risk,
+         lines: [row.reason], args: row.args === undefined ? {} : row.args,
+         scopes: row.scopes, expiresIn: row.expires_in, note: chatPendingNote(row)
+       });
+     });
+     consents.forEach(function(row) {
+       if (chatPendingSkip("consent", row)) return;
+       chatDecisionCard({
+         kind: "consent", id: row.id, turnId: row.turn_id,
+         title: "Send this turn to the cloud model?", lines: chatConsentLines(row),
+         scopes: row.scopes, expiresIn: row.expires_in, note: chatPendingNote(row)
+       });
+     });
+   }
+
+   // ------------------------------------------------- history replay ---
+
+   function chatToolNames(tools) {
+     return (Array.isArray(tools) ? tools : []).map(function(t) {
+       if (typeof t === "string") return t;
+       return (t && (t.name || t.tool)) || "";
+     }).filter(function(t) { return !!t; });
+   }
+
+   // A stored answer's meta: its reasoning (collapsed per the
+   // reasoning_display preference), the tools it used, and whether it was
+   // stopped. These used to exist only in the live stream, so a reopened
+   // conversation showed bare answers.
+   function chatReplayMeta(div, meta) {
+     if (!meta || typeof meta !== "object") return;
+     var actions = div.querySelector(".msg-actions");
+     if (meta.reasoning && chatPrefs.reasoning_display !== "hidden") {
+       var det = document.createElement("details");
+       det.className = "msg-reasoning";
+       if (chatPrefs.reasoning_display === "expanded") det.open = true;
+       var sum = document.createElement("summary");
+       sum.textContent = "Reasoning";
+       var pre = document.createElement("pre");
+       pre.className = "msg-reasoning-body";
+       pre.textContent = String(meta.reasoning);
+       det.appendChild(sum);
+       det.appendChild(pre);
+       div.insertBefore(det, div.firstChild);
+     }
+     var tools = chatToolNames(meta.tools);
+     if (tools.length || meta.cancelled) {
+       var line = document.createElement("div");
+       line.className = "msg-meta";
+       if (tools.length) {
+         var names = document.createElement("span");
+         names.className = "mono";
+         names.textContent = "tools: " + tools.join(", ");
+         line.appendChild(names);
+       }
+       if (meta.cancelled) {
+         var pill = document.createElement("span");
+         pill.className = "pill warn";
+         pill.textContent = "stopped";
+         line.appendChild(pill);
+       }
+       div.insertBefore(line, actions);
      }
    }
 
@@ -1557,6 +2523,8 @@ UI_JS_CHAT = r"""
    }
 
    async function refreshHealth() {
+     // The bell rides on this poll (self-throttled to every 15 seconds).
+     chatPollNotifications(false);
      try {
        var out = await fetchJSON("/api/health");
        var data = out.data;
@@ -1652,6 +2620,478 @@ UI_JS_CHAT = r"""
        statusEl.setAttribute("data-tip", "Status unavailable: " + err.message);
      }
    }
+
+   // ------------------------------------------------ composer: pickers ---
+
+   // Project and agent-profile pickers. Each stays hidden until the server
+   // says there is something to pick, so an installation without projects or
+   // agent profiles keeps exactly the toolbar it had.
+   function chatSelectValue(id) {
+     var sel = document.getElementById(id);
+     if (!sel || sel.classList.contains("hidden")) return "";
+     return sel.value || "";
+   }
+
+   function chatFillSelect(sel, items, emptyLabel, labelOf) {
+     var keep = sel.value;
+     while (sel.firstChild) sel.removeChild(sel.firstChild);
+     var none = document.createElement("option");
+     none.value = "";
+     none.textContent = emptyLabel;
+     sel.appendChild(none);
+     items.forEach(function(item) {
+       if (!item || !item.id) return;
+       var opt = document.createElement("option");
+       opt.value = item.id;
+       opt.textContent = labelOf(item);
+       sel.appendChild(opt);
+     });
+     sel.value = keep;
+     if (sel.value !== keep) sel.value = "";
+   }
+
+   async function chatLoadComposerOptions() {
+     var psel = document.getElementById("projectSel");
+     try {
+       var out = await fetchJSON("/api/projects");
+       var d = out.data || {};
+       var projects = d.projects || [];
+       chatFillSelect(psel, projects, "No project", function(p) { return p.name || p.id; });
+       psel.classList.toggle("hidden", d.enabled === false || !projects.length);
+     } catch (err) {
+       psel.value = "";
+       psel.classList.add("hidden");
+     }
+     var asel = document.getElementById("agentSel");
+     try {
+       var out2 = await fetchJSON("/api/agents");
+       // Admins are sent every profile (to manage them); only enabled ones
+       // can run a turn, which is all a non-admin is sent anyway.
+       var agents = ((out2.data && out2.data.agents) || []).filter(function(a) { return a.enabled; });
+       chatFillSelect(asel, agents, "Default agent", function(a) { return a.name || a.id; });
+       asel.classList.toggle("hidden", !agents.length);
+     } catch (err) {
+       asel.value = "";
+       asel.classList.add("hidden");
+     }
+     // Attachments: the paperclip and the mic only where the route exists.
+     var attOk = false;
+     try {
+       await fetchJSON("/api/attachments");
+       attOk = true;
+     } catch (err) { attOk = false; }
+     document.getElementById("attBtn").classList.toggle("hidden", !attOk);
+     document.getElementById("micBtn").classList.toggle("hidden", !(attOk && chatMicSupported() && !chatMicOff));
+   }
+
+   // --------------------------------------------- composer: attachments ---
+
+   // Uploaded before sending (POST /api/attachments, the raw file as the
+   // body), sent as ids with the message. A chip per file; removing one also
+   // deletes the upload so nothing is left behind that no message uses.
+   var chatAtts = [];
+   var CHAT_ATT_MAX = 16;
+
+   function chatAttPick() {
+     var picker = document.getElementById("attInput");
+     if (picker) picker.click();
+   }
+
+   function chatAttBusy() {
+     return chatAtts.some(function(a) { return a.status === "uploading"; });
+   }
+
+   function chatAttReady() {
+     return chatAtts.filter(function(a) { return a.status === "ready" && a.id; });
+   }
+
+   function chatAttClear(deleteUploads) {
+     if (deleteUploads) chatAtts.forEach(function(a) { if (a.id) chatAttForget(a.id); });
+     chatAtts = [];
+     chatAttRender();
+   }
+
+   function chatAttForget(id) {
+     fetch("/api/attachments/" + encodeURIComponent(id), { method: "DELETE" }).catch(function() {});
+   }
+
+   function chatAttRemove(item) {
+     item.removed = true;
+     chatAtts = chatAtts.filter(function(a) { return a !== item; });
+     if (item.id) chatAttForget(item.id);
+     chatAttRender();
+   }
+
+   function chatAttRender() {
+     var host = document.getElementById("attChips");
+     if (!host) return;
+     while (host.firstChild) host.removeChild(host.firstChild);
+     chatAtts.forEach(function(item) {
+       var chip = document.createElement("span");
+       chip.className = "att-chip" + (item.status === "uploading" ? " uploading" : "");
+       if (item.kind === "image" && item.id) {
+         var img = document.createElement("img");
+         img.className = "att-thumb";
+         img.alt = "";
+         img.src = "/api/attachments/" + encodeURIComponent(item.id);
+         chip.appendChild(img);
+       }
+       var name = document.createElement("span");
+       name.className = "att-name";
+       name.textContent = item.name + (item.status === "uploading" ? " (uploading…)" : "");
+       name.title = item.name + (item.bytes ? " · " + chatBytes(item.bytes) : "");
+       chip.appendChild(name);
+       var x = document.createElement("button");
+       x.type = "button";
+       x.className = "btn-icon btn-ghost btn-sm att-remove";
+       x.setAttribute("aria-label", "Remove " + item.name);
+       x.textContent = "×";
+       x.onclick = function() { chatAttRemove(item); };
+       chip.appendChild(x);
+       host.appendChild(chip);
+     });
+     host.classList.toggle("hidden", !chatAtts.length);
+   }
+
+   function chatBytes(n) {
+     n = Number(n) || 0;
+     if (n >= 1048576) return (n / 1048576).toFixed(1) + " MB";
+     if (n >= 1024) return Math.round(n / 1024) + " KB";
+     return n + " B";
+   }
+
+   // POST one blob as an attachment. Resolves to the stored row; throws an
+   // Error carrying the server's own reason (too large, type refused, quota).
+   async function chatUploadBlob(blob, filename) {
+     var res = await fetch("/api/attachments", {
+       method: "POST",
+       headers: { "Content-Type": blob.type || "application/octet-stream",
+                  "X-Filename": encodeURIComponent(filename || "file") },
+       body: blob
+     });
+     if (res.status === 401 && typeof onUnauthorized === "function") onUnauthorized();
+     var data = {};
+     try { data = await res.json(); } catch (e) { data = {}; }
+     if (!res.ok || !data.id) {
+       var err = new Error(httpErrorText(data, res.status));
+       err.status = res.status;
+       throw err;
+     }
+     return data;
+   }
+
+   async function chatAttUpload(files) {
+     if (!files || !files.length) return;
+     var list = Array.prototype.slice.call(files);
+     for (var i = 0; i < list.length; i++) {
+       if (chatAtts.length >= CHAT_ATT_MAX) {
+         uiToast("At most " + CHAT_ATT_MAX + " attachments per message.", "warn");
+         break;
+       }
+       var file = list[i];
+       var item = { name: file.name || "pasted file", status: "uploading", id: null, kind: "", bytes: file.size };
+       chatAtts.push(item);
+       chatAttRender();
+       try {
+         var row = await chatUploadBlob(file, item.name);
+         item.id = row.id;
+         item.kind = row.kind || "";
+         item.mime = row.mime || "";
+         item.bytes = row.bytes || item.bytes;
+         item.status = "ready";
+         // Removed while it was still uploading: drop the upload as well.
+         if (item.removed) chatAttForget(row.id);
+       } catch (err) {
+         chatAtts = chatAtts.filter(function(a) { return a !== item; });
+         uiToast(item.name + ": " + err.message, "error");
+       }
+       chatAttRender();
+     }
+   }
+
+   // Thumbnails (images) and name chips (other files) under a user message.
+   // Accepts upload rows or bare ids (a stored message's meta may only keep
+   // the ids): an id whose image fails to load falls back to a chip.
+   function chatRenderMsgAtts(div, atts) {
+     if (!div || !atts || !atts.length) return;
+     var row = document.createElement("div");
+     row.className = "msg-atts";
+     atts.forEach(function(a) {
+       var id = typeof a === "string" ? a : (a && a.id);
+       if (!id) return;
+       var name = (a && a.name) || (a && a.filename) || "attachment";
+       var kind = typeof a === "string" ? "" : (a.kind || "");
+       function chatAsChip() {
+         var chip = document.createElement("span");
+         chip.className = "att-chip";
+         chip.textContent = name;
+         return chip;
+       }
+       if (kind === "image" || !kind) {
+         var img = document.createElement("img");
+         img.className = "msg-thumb";
+         img.alt = name;
+         img.loading = "lazy";
+         img.src = "/api/attachments/" + encodeURIComponent(id);
+         img.onclick = function() { window.open(img.src, "_blank", "noopener"); };
+         img.onerror = function() { if (img.parentNode) img.parentNode.replaceChild(chatAsChip(), img); };
+         row.appendChild(img);
+       } else {
+         row.appendChild(chatAsChip());
+       }
+     });
+     div.insertBefore(row, div.querySelector(".msg-actions"));
+   }
+
+   // ---------------------------------------------------- composer: mic ---
+
+   // Dictation: record with MediaRecorder, upload the clip as an audio
+   // attachment, transcribe it on the server, put the text in the box.
+   var chatRec = null;
+   var chatMicOff = false;
+
+   function chatMicSupported() {
+     return !!(window.MediaRecorder && navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+   }
+
+   function chatMicUi(state) {
+     var mic = document.getElementById("micBtn");
+     if (!mic) return;
+     mic.classList.toggle("recording", state === "recording");
+     mic.setAttribute("aria-pressed", state === "recording" ? "true" : "false");
+     mic.disabled = state === "working";
+     mic.setAttribute("data-tip", state === "recording" ? "Recording: click again to stop and transcribe."
+       : (state === "working" ? "Transcribing…" : "Dictate: record a voice note and insert its transcript."));
+   }
+
+   async function chatMicToggle() {
+     if (chatRec) { chatRec.recorder.stop(); return; }
+     if (!chatMicSupported()) { uiToast("This browser cannot record audio.", "warn"); return; }
+     var stream;
+     try {
+       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+     } catch (err) {
+       uiToast("Microphone unavailable: " + ((err && err.message) || err), "error");
+       return;
+     }
+     var recorder;
+     try { recorder = new MediaRecorder(stream); } catch (err) {
+       stream.getTracks().forEach(function(t) { t.stop(); });
+       uiToast("Recording failed: " + err.message, "error");
+       return;
+     }
+     var chunks = [];
+     recorder.ondataavailable = function(e) { if (e.data && e.data.size) chunks.push(e.data); };
+     recorder.onstop = function() {
+       stream.getTracks().forEach(function(t) { t.stop(); });
+       chatRec = null;
+       chatMicUi("idle");
+       chatMicTranscribe(new Blob(chunks, { type: recorder.mimeType || "audio/webm" }));
+     };
+     chatRec = { recorder: recorder };
+     recorder.start();
+     chatMicUi("recording");
+   }
+
+   async function chatMicTranscribe(blob) {
+     if (!blob || !blob.size) return;
+     var type = blob.type || "";
+     var ext = type.indexOf("ogg") >= 0 ? "ogg" : (type.indexOf("mp4") >= 0 || type.indexOf("aac") >= 0 ? "m4a" : "webm");
+     chatMicUi("working");
+     var row = null;
+     try {
+       row = await chatUploadBlob(blob, "voice-note." + ext);
+       var res = await fetch("/api/attachments/" + encodeURIComponent(row.id) + "/transcribe", { method: "POST" });
+       var data = {};
+       try { data = await res.json(); } catch (e) { data = {}; }
+       if (res.status === 503) {
+         // Speech to text is not installed on the server: say how to get it.
+         // The server's error usually quotes the hint already.
+         var why = data.error || "Speech to text is not available.";
+         var hint = data.hint && why.indexOf(data.hint) < 0 ? " " + data.hint : "";
+         uiToast(why + hint, "warn");
+       } else if (res.status === 404 && !data.error) {
+         // The server has attachments but no transcription route.
+         chatMicOff = true;
+         document.getElementById("micBtn").classList.add("hidden");
+         uiToast("Voice input is not available on this server.", "warn");
+       } else if (!res.ok) {
+         uiToast("Transcription failed: " + httpErrorText(data, res.status), "error");
+       } else {
+         chatInsertText(data.text || "");
+       }
+     } catch (err) {
+       uiToast("Voice note failed: " + err.message, "error");
+     } finally {
+       // The clip was only the way to the text.
+       if (row && row.id) chatAttForget(row.id);
+       chatMicUi("idle");
+     }
+   }
+
+   function chatInsertText(text) {
+     text = String(text || "").trim();
+     if (!text) { uiToast("No speech was recognised.", "warn"); return; }
+     var value = input.value;
+     var start = typeof input.selectionStart === "number" ? input.selectionStart : value.length;
+     var end = typeof input.selectionEnd === "number" ? input.selectionEnd : value.length;
+     var before = value.slice(0, start);
+     var sep = before && !/\s$/.test(before) ? " " : "";
+     input.value = before + sep + text + value.slice(end);
+     var pos = (before + sep + text).length;
+     input.focus();
+     try { input.setSelectionRange(pos, pos); } catch (err) { /* not focusable yet */ }
+     input.dispatchEvent(new Event("input"));
+   }
+
+   // ---------------------------------------------------- notifications ---
+
+   // The header bell: what the agent and scheduled tasks told this user
+   // (GET /api/notifications). Polled from the health poll, at most every
+   // 15 seconds; a server without the route hides the bell for good.
+   var chatNotifs = [];
+   var chatNotifAt = 0;
+   var chatNotifOff = false;
+
+   async function chatPollNotifications(force) {
+     if (chatNotifOff) return;
+     var now = Date.now();
+     if (!force && now - chatNotifAt < 15000) return;
+     chatNotifAt = now;
+     try {
+       var out = await fetchJSON("/api/notifications?limit=30");
+       chatNotifs = (out.data && out.data.notifications) || [];
+       document.getElementById("notifMenu").classList.remove("hidden");
+       chatNotifRender();
+     } catch (err) {
+       if (err.status === 404) {
+         chatNotifOff = true;
+         document.getElementById("notifMenu").classList.add("hidden");
+       }
+     }
+   }
+
+   function chatNotifRender() {
+     var unread = chatNotifs.filter(function(n) { return !n.read_at; }).length;
+     var badge = document.getElementById("notifBadge");
+     badge.textContent = unread > 9 ? "9+" : String(unread);
+     badge.classList.toggle("hidden", !unread);
+     var btn = document.getElementById("notifBtn");
+     btn.setAttribute("aria-label", unread ? "Notifications, " + unread + " unread" : "Notifications");
+     var list = document.getElementById("notifList");
+     while (list.firstChild) list.removeChild(list.firstChild);
+     if (!chatNotifs.length) {
+       var empty = document.createElement("div");
+       empty.className = "empty";
+       empty.textContent = "Nothing yet.";
+       list.appendChild(empty);
+       return;
+     }
+     chatNotifs.forEach(function(n) {
+       var item = document.createElement("button");
+       item.type = "button";
+       item.setAttribute("role", "menuitem");
+       item.className = "notif-item" + (n.read_at ? "" : " unread") + (n.level ? " " + n.level : "");
+       if (n.title) {
+         var title = document.createElement("span");
+         title.className = "notif-title";
+         title.textContent = n.title;
+         item.appendChild(title);
+       }
+       var body = document.createElement("span");
+       body.className = "notif-body";
+       body.textContent = n.body || "";
+       item.appendChild(body);
+       var when = document.createElement("span");
+       when.className = "notif-when";
+       when.textContent = String(n.created_at || "").replace("T", " ").slice(0, 16)
+         + (n.source ? " · " + n.source : "");
+       item.appendChild(when);
+       item.onclick = function() { chatNotifRead(n); };
+       list.appendChild(item);
+     });
+   }
+
+   async function chatNotifRead(n) {
+     if (n.read_at) return;
+     n.read_at = new Date().toISOString();
+     chatNotifRender();
+     try {
+       await postJSON("/api/notifications/" + encodeURIComponent(n.id) + "/read", {});
+     } catch (err) { /* the next poll shows the server's view */ }
+   }
+
+   async function chatNotifReadAll() {
+     var stamp = new Date().toISOString();
+     chatNotifs.forEach(function(n) { if (!n.read_at) n.read_at = stamp; });
+     chatNotifRender();
+     await uiAct("Mark all read", function() { return postJSON("/api/notifications/read-all", {}); });
+   }
+
+   function chatNotifToggle(force) {
+     var pop = document.getElementById("notifPop");
+     var btn = document.getElementById("notifBtn");
+     var open = (typeof force === "boolean") ? force : pop.classList.contains("hidden");
+     pop.classList.toggle("hidden", !open);
+     btn.setAttribute("aria-expanded", open ? "true" : "false");
+     if (open) chatPollNotifications(true);
+   }
+
+   // ------------------------------------------------ composer wiring ---
+
+   (function chatWireComposer() {
+     var picker = document.getElementById("attInput");
+     if (picker) picker.addEventListener("change", function() {
+       chatAttUpload(picker.files);
+       picker.value = "";
+     });
+     // Paste an image (a screenshot) or a file straight into the message box.
+     input.addEventListener("paste", function(e) {
+       var files = e.clipboardData && e.clipboardData.files;
+       if (!files || !files.length || document.getElementById("attBtn").classList.contains("hidden")) return;
+       e.preventDefault();
+       chatAttUpload(files);
+     });
+     // Drop files anywhere on the conversation or the composer.
+     var box = document.getElementById("composerBox");
+     function chatHasFiles(e) {
+       var types = e.dataTransfer && e.dataTransfer.types;
+       return !!types && Array.prototype.indexOf.call(types, "Files") >= 0;
+     }
+     ["chatView", "composer"].forEach(function(id) {
+       var zone = document.getElementById(id);
+       if (!zone) return;
+       zone.addEventListener("dragover", function(e) {
+         if (!chatHasFiles(e) || document.getElementById("attBtn").classList.contains("hidden")) return;
+         e.preventDefault();
+         box.classList.add("dragging");
+       });
+       zone.addEventListener("dragleave", function(e) {
+         if (e.target === zone) box.classList.remove("dragging");
+       });
+       zone.addEventListener("drop", function(e) {
+         box.classList.remove("dragging");
+         if (!chatHasFiles(e) || document.getElementById("attBtn").classList.contains("hidden")) return;
+         e.preventDefault();
+         chatAttUpload(e.dataTransfer.files);
+       });
+     });
+     // The bell's popover closes on an outside click or Escape, like the menus.
+     document.addEventListener("click", function(e) {
+       var pop = document.getElementById("notifPop");
+       if (!pop || pop.classList.contains("hidden")) return;
+       if (e.target.closest && e.target.closest("#notifMenu")) return;
+       chatNotifToggle(false);
+     });
+     document.addEventListener("keydown", function(e) {
+       if (e.key !== "Escape") return;
+       var pop = document.getElementById("notifPop");
+       if (pop && !pop.classList.contains("hidden")) {
+         chatNotifToggle(false);
+         document.getElementById("notifBtn").focus();
+       }
+     });
+   })();
 """
 
 __all__ = ["UI_JS_CHAT"]

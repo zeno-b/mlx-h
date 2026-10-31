@@ -32,6 +32,9 @@ import sys
 from pathlib import Path
 
 ORDER = [
+    # The .env loader comes first: in the single file it applies .env before
+    # core computes its import-time defaults (deploy.py does that for the package).
+    "envfile",
     "core", "obslog", "codecheck", "database", "sysutil",
     # The settings metadata feeds both the generated Settings markup and the
     # /api/settings/schema route, so it precedes the UI parts.
@@ -43,6 +46,13 @@ ORDER = [
     # Settings panels for client wiring, tokens, MCP, catalogue, approvals,
     # audit and projects (one more script part ui.py assembles).
     "ui_script_integrations",
+    # uiChart (the one chart primitive) and the operational Settings panels
+    # (engine, admission, catalogue, benchmark, training, cluster, remote).
+    "ui_script_charts", "ui_script_ops",
+    # Admin > Dashboards: KPI tiles, charts, adapter ratings, A/B voting.
+    "ui_script_dashboards",
+    # Admin > Evals: run the evaluation suites, scores against the baseline.
+    "ui_script_evals",
     # Tool-call parsing: config clamps TOOL_CALL_FORMAT with it and llm reads
     # its reasoning-tag constants at class-definition time.
     "ui", "toolparse", "config", "model_server", "websearch", "training", "calculator",
@@ -51,7 +61,10 @@ ORDER = [
     # Tool approval policy: tools star-imports it (ToolRegistry.call enforces
     # it); it reads turnctx, which resolve_order hoists above it.
     "policy",
-    "tools", "llm", "model_client", "textutil",
+    # Cloud fallback: model_client star-imports it (cloud_offload); it reads
+    # turnctx, which resolve_order hoists above policy already.
+    "cloud",
+    "tools", "llm", "model_client", "textutil", "intents",
     # tasks star-imports admission (the generation admission controller).
     "taskstate", "agent", "admission", "tasks", "auth", "cluster", "claude_import",
     "appctx",
@@ -89,6 +102,22 @@ ORDER = [
     "tools_extra", "mcp_server",
     # The Settings tool catalogue route (reads config, policy, mcp, tools_extra).
     "tool_catalog",
+    # Admin dashboards (wraps Database.log_metric/record_feedback for adapter
+    # attribution), then the adapter ELO evaluation that reads its fingerprints.
+    "dashboards", "elo",
+    # Menu-bar companion: the status summary route (reads dashboards, policy,
+    # api_tokens) and `deploy.py companion` build/install helpers (cli).
+    "companion",
+    # `deploy.py init` / `service` and the --doctor install checks (reads
+    # catalog, sysutil, sharding's cluster join, envfile).
+    "setup_cmds",
+    # Terminal client (`deploy.py chat|login|logout|whoami`): stdlib only, no
+    # package imports, read by cli.
+    "client",
+    # Evaluation and regression suites: case data, then the runner, routes,
+    # `deploy.py eval` and the EVAL_ON_PROMOTE gate (reads agent, tools,
+    # toolparse, taskstate, codecheck, dashboards' fingerprints, api_tokens).
+    "eval_suites", "evals",
     # ---- extension modules: feature modules in dependency order, above this line ---- #
     "api",
     "diagnostics", "selftest", "cli",

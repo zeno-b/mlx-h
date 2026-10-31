@@ -48,9 +48,9 @@ SETTINGS_SECTIONS: list[dict[str, Any]] = [
     {"key": "memory", "label": "Memory", "admin": False,
      "description": "Notes the assistant keeps, retrieval and learned skills."},
     {"key": "tools", "label": "Tools", "admin": False,
-     "description": "The tool catalogue, sandboxed execution and integrations."},
+     "description": "The tool catalogue, approvals, client connections, API tokens and MCP."},
     {"key": "admin", "label": "Admin", "admin": True,
-     "description": "Users, agents, cluster, imports, codebase, backup and logs."},
+     "description": "Users, dashboards, agents, cluster, imports, codebase, backup, logs, audit and remote access."},
 ]
 
 SECTION_KEYS = [s["key"] for s in SETTINGS_SECTIONS]
@@ -79,6 +79,16 @@ USER_PREFS: dict[str, dict[str, Any]] = {
     # itself does not carry a value. None = the installation default.
     "temperature": {"type": "float", "min": 0.0, "max": 2.0, "default": None, "nullable": True},
     "max_tokens": {"type": "int", "min": 16, "max": 32768, "default": None, "nullable": True},
+    # ---- approvals: the header's Approvals control (policy.py) ---- #
+    # When this user's tool calls wait for their yes: all (every call), risky
+    # (writes, code, sends, deletes) or off. None = never chosen, which means
+    # APPROVAL_DEFAULT_MODE ("all" unless the administrator changed it). The
+    # default is None rather than "all" on purpose: PreferenceStore drops a
+    # value equal to the default, so a user who explicitly picked "all" would
+    # silently follow a later change of the installation default.
+    "approval_mode": {"type": "enum", "options": ["all", "risky", "off"], "default": None,
+                      "nullable": True},
+    # ---- approvals end ---- #
     # ---- extension user prefs: above this line ---- #
 }
 
@@ -1112,10 +1122,25 @@ SETTINGS_FIELDS: list[dict[str, Any]] = [
         "allows the workspace folder and the codebase folder.",
         "text", placeholder="/Users/shared/projects", advanced=True),
     # --- Tool approval policy (policy.py) --- #
-    _ss("tool_approval_mode", "tools", "Approvals", "Ask before running tools",
-        "Off runs every tool call as before. Risky asks you before anything that "
-        "writes files, runs code or sends something out; reading stays automatic. "
-        "All asks before every call.",
+    # The user's own mode first: it is the one control every role sees here,
+    # and the same preference as the Approvals control in the header.
+    _ss("approval_mode", "tools", "Approvals", "My approvals",
+        "Ask every action: every tool call waits for your yes. Ask for changes: "
+        "reading runs on its own, while writing, running code, sending and "
+        "deleting wait for you. Don't ask: tools run without asking. The same "
+        "setting as Approvals in the header; an administrator minimum still applies.",
+        "segmented", scope="user", autosave=True,
+        options=_ss_opts(("all", "Ask every action"), ("risky", "Ask for changes"),
+                         ("off", "Don't ask"))),
+    _ss("approval_default_mode", "tools", "Approvals", "Default for new users",
+        "The approvals mode of every user who has not chosen one in the header. "
+        "Ask every action is the safe default.",
+        "segmented", options=_ss_opts(("all", "Ask every action"), ("risky", "Ask for changes"),
+                                      ("off", "Don't ask"))),
+    _ss("tool_approval_mode", "tools", "Approvals", "Minimum for everyone",
+        "The least asking any user gets, whatever they pick in the header. Off "
+        "leaves it to each user. Risky always asks before anything that writes "
+        "files, runs code or sends something out. All always asks before every call.",
         "segmented", options=_ss_opts(("off", "Off"), ("risky", "Risky"), ("all", "All"))),
     _ss("tool_approval_timeout_s", "tools", "Approvals", "Approval timeout",
         "How long a prompt waits for an answer before the call counts as refused.",
@@ -1232,7 +1257,7 @@ SETTINGS_FIELDS: list[dict[str, Any]] = [
         "Offer the cloud when reading the prompt locally would take at least this long "
         "at the measured prompt speed. 0 turns this trigger off; a prompt larger than "
         "the context window is always offered.",
-        "number", min=0, max=86400, step=10, unit="s", sub="system"),
+        "number", min=0, max=86400, step=10, unit="s", type="float", sub="system"),
     _ss("cloud_min_prompt_tokens", "admin", "Cloud fallback", "Large prompt threshold",
         "Offer the cloud for any prompt of at least this many tokens. 0 turns this "
         "trigger off.",
@@ -1254,6 +1279,52 @@ SETTINGS_FIELDS: list[dict[str, Any]] = [
     _ss_info("cloud_model", "admin", "Cloud fallback", "Cloud model",
              "The model cloud prompts run on; empty keeps the fallback unavailable.",
              "CLOUD_MODEL", sub="system"),
+    # --- Evaluation and regression suite (evals.py) --- #
+    _ss("eval_on_promote", "admin", "Regression gate", "Evaluate every promoted adapter",
+        "After a retrain promotes an adapter and restarts the server, run the live "
+        "tool-calling, RAG and multi-turn suites and roll the adapter back when any suite "
+        "scores worse than the previous adapter's baseline by more than the allowed drop. "
+        "Off keeps every promotion as before.",
+        "switch", sub="evals"),
+    _ss("eval_max_regression", "admin", "Regression gate", "Allowed score drop",
+        "How far a suite's score may fall below the baseline before the run counts as a "
+        "regression (and the gate rolls a new adapter back).",
+        "range", min=0.0, max=1.0, step=0.01, format="percent", type="float", sub="evals"),
+    # --- File-tool deny-list and generated documents (tools.py, Phase B) --- #
+    _ss_info("file_deny_globs", "tools", "Workspaces", "Protected paths",
+             "Paths no file tool, @reference, download or generated document may read or "
+             "write, relative to the project or workspace folder (.env, data/**, *.db, "
+             "...). A pattern with a slash starts at the folder root; one without "
+             "matches at any depth.", "FILE_DENY_GLOBS", advanced=True),
+    _ss_info("outputs_dir", "tools", "Workspaces", "Generated documents folder",
+             "Where a PDF, Word, Excel or PowerPoint file goes when the model names "
+             "only a file, relative to the project or workspace folder; empty writes "
+             "to the folder root.", "OUTPUTS_DIR", advanced=True),
+    # --- Agent routing, retrieval relevance and reasoning budget (agent.py, llm.py) --- #
+    _ss("reasoning_prompt", "generation", "Reasoning", "Think-first instruction",
+        "When to add the \"think step by step before answering\" instruction while "
+        "Reason out loud is on. Auto adds it only for models the catalogue marks as "
+        "thinking models; a small model told to think can spend its whole reply on "
+        "reasoning and never answer.",
+        "select", options=_ss_opts(("auto", "Auto (thinking models only)"),
+                                   ("always", "Always"), ("never", "Never"))),
+    _ss("think_max_tokens", "generation", "Reasoning", "Reasoning budget per step",
+        "Reasoning tokens one agent step may spend before it is stopped and asked for "
+        "the answer only. 0 means no cap.",
+        "number", min=0, max=8192, step=64, unit="tokens"),
+    _ss("rag_df_ceiling", "models", "Retrieval", "Ignore words this common",
+        "A question word found in more than this share of the indexed documents says "
+        "nothing about which one is relevant, so it no longer admits a passage on its "
+        "own. Applies from 20 indexed documents; 100% turns it off.",
+        "range", min=0.01, max=1.0, step=0.01, format="percent", type="float",
+        sub="knowledge"),
+    # --- Intent lexicon (intents.py) --- #
+    _ss("intent_lexicon_enabled", "agent", "Routing", "Read app terms as instructions",
+        "Before the router runs, map the app's own words (knowledge base, codebase, skills, "
+        "memory, history, tasks, a PDF or Word file) to the right tools and retrieval, and "
+        "answer settings and switched-off capabilities with where to find them. Off leaves "
+        "every turn to the router.",
+        "switch"),
     # ---- extension settings fields: one block per feature, above this line ---- #
 ]
 
@@ -1272,7 +1343,7 @@ UI_HIDDEN: dict[str, str] = {
 # Sub-tabs of the sections that hold more than one screenful. A field's `sub`
 # picks its tab; the bespoke panels (model switcher, users, cluster, ...) are
 # rendered into the tab of the same key by ui_settings.py.
-SETTINGS_SUBTABS: dict[str, list[dict[str, str]]] = {
+SETTINGS_SUBTABS: dict[str, list[dict[str, Any]]] = {
     "models": [
         {"key": "model", "label": "Model"},
         {"key": "training", "label": "Training"},
@@ -1289,6 +1360,79 @@ SETTINGS_SUBTABS: dict[str, list[dict[str, str]]] = {
         {"key": "system", "label": "System"},
     ],
 }
+
+
+# ---- panels-integrations: Tools sub-tabs and Admin > Audit ----------------- #
+# Tools grew from one catalogue card into five jobs (catalogue, approvals,
+# client wiring, API tokens, MCP), each with live panels next to the schema
+# fields that configure it. The fields keep their own blocks; this assigns the
+# ones that belong beside a panel by key or group, so a field added later to
+# the Approvals or MCP group follows without touching this block. Everything
+# else stays in the first tab. "admin": True gates a tab like an admin-only
+# section (cosmetic; ui_settings.py renders it, the routes are ADMIN).
+_SS_INTEG_TOOL_TABS: list[dict[str, Any]] = [
+    {"key": "catalogue", "label": "Catalogue"},
+    {"key": "approvals", "label": "Approvals"},
+    {"key": "clients", "label": "Connect a client"},
+    {"key": "tokens", "label": "API tokens"},
+    {"key": "mcp", "label": "MCP", "admin": True},
+]
+_SS_INTEG_SUB_BY_KEY = {"v1_default_mode": "clients", "v1_raw_enabled": "clients",
+                        "mcp_server_enabled": "mcp", "mcp_timeout": "mcp"}
+_SS_INTEG_SUB_BY_GROUP = {"Approvals": "approvals", "MCP": "mcp"}
+
+
+def _ss_integ_tabs() -> None:
+    SETTINGS_SUBTABS.setdefault("tools", list(_SS_INTEG_TOOL_TABS))
+    admin_tabs = SETTINGS_SUBTABS.get("admin", [])
+    if not any(t["key"] == "audit" for t in admin_tabs):
+        keys = [t["key"] for t in admin_tabs]
+        at = keys.index("logs") + 1 if "logs" in keys else len(admin_tabs)
+        admin_tabs.insert(at, {"key": "audit", "label": "Audit"})
+    for f in SETTINGS_FIELDS:
+        if f["section"] != "tools" or f.get("sub"):
+            continue
+        sub = _SS_INTEG_SUB_BY_KEY.get(f["key"]) or _SS_INTEG_SUB_BY_GROUP.get(f["group"])
+        if sub:
+            f["sub"] = sub
+
+
+_ss_integ_tabs()
+# ---- panels-integrations end ------------------------------------------------ #
+
+
+# ---- dashboards: Admin > Dashboards ---------------------------------------- #
+# The admin dashboards and adapter ratings have no settings of their own, only
+# panels (ui_settings.py). The tab goes right after Users, never first: the
+# first tab of a section is where fields without a `sub` land.
+def _ss_dash_tabs() -> None:
+    admin_tabs = SETTINGS_SUBTABS.get("admin", [])
+    if any(t["key"] == "dashboards" for t in admin_tabs):
+        return
+    keys = [t["key"] for t in admin_tabs]
+    at = keys.index("users") + 1 if "users" in keys else len(admin_tabs)
+    admin_tabs.insert(at, {"key": "dashboards", "label": "Dashboards"})
+
+
+_ss_dash_tabs()
+# ---- dashboards end -------------------------------------------------------- #
+
+
+# ---- evals: Admin > Evals --------------------------------------------------- #
+# The evaluation suites' runs, scores and baselines (ui_settings.py panels) and
+# the regression-gate settings. After Dashboards, else after Users.
+def _ss_evals_tabs() -> None:
+    admin_tabs = SETTINGS_SUBTABS.get("admin", [])
+    if any(t["key"] == "evals" for t in admin_tabs):
+        return
+    keys = [t["key"] for t in admin_tabs]
+    anchor = "dashboards" if "dashboards" in keys else "users"
+    at = keys.index(anchor) + 1 if anchor in keys else len(admin_tabs)
+    admin_tabs.insert(at, {"key": "evals", "label": "Evals"})
+
+
+_ss_evals_tabs()
+# ---- evals end -------------------------------------------------------------- #
 
 
 def settings_field_type(field: dict[str, Any]) -> str:

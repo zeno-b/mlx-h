@@ -72,8 +72,16 @@ from .mcp_server import *  # noqa: F401,F403
 from .tools_extra import *  # noqa: F401,F403
 # Settings > Tools > Catalogue: per-tool capability, risk, source and grants.
 from .tool_catalog import *  # noqa: F401,F403
-# Admin dashboards: KPI tiles and time series over metrics, events and feedback.
+# Cloud fallback for oversized prefill: consent store, usage, /api/cloud/*.
+from .cloud import *  # noqa: F401,F403
+# Admin dashboards (metric/feedback attribution, /api/dashboards/*) and the
+# adapter preference evaluation built on them (ELO, /api/eval/*).
 from .dashboards import *  # noqa: F401,F403
+from .elo import *  # noqa: F401,F403
+# Menu-bar companion: GET /api/status/summary for status-scoped tokens.
+from .companion import *  # noqa: F401,F403
+# Evaluation and regression suites: /api/evals/* (and the EVAL_ON_PROMOTE gate).
+from .evals import *  # noqa: F401,F403
 # ---- extension imports: one `from .<feature> import *` per feature, above this line ---- #
 
 # Request/Response must be resolvable at MODULE scope: with `from __future__
@@ -2044,6 +2052,25 @@ def create_app(
                     logging.DEBUG)
         return opts
 
+    async def _link_turn_attachments(request, uid: str, conversation_id: str) -> None:
+        """File this turn's composer uploads under its conversation.
+
+        Uploads arrive before the conversation id is known (a new chat has
+        none until load_history mints it), so they were stored unlinked and
+        stayed unlinked. Called right after load_history, once the id is
+        final; resolve_turn_options has already proved the ids are the
+        caller's. Best effort: a turn never fails over the bookkeeping."""
+        if not request.attachments:
+            return
+        link = optional_feature("attachments", "link_attachments_to_conversation")
+        if not callable(link):
+            return
+        ids = [str(i).strip() for i in request.attachments if str(i).strip()]
+        try:
+            await asyncio.to_thread(link, db, uid, ids, conversation_id)
+        except Exception as exc:  # noqa: BLE001 - bookkeeping, never the turn
+            log(f"attachments not linked to {conversation_id}: {exc}", logging.DEBUG)
+
     def _chat_turn_context(turn, user: dict, opts, interactive: bool) -> TurnContext:
         turn_ctx = TurnContext(
             turn_id=turn.turn_id, user_id=user["id"], conversation_id=turn.conversation_id,
@@ -2068,6 +2095,7 @@ def create_app(
         agent_kwargs = {"attachments": opts.attachments} if opts.attachments else {}
 
         conversation_id, history = load_history(request, uid)
+        await _link_turn_attachments(request, uid, conversation_id)
         max_tokens, temperature = overrides(request, uid)
         use_agent = config.agent_enabled if request.agent is None else request.agent
         # Mirror the streaming handler: route substantive messages through the
@@ -2128,7 +2156,10 @@ def create_app(
              *history, {"role": "user", "content": for_model}],
             max_tokens, config.context_size)
         try:
-            ticket = await generation_gate.acquire(cost_tokens=cost)
+            # Timed: the wait for a slot is the dashboards' queue_ms.
+            queue_started = time.monotonic()
+            ticket = await dash_timed_acquire(generation_gate, cost_tokens=cost)
+            waited_ms = (time.monotonic() - queue_started) * 1000
         except GenerationBusy as exc:
             # chat_in_flight was raised above and the finally below never runs
             # on this path. Before this decrement every 503 leaked +1, and since
@@ -2149,6 +2180,7 @@ def create_app(
         # policy's answer instead of waiting for a click nobody can make.
         turn = turns.create(uid, conversation_id, detachable=False, interactive=False)
         turn_ctx = _chat_turn_context(turn, user, opts, interactive=False)
+        turn_ctx.extras["queue_ms"] = round(waited_ms, 1)
         turn_ctx.suspend_admission = lambda: generation_gate.suspend(ticket)
         bound_turn = set_current_turn(turn_ctx)
         try:
@@ -2203,7 +2235,7 @@ def create_app(
                     return JSONResponse(content={"error": error}, status_code=502)
             else:
                 _sys = config.system_prompt_with_identity + (
-                    REASONING_INSTRUCTION if config.reasoning_visible else "")
+                    REASONING_INSTRUCTION if reasoning_prompt_wanted(config) else "")
                 system = {"role": "system", "content": _sys}
                 user_msg = {"role": "user", "content": request.message}
                 messages, _ = trim_to_context(
@@ -2215,6 +2247,9 @@ def create_app(
                 reasoning = reasoning_of(answer)
                 answer = plain_lane_answer(answer, stats, max_tokens)
                 trace = []
+            if stats is not None and not stats.queue_ms:
+                # The admission wait, so "usage" and the metrics row carry it.
+                stats.queue_ms = float(turn_ctx.extras.get("queue_ms") or 0.0)
 
             if answer or not cancelled:
                 db.add_message(
@@ -2278,6 +2313,7 @@ def create_app(
         agent_kwargs = {"attachments": opts.attachments} if opts.attachments else {}
         want_ids = wants_stream_ids(raw.headers)
         conversation_id, history = load_history(request, uid)
+        await _link_turn_attachments(request, uid, conversation_id)
         max_tokens, temperature = overrides(request, uid)
         use_agent = config.agent_enabled if request.agent is None else request.agent
         # Route substantive messages through the agent even when the agent
@@ -2364,15 +2400,26 @@ def create_app(
                                "limit": snap.get("limit", 0)})
                 moved.set()
 
+            queue_started = time.monotonic()
             acquiring = asyncio.ensure_future(
                 generation_gate.acquire(cost_tokens=cost, on_wait=on_wait))
             last_queued: dict | None = None
+            # The question is stored the moment the turn starts to wait, before
+            # the client hears "queued": a reload while queued then finds it in
+            # the transcript above the resumed answer. A turn admitted at once
+            # stores it after "start" as before, and a refusal (queue full)
+            # leaves no orphan question behind.
+            question_saved = False
             try:
                 while not acquiring.done():
                     if queued:
                         # Only the newest position matters; older ones are stale.
                         last_queued = queued[-1]
                         queued.clear()
+                        if not question_saved:
+                            await asyncio.to_thread(db.add_message, conversation_id, "user",
+                                                    request.message, user_id=uid)
+                            question_saved = True
                         yield last_queued
                         continue
                     moved.clear()
@@ -2404,6 +2451,12 @@ def create_app(
             # The ticket was taken in the helper task; bind it here so a
             # ticket-less release() or suspend() in this task finds it.
             generation_gate.adopt(ticket)
+            # Noted HERE, in the generator's own task (the acquire ran in a
+            # helper task whose context does not flow back), for the metrics,
+            # and on the turn so the agent's usage events carry it too.
+            waited_ms = (time.monotonic() - queue_started) * 1000
+            dash_note_queue_wait(waited_ms)
+            turn_ctx.extras["queue_ms"] = round(waited_ms, 1)
 
             def requeued(position: int, snap: dict) -> None:
                 turn.push({"type": "queued", "position": position,
@@ -2419,7 +2472,8 @@ def create_app(
                        "agent": use_agent, "turn_id": turn.turn_id}
                 if fb:
                     yield {"type": "notice", "info": True, "message": fb["label"]}
-                await asyncio.to_thread(db.add_message, conversation_id, "user", request.message, user_id=uid)
+                if not question_saved:
+                    await asyncio.to_thread(db.add_message, conversation_id, "user", request.message, user_id=uid)
                 if use_agent and opts.project:
                     # Say which project files (AGENTS.md and friends) the agent
                     # reads this turn, so the user can see instructions the
@@ -2469,7 +2523,7 @@ def create_app(
                             )
                 else:
                     _sys = config.system_prompt_with_identity + (
-                        REASONING_INSTRUCTION if config.reasoning_visible else "")
+                        REASONING_INSTRUCTION if reasoning_prompt_wanted(config) else "")
                     system = {"role": "system", "content": _sys}
                     user_msg = {"role": "user", "content": request.message}
                     messages, dropped = trim_to_context(
@@ -2478,7 +2532,8 @@ def create_app(
                     if dropped:
                         yield {"type": "context", "dropped": dropped,
                                "tokens": messages_tokens(messages)}
-                    plain_stats = GenerationStats()
+                    plain_stats = GenerationStats(
+                        queue_ms=float(turn_ctx.extras.get("queue_ms") or 0.0))
                     # Accumulate tokens in a list and join once: repeated string
                     # concatenation in a hot loop is O(n^2) and drags on long replies.
                     answer_parts: list[str] = []
@@ -2650,8 +2705,18 @@ def create_app(
     def get_config(_a: dict = ADMIN):
         return {"config": config.public(), "tools": registry.specs()}
 
+    def _launch_signature_for(cfg: Config) -> tuple | None:
+        hook = getattr(model_manager, "launch_signature_for", None)
+        if hook is None:
+            return None
+        try:
+            return hook(cfg)
+        except Exception:  # noqa: BLE001 - only the restart hint depends on it
+            return None
+
     @app.post("/api/config")
     def set_config(request: ConfigRequest, _a: dict = ADMIN):
+        launch_before = _launch_signature_for(config)
         try:
             requested = request.model_dump(exclude_none=True)
             # A project directory must actually exist; "" clears it. Without this
@@ -2697,6 +2762,23 @@ def create_app(
                                           "admission_min_free_mb")):
                 generation_gate.configure(memory_aware=config.admission_memory_aware,
                                           min_free_mb=config.admission_min_free_mb)
+        # Hand launch settings to the model server manager so the next start
+        # uses them, and tell the UI whether this change makes a restart due:
+        # only when it alters the launch command (the manager's state may
+        # already differ from the config for reasons this save did not cause).
+        # Non-blocking: a start in progress holds the manager's lock for the
+        # whole model load.
+        restart_required = False
+        launch_fields = getattr(model_manager, "CONFIG_FIELDS", None) or ()
+        if changed and any(k in launch_fields for k in changed):
+            try:
+                due = bool(model_manager.apply_config_nowait(config))
+                launch_after = _launch_signature_for(config)
+                restart_required = (due if launch_before is None or launch_after is None
+                                    else launch_before != launch_after)
+            except Exception as exc:  # noqa: BLE001 - saved already; only the hint is lost
+                log(f"Could not hand the new settings to the model server manager: "
+                    f"{redact_text(str(exc))}", logging.WARNING)
         # Report any requested mutable field that was rejected (e.g. a bad value)
         # so the UI can tell the user rather than silently dropping it.
         ignored = [k for k in requested
@@ -2706,6 +2788,7 @@ def create_app(
             "changed": changed,
             "ignored": ignored,
             "config": config.public(),
+            "restart_required": restart_required,
             "note": "context_size applies immediately. max_kv_size needs a model server restart.",
         }
 
@@ -3060,7 +3143,17 @@ def create_app(
     def clear_conversation(conversation_id: str, user: dict = USER):
         if not db.can_access_conversation(conversation_id, user["id"]):
             return JSONResponse({"error": "not found"}, status_code=404)
-        return {"deleted": db.clear_conversation(conversation_id, user_id=user["id"])}
+        deleted = db.clear_conversation(conversation_id, user_id=user["id"])
+        # Files uploaded into this conversation go with it (rows and bytes);
+        # only the caller's own, and a missing attachments feature is no error.
+        drop_files = optional_feature("attachments", "delete_conversation_attachments")
+        if callable(drop_files):
+            try:
+                drop_files(db, user["id"], conversation_id)
+            except Exception as exc:  # noqa: BLE001 - the transcript is gone already
+                log(f"Conversation {conversation_id}: attachments not removed "
+                    f"({redact_text(str(exc))}).", logging.WARNING)
+        return {"deleted": deleted}
 
     @app.post("/api/model/restart")
     def restart_model(_a: dict = ADMIN):
@@ -3118,7 +3211,7 @@ def create_app(
         pending = 1 if (wanted and not is_admin) else 0
         session_id = str(uuid.uuid4())[:8]
 
-        db.execute(
+        feedback_row = db.execute(
             """INSERT INTO feedback
                (user_prompt, assistant_response, rating, corrected_response,
                 approved_for_training, pending_approval, session_id, model_id,
@@ -3137,6 +3230,9 @@ def create_app(
             ),
         )
         db.commit()
+        # Which adapter wrote the rated answer (dashboards, ELO implicit
+        # matches): the conversation's own metric rows first, else the live one.
+        dash_tag_feedback(db, feedback_row.lastrowid, request.conversation_id)
 
         # Close the learning loop. A rating is the only honest signal this
         # project has about whether an answer was any good, and it is already
@@ -3249,7 +3345,11 @@ def create_app(
     register_mcp_server(app, ctx)
     register_tools_extra(app, ctx)
     register_tool_catalog(app, ctx)
+    register_cloud(app, ctx)
     register_dashboards(app, ctx)
+    register_elo(app, ctx)
+    register_companion(app, ctx)
+    register_evals(app, ctx)
     # ---- extension routes: one `register_<feature>(app, ctx)` per feature, above this line ---- #
 
     return app

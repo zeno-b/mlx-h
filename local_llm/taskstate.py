@@ -136,7 +136,7 @@ def canonical_language(name: str | None) -> str:
     if not text:
         return ""
     # A fence info string can carry extras: ```bash title=x
-    text = re.split(r"[\s,;:{]", text, 1)[0]
+    text = re.split(r"[\s,;:{]", text, maxsplit=1)[0]
     return _LANG_ALIASES.get(text, "")
 
 

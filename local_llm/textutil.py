@@ -1499,6 +1499,31 @@ def refers_to_active_task(message: str) -> bool:
     return bool(_ACTIVE_TASK_REFERENCE.search(text))
 
 
+# "code" is both a verb in CODE_INTENT and a noun in CODE_OBJECT, so "summarize
+# the code", "use my code-review prompt" and "connect Claude Code to this app"
+# each counted as a code verb plus a code object and were answered as requests
+# to write code. In a product name, in a hyphenated compound and as the object
+# of a summary it is the noun, so the VERB check ignores it there; the object
+# check still sees it ("fix this code"). Narrow on purpose: "show me the code"
+# and "review this code:" before an unfenced paste kept their old reading,
+# since nothing reported them as wrong.
+_CODE_NOUN = re.compile(
+    r"(?i)\b(?:claude|vs|visual\s+studio)\s+code\b"
+    r"|\bcode(?=-[a-z])"
+    r"|\b(?:summari[sz]e|summary\s+of|overview\s+of)\s+(?:the|my|our|your)\s+code\b")
+# A credential is created with a verb CODE_INTENT knows, often for a script
+# CODE_OBJECT knows: "create an api token for my script" is account admin, not
+# code. Masked only when no language is named ("generate an rsa key in python"
+# stays code) and only when the credential is the object itself, so "create a
+# password reset flow for my app" still is.
+_CREDENTIAL_ASK = re.compile(
+    r"(?i)\b(?:create|generate|make|issue|revoke|rotate)\s+(?:(?:an?|the|my|new|another)\s+)*"
+    r"(?:(?:api|access|bearer|auth|personal)[- ]?)?(?:tokens?|keys?|passwords?)\b"
+    r"(?!\s+(?:validation|validator|field|check|checker|hashing|hash|generator|reset|strength|"
+    r"policy|input|form|manager|rotation|class|function|method|column|table|model|handling|"
+    r"logic|support|auth\w*|parser|store|storage)\b)")
+
+
 def is_code_request(message: str) -> bool:
     """True if the message asks to write, fix, or modify code.
 
@@ -1510,9 +1535,11 @@ def is_code_request(message: str) -> bool:
     text = message or ""
     if "```" in text:
         return True
-    has_verb = bool(CODE_INTENT.search(text))
-    has_object = bool(CODE_OBJECT.search(text))
     has_language = bool(CODE_LANGUAGE.search(text) or CODE_C_LANGUAGE.search(text))
+    if not has_language:
+        text = _CREDENTIAL_ASK.sub(" ", text)
+    has_verb = bool(CODE_INTENT.search(_CODE_NOUN.sub(" ", text)))
+    has_object = bool(CODE_OBJECT.search(text))
     # A code verb plus an object or a language ("write a python script"), or a
     # language and an object together even without an imperative verb ("python
     # script to pull CVEs"), both count as a code request.
@@ -1595,10 +1622,12 @@ _RESULT_HEAD = re.compile(r"^\s*\d+\.\s+(.*)$")
 # filename. A code request WITHOUT any of these ("write a basic c++ crud
 # program") wants code from the model's own knowledge, and pulling indexed
 # documents into it only spends context and derails the answer.
+# "my code-review prompt" is a compound noun, not "my code": the bare "code"
+# branch refuses a following hyphen or word character.
 _PROJECT_REFERENCE = re.compile(
     r"(\bthis (?:project|repo|repository|codebase|file|function|class|module|"
     r"script|code|bug|error|test|package)\b"
-    r"|\b(?:my|our) (?:project|repo|repository|codebase|code ?base|code|file|"
+    r"|\b(?:my|our) (?:project|repo|repository|codebase|code[ -]?base|code(?![\w-])|file|"
     r"files|script|scripts|module|function|class|tests?)\b"
     r"|\b(?:in|from|of|open|read|edit|patch|review) (?:the )?(?:file|files|repo|"
     r"repository|codebase|project)\b"
@@ -1609,9 +1638,17 @@ _PROJECT_REFERENCE = re.compile(
 )
 
 
+# A web address is somebody else's page, never the user's own files: "add
+# https://example.com/docs to the knowledge base" matched the two-segment path
+# branch on "//example.com/docs", and "example.com/a/b" without a scheme the
+# same way. Addresses are blanked before the project patterns run.
+_PROJECT_NOT_A_PATH = re.compile(_BARE_DOMAIN.pattern + r"(?:/[^\s]*)?")
+
+
 def refers_to_project(message: str) -> bool:
     """True if the message points at the user's own files, repo or project."""
-    return bool(_PROJECT_REFERENCE.search(message or ""))
+    text = _PROJECT_NOT_A_PATH.sub(" ", _URL_IN_TEXT.sub(" ", message or ""))
+    return bool(_PROJECT_REFERENCE.search(text))
 
 
 def _parse_search_results(search_text: str) -> list[tuple[str, str, str]]:
@@ -2284,5 +2321,8 @@ __all__ = [
     '_RAG_GENERIC',
     'refers_to_project',
     '_PROJECT_REFERENCE',
+    '_PROJECT_NOT_A_PATH',
+    '_CODE_NOUN',
+    '_CREDENTIAL_ASK',
     '_RESULT_HEAD',
 ]
