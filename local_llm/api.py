@@ -72,6 +72,8 @@ from .mcp_server import *  # noqa: F401,F403
 from .tools_extra import *  # noqa: F401,F403
 # Settings > Tools > Catalogue: per-tool capability, risk, source and grants.
 from .tool_catalog import *  # noqa: F401,F403
+# Admin dashboards: KPI tiles and time series over metrics, events and feedback.
+from .dashboards import *  # noqa: F401,F403
 # ---- extension imports: one `from .<feature> import *` per feature, above this line ---- #
 
 # Request/Response must be resolvable at MODULE scope: with `from __future__
@@ -3247,6 +3249,7 @@ def create_app(
     register_mcp_server(app, ctx)
     register_tools_extra(app, ctx)
     register_tool_catalog(app, ctx)
+    register_dashboards(app, ctx)
     # ---- extension routes: one `register_<feature>(app, ctx)` per feature, above this line ---- #
 
     return app
