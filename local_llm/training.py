@@ -116,6 +116,30 @@ DEFAULT_REPLAY_EXAMPLES: list[tuple[str, str]] = [
 ]
 
 
+# ---- evals: post-promotion regression gate (EVAL_ON_PROMOTE) ---------------- #
+def _train_eval_gate(manager: "RetrainManager", backup_path: Path | None,
+                     feedback_ids: "list[int] | None") -> None:
+    """Hand a just-promoted adapter to evals.eval_after_promote, when present.
+
+    Looked up at call time (evals imports this module's neighbours, and the
+    bundle has no package to import from). Only reached with EVAL_ON_PROMOTE=1;
+    the gate never raises, and a build without evals keeps the adapter.
+    """
+    if __package__:
+        import importlib
+        try:
+            gate = getattr(importlib.import_module(f"{__package__}.evals"),
+                           "eval_after_promote", None)
+        except Exception as exc:  # noqa: BLE001 - optional feature
+            log(f"Post-promotion evaluation unavailable: {exc}", logging.WARNING)
+            return
+    else:
+        gate = globals().get("eval_after_promote")
+    if callable(gate):
+        gate(manager, backup_path, feedback_ids)
+# ---- evals end -------------------------------------------------------------- #
+
+
 class RetrainManager:
     """Manages LoRA retraining with adapter backup, val-loss gating and rollback."""
 
@@ -212,7 +236,7 @@ class RetrainManager:
         if "--config" not in self._lora_help:
             return None
         cfg = self.config
-        path = SFT_DIR / "lora_config.yaml"
+        path = train_sft_dir(SFT_DIR) / "lora_config.yaml"
         # Hand-written rather than via pyyaml: three scalars under one key needs
         # no dependency, and mlx-lm's own example config is this shape.
         path.write_text(
@@ -232,8 +256,8 @@ class RetrainManager:
             cmd.extend(["--model", self.config.model])
         if not add_if_supported(cmd, self._lora_help, ["--train"]):
             cmd.append("--train")
-        if not add_if_supported(cmd, self._lora_help, ["--data"], str(SFT_DIR)):
-            cmd.extend(["--data", str(SFT_DIR)])
+        if not add_if_supported(cmd, self._lora_help, ["--data"], str(train_sft_dir(SFT_DIR))):
+            cmd.extend(["--data", str(train_sft_dir(SFT_DIR))])
         if not add_if_supported(cmd, self._lora_help, ["--adapter-path", "--adapter"], str(ADAPTER_DIR)):
             cmd.extend(["--adapter-path", str(ADAPTER_DIR)])
 
@@ -393,17 +417,17 @@ class RetrainManager:
 
     def _seed_replay_file(self) -> None:
         """Write a starter rehearsal set if the user has not supplied one."""
-        if REPLAY_FILE.exists():
+        if train_replay_file(REPLAY_FILE).exists():
             return
-        REPLAY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        train_replay_file(REPLAY_FILE).parent.mkdir(parents=True, exist_ok=True)
         # Without the date: a rehearsal example carrying "Today's date is
         # 2026-09-20" teaches the model that date, and it is wrong the next
         # morning.
         system = self.config.training_system_prompt
         lines = [json.dumps(self._example(q, a, system), ensure_ascii=False)
                  for q, a in DEFAULT_REPLAY_EXAMPLES]
-        REPLAY_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        log(f"Seeded a starter rehearsal set at {REPLAY_FILE} "
+        train_replay_file(REPLAY_FILE).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        log(f"Seeded a starter rehearsal set at {train_replay_file(REPLAY_FILE)} "
             f"({len(lines)} examples). Edit it to match your own general use.")
 
     def load_replay(self, wanted: int, rng: random.Random) -> list[dict]:
@@ -419,7 +443,7 @@ class RetrainManager:
             return []
         self._seed_replay_file()
         try:
-            raw = REPLAY_FILE.read_text(encoding="utf-8").splitlines()
+            raw = train_replay_file(REPLAY_FILE).read_text(encoding="utf-8").splitlines()
         except OSError as exc:
             log(f"Rehearsal set unreadable ({exc}); training without it. "
                 f"The adapter is more likely to forget general behaviour.", logging.WARNING)
@@ -438,7 +462,7 @@ class RetrainManager:
                     and self._fits(example):
                 pool.append(example)
         if not pool:
-            log(f"No usable rehearsal examples in {REPLAY_FILE}; training without them.",
+            log(f"No usable rehearsal examples in {train_replay_file(REPLAY_FILE)}; training without them.",
                 logging.WARNING)
             return []
         if wanted <= len(pool):
@@ -541,14 +565,14 @@ class RetrainManager:
         train_examples = examples[:split]
         valid_examples = examples[split:]
 
-        SFT_DIR.mkdir(parents=True, exist_ok=True)
+        train_sft_dir(SFT_DIR).mkdir(parents=True, exist_ok=True)
         for name, chunk in (("train.jsonl", train_examples),
                             ("valid.jsonl", valid_examples),
                             # mlx-lm's --test reads this; same held-out rows, so
                             # a manual `mlx_lm.lora --test` reproduces the gate.
                             ("test.jsonl", valid_examples)):
             text = "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in chunk)
-            (SFT_DIR / name).write_text(text, encoding="utf-8")
+            (train_sft_dir(SFT_DIR) / name).write_text(text, encoding="utf-8")
 
         if dropped_long:
             log(f"{dropped_long} approved example(s) exceed TRAIN_SEQ_LEN="
@@ -785,6 +809,10 @@ class RetrainManager:
                            f"Retraining complete on {count} examples "
                            f"({stats['feedback']} feedback, {stats['tool']} tool, "
                            f"{stats['replay']} rehearsal).{delta}"}
+            # ---- evals: EVAL_ON_PROMOTE gate (may roll the adapter back) ---- #
+            if getattr(cfg, "eval_on_promote", False):
+                _train_eval_gate(self, backup_path, exported_ids)
+            # ---- evals end ---- #
 
         except Exception as exc:
             log(f"Retrain failed: {exc}", logging.ERROR)
@@ -828,7 +856,7 @@ class RetrainManager:
     def _preference_dir(self, method: str) -> Path:
         # Beside data/sft, resolved through this module's SFT_DIR so a test
         # sandbox that redirects SFT_DIR redirects this too.
-        return SFT_DIR.parent / "pref" / method
+        return train_sft_dir(SFT_DIR).parent / "pref" / method
 
     def export_method(self, method: str) -> dict:
         """Write the training set for `method` without training. {"busy": True} mid-run."""
@@ -838,9 +866,9 @@ class RetrainManager:
             if method == "sft":
                 count, ids = self.export_feedback()
                 return {"method": "sft", "format": TRAIN_METHOD_SPECS["sft"].data_format,
-                        "counts": dict(self.last_export), "dir": str(SFT_DIR),
-                        "files": [str(SFT_DIR / n) for n in ("train.jsonl", "valid.jsonl")
-                                  if (SFT_DIR / n).exists()],
+                        "counts": dict(self.last_export), "dir": str(train_sft_dir(SFT_DIR)),
+                        "files": [str(train_sft_dir(SFT_DIR) / n) for n in ("train.jsonl", "valid.jsonl")
+                                  if (train_sft_dir(SFT_DIR) / n).exists()],
                         "feedback_ids": len(ids)}
             tools = self.export_tool_traces() if method == "grpo" else None
             result = export_preferences(self.db, self.config, method,
@@ -1005,6 +1033,10 @@ class RetrainManager:
             self.status = {"running": False, "message":
                            f"{spec.label} retraining complete on {counts['examples']} examples. "
                            f"{verdict['message']}"}
+            # ---- evals: EVAL_ON_PROMOTE gate (may roll the adapter back) ---- #
+            if getattr(cfg, "eval_on_promote", False):
+                _train_eval_gate(self, backup_path, export["feedback_ids"])
+            # ---- evals end ---- #
         except Exception as exc:
             log(f"Retrain ({method}) failed: {exc}", logging.ERROR)
             if not promoted:
@@ -1024,5 +1056,6 @@ class RetrainManager:
 # helpers (leading underscore) must cross module boundaries too.
 __all__ = [
     'DEFAULT_REPLAY_EXAMPLES',
+    '_train_eval_gate',
     'RetrainManager',
 ]

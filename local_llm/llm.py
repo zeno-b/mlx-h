@@ -84,6 +84,56 @@ PROSE_REASONING_INSTRUCTION = (
 )
 
 
+def _llm_model_metadata(model: str) -> dict | None:
+    """catalog.model_metadata(model), or None when the catalogue is absent.
+
+    Looked up at call time, the way backends.py and agent.py find it: in the
+    package it is local_llm.catalog, in the single-file build its names are
+    globals, and a build without it must keep working rather than fail to
+    import.
+    """
+    if __package__:
+        try:
+            import importlib  # noqa: PLC0415
+            lookup = getattr(importlib.import_module(f"{__package__}.catalog"),
+                             "model_metadata", None)
+        except Exception:  # noqa: BLE001 - optional feature
+            lookup = None
+    else:
+        lookup = globals().get("model_metadata")
+    if not callable(lookup):
+        return None
+    try:
+        meta = lookup(str(model or ""))
+    except Exception:  # noqa: BLE001 - a broken catalogue entry means "unknown"
+        return None
+    return meta if isinstance(meta, dict) else None
+
+
+def reasoning_prompt_wanted(config) -> bool:
+    """Whether a prompt for this config should carry the think-first instruction.
+
+    REASONING_VISIBLE stays the master switch. Under it, REASONING_PROMPT says
+    when the instruction is actually appended: always, never, or auto (the
+    default), which appends it only for a model the catalogue marks as a
+    thinking model. Telling a non-thinking 3B model to "think step by step in
+    <think> tags" is what spent all 2048 reply tokens of a codebase question on
+    reasoning and left none for the answer (upgrade/ROUTING_AND_TOOLING.md,
+    conversation 3). A model the catalogue does not know gets no instruction:
+    guessing "thinking" for it is the expensive mistake, guessing "not" only
+    costs the visible reasoning a thinking model produces on its own anyway.
+    """
+    if not getattr(config, "reasoning_visible", False):
+        return False
+    mode = str(getattr(config, "reasoning_prompt", "auto") or "auto").strip().lower()
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    meta = _llm_model_metadata(getattr(config, "model", ""))
+    return bool(meta and meta.get("thinking") is True)
+
+
 SKILL_PREAMBLE = (
     "\n\nYOUR SKILLS (name and summary only). Call load_skill with a name to read "
     "the procedure BEFORE doing that kind of task; do not guess one you have a "
@@ -156,6 +206,13 @@ def is_truncated_tool_call(text: str, known: "set[str] | None" = None) -> bool:
     return True
 
 
+# The protocol's web advice, dropped from a narrowed catalogue without web_search
+# (see build_agent_system_prompt). Exactly as TOOL_PROTOCOL words it; if that
+# wording changes, the replace is a no-op and the advice simply stays.
+_LLM_PREFER_WEB = ("- Prefer web_search then fetch_url for anything current. Prefer the\n"
+                   "  calculator over doing arithmetic yourself.\n")
+
+
 def build_agent_system_prompt(base_prompt: str, registry: ToolRegistry,
                               reasoning: bool = False,
                               only: Sequence[str] | None = None) -> str:
@@ -184,7 +241,15 @@ def build_agent_system_prompt(base_prompt: str, registry: ToolRegistry,
         ) or "no arguments"
         required = ", ".join(tool["required"]) or "none"
         lines.append(f"- {tool['name']}: {tool['description']}\n  args: {params}\n  required: {required}")
-    prompt = f"{base_prompt}\n\n{TOOL_PROTOCOL}" + "\n".join(lines)
+    protocol = TOOL_PROTOCOL
+    if only and not any(t["name"] == "web_search" for t in specs):
+        # A narrowed lane (a codebase review, a skill save, a document) has no
+        # web_search to prefer. Leaving the advice in told a 3B model to call a
+        # tool its catalogue does not list, and the unknown name cost a step.
+        # The full catalogue keeps the protocol byte for byte, so the shared
+        # tools-lane prefix is unchanged.
+        protocol = protocol.replace(_LLM_PREFER_WEB, "")
+    prompt = f"{base_prompt}\n\n{protocol}" + "\n".join(lines)
     prompt += project_block(registry)
     prompt += skills_block(registry)
     if reasoning:
@@ -612,6 +677,9 @@ __all__ = [
     'GenerationStats',
     'OPEN_THINK',
     'REASONING_INSTRUCTION',
+    'reasoning_prompt_wanted',
+    '_llm_model_metadata',
+    '_LLM_PREFER_WEB',
     'THINK_BLOCK',
     'ThinkSplitter',
     '_CONNECTIVITY',

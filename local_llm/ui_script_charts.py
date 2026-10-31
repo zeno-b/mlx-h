@@ -173,7 +173,9 @@ UI_JS_CHARTS = r"""   // -------------------------------------------------------
          continue;
        }
        var x = n > 1 ? (i / (n - 1)) * w : w / 2;
-       var y = h - ((v - lo) / span) * h;
+       // A 1px inset keeps the 2px stroke whole at the floor and the peak:
+       // an idle (all-zero) sparkline otherwise drew half its line off the edge.
+       var y = h - 1 - ((v - lo) / span) * (h - 2);
        cur.push([Math.round(x * 10) / 10, Math.round(y * 10) / 10]);
      }
      if (cur.length) segs.push(cur);

@@ -586,7 +586,7 @@ UI_CSS = r"""
    }
    .card-header { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
    .card-header > :first-child { min-width: 0; }
-   .card-actions { display: flex; flex-wrap: wrap; gap: var(--sp-1); }
+   .card-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-1); }
    .card-header { flex-wrap: wrap; }
    .card-header > .card-actions { margin-left: auto; }
    .card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
@@ -957,7 +957,12 @@ UI_CSS = r"""
    #ctxHint { font-size: var(--fs-xs); white-space: nowrap; }
    /* Stop/Send stay right-aligned even when the toolbar wraps on a phone. */
    .composer-toolbar #stopBtn { margin-left: auto; }
-   .composer-meta { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-xs); }
+   /* The metrics line takes the free space with a zero basis and ellipsizes:
+      with an auto basis its text width made the wrapping toolbar push Send onto
+      a second row once the mic and pickers joined it. Stop's auto margin keeps
+      the buttons right-aligned, so the spacer is redundant here. */
+   .composer-meta { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-xs); }
+   .composer-toolbar > .spacer { display: none; }
 
    /* =============================================================== history */
    #historyView > .panel { width: 100%; max-width: 860px; margin: 0 auto; padding: var(--sp-5) var(--sp-4); }
@@ -1159,6 +1164,8 @@ UI_CSS = r"""
    .sub-panel { display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; }
    /* "Advanced" folds inside a group: a quiet disclosure, not another card. */
    details.sgroup-advanced { border-top: 1px solid var(--border); padding-top: var(--sp-3); }
+   /* A group whose fields are all advanced (Benchmark) has no rule to separate. */
+   details.sgroup-advanced:first-child { border-top: 0; padding-top: 0; }
    details.sgroup-advanced > summary {
      display: inline-flex; align-items: center; gap: var(--sp-2);
      list-style: none; cursor: pointer; user-select: none;
@@ -1244,7 +1251,173 @@ UI_CSS = r"""
    .ops-meter .meter > div.warn { background: var(--warn); }
    .ops-meter .meter > div.error { background: var(--error); }
    .ops-code { font-family: var(--font-mono); font-size: var(--fs-xl); letter-spacing: .12em; }
+   /* The cluster node table has six columns; on a phone it scrolls inside
+      the card instead of widening the page. */
+   .ops-scroll { overflow-x: auto; min-width: 0; }
    /* ============================================== panels-ops: charts end */
+
+   /* ============================================================ dashboards */
+   /* Admin > Dashboards (ui_script_dashboards.py). KPI tiles: a label, one
+      figure in tabular numerals, one line of context; the grid reflows from
+      six across to two on a phone. The chart grid does the same for uiChart
+      hosts. The A/B card shows two answers side by side (stacked on a phone),
+      each scrolling on its own so a long answer cannot push the vote buttons
+      off screen. */
+   .dash-kpis { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: var(--sp-2); }
+   .dash-kpi { display: flex; flex-direction: column; gap: 2px; min-width: 0; padding: var(--sp-2) var(--sp-3); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--r-md); }
+   .dash-kpi-label { font-size: var(--fs-xs); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+   .dash-kpi-value { font-size: var(--fs-xl); font-weight: 600; color: var(--fg); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+   .dash-kpi-sub { font-size: var(--fs-xs); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+   .dash-charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: var(--sp-4) var(--sp-3); }
+   .dash-chart { display: flex; flex-direction: column; gap: var(--sp-1); min-width: 0; }
+   .dash-ab { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--sp-3); }
+   .dash-answer { max-height: 360px; overflow-y: auto; padding: var(--sp-3); border: 1px solid var(--border); border-radius: var(--r-md); font-size: var(--fs-md); white-space: pre-wrap; overflow-wrap: anywhere; }
+   @media (max-width: 640px) {
+     .dash-ab { grid-template-columns: minmax(0, 1fr); }
+   }
+   /* ========================================================= dashboards end */
+
+   /* ================================================ chat surface additions */
+   /* Owned by the chat surface (ui_script_chat.py): the composer's pickers,
+      attachment chips and mic, thumbnails in a question, the inline decision
+      card (tool approval and cloud consent share it), replayed reasoning and
+      metadata on a stored answer, and the header notifications bell. Built
+      from the kit's tokens; the card, pill, badge, seg and menu are the kit's. */
+   .composer-select { min-height: var(--ctl-h-sm); max-width: 168px; padding-left: var(--sp-2); font-size: var(--fs-sm); border-radius: var(--r-sm); }
+   .composer-box.dragging { border-color: var(--accent); box-shadow: var(--focus-ring); }
+   .att-chips { display: flex; flex-wrap: wrap; gap: var(--sp-1); min-width: 0; padding: 0 var(--sp-3) var(--sp-1); }
+   .att-chip {
+     display: inline-flex; align-items: center; gap: var(--sp-1);
+     max-width: 240px; min-width: 0; padding: 2px var(--sp-2);
+     background: var(--chip-bg); border: 1px solid var(--border); border-radius: var(--r-pill);
+     color: var(--fg); font-size: var(--fs-xs); line-height: 1.5;
+     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+   }
+   .att-chips .att-chip { padding-right: 2px; }
+   .att-chip.uploading { opacity: 0.7; }
+   .att-chip .att-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+   .att-chip .att-remove { width: 20px; min-width: 20px; min-height: 20px; padding: 0; border-radius: 50%; font-size: var(--fs-sm); }
+   .att-thumb { flex: 0 0 auto; width: 20px; height: 20px; object-fit: cover; border-radius: var(--r-sm); }
+   .mic-btn.recording { color: var(--error); border-color: var(--error); }
+   .msg-atts { display: flex; flex-wrap: wrap; gap: var(--sp-1); margin-top: var(--sp-2); white-space: normal; }
+   .msg-thumb { display: block; max-width: 180px; max-height: 140px; object-fit: cover; border-radius: var(--r-md); border: 1px solid var(--border); background: var(--surface); cursor: zoom-in; }
+   .msg.user .att-chip { background: color-mix(in srgb, var(--accent-fg) 14%, transparent); border-color: transparent; color: inherit; }
+   .msg-reasoning { margin: 0 0 var(--sp-2); }
+   .msg-reasoning > summary { cursor: pointer; user-select: none; color: var(--muted); font-family: var(--font-mono); font-size: var(--fs-xs); }
+   .msg-reasoning-body { margin: var(--sp-1) 0 0; max-height: 200px; overflow: auto; color: var(--muted); font-style: italic; font-size: var(--fs-sm); white-space: pre-wrap; overflow-wrap: anywhere; }
+   .msg-meta { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); margin-top: var(--sp-1); color: var(--muted); font-size: var(--fs-xs); white-space: normal; }
+   .gnode.tool.awaiting .gpill { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
+   .gnode.decision::before { border-color: var(--warn); background: var(--warn); }
+   .gnode.decision.resolved::before { border-color: var(--border); background: var(--surface); }
+   .decision-card { gap: var(--sp-2); padding: var(--sp-3); border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
+   .decision.resolved .decision-card { border-color: var(--border); }
+   .decision-card .decision-timer { margin-left: auto; font-size: var(--fs-xs); }
+   /* "Edit arguments" sits under the arguments, not stretched across the card. */
+   .decision-card > .btn-ghost { align-self: flex-start; }
+   .decision-args { margin: 0; max-height: 180px; overflow: auto; padding: var(--sp-2); background: var(--surface-2); border-radius: var(--r-sm); font-size: var(--fs-xs); white-space: pre-wrap; overflow-wrap: anywhere; }
+   .decision-edit { min-height: 120px; font-family: var(--font-mono); font-size: var(--fs-xs); }
+   .decision-actions { align-items: center; gap: var(--sp-2); }
+   .decision-pending { align-self: stretch; display: flex; flex-direction: column; gap: var(--sp-2); }
+   .notif { position: relative; }
+   .notif-btn { position: relative; }
+   .notif-badge {
+     position: absolute; top: 1px; right: 1px;
+     min-width: 16px; justify-content: center; padding: 0 4px;
+     background: var(--accent); color: var(--accent-fg); border-color: transparent; border-radius: var(--r-pill);
+     font-size: 10px; line-height: 16px; pointer-events: none;
+   }
+   .notif-pop { right: 0; top: calc(100% + 6px); width: min(360px, calc(100vw - 2 * var(--sp-4))); max-width: none; max-height: min(480px, 70vh); overflow-y: auto; }
+   /* On a phone the bell is not at the header's right edge, so a popover
+      right-aligned to it ran off the left of the screen: pin it to the viewport. */
+   @media (max-width: 480px) {
+     .notif-pop { position: fixed; top: calc(var(--header-h) + var(--sp-1)); left: var(--sp-3); right: var(--sp-3); width: auto; }
+   }
+   .notif-head { padding: var(--sp-1) var(--sp-2); }
+   .notif-list { gap: 2px; }
+   .notif-item {
+     display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+     width: 100%; min-height: 0; padding: var(--sp-2);
+     background: transparent; border-color: transparent; border-radius: var(--r-sm);
+     text-align: left; white-space: normal; font-weight: 400;
+   }
+   .notif-item .notif-title { font-weight: 600; font-size: var(--fs-sm); }
+   .notif-item .notif-body { color: var(--muted); font-size: var(--fs-sm); overflow-wrap: anywhere; }
+   .notif-item .notif-when { color: var(--muted); font-size: var(--fs-xs); font-family: var(--font-mono); }
+   .notif-item.unread .notif-title::before, .notif-item.unread .notif-body:first-child::before {
+     content: ""; display: inline-block; width: 7px; height: 7px; margin-right: var(--sp-1);
+     border-radius: 50%; background: var(--accent); vertical-align: middle;
+   }
+   .notif-item.error .notif-title { color: var(--error); }
+   .notif-item.warn .notif-title, .notif-item.warning .notif-title { color: var(--warn); }
+   /* ============================================ chat surface additions end */
+
+   /* ============================== integrator (Wave 4a): narrow-screen tables */
+   /* The settings scroller clips sideways overflow (overflow-x: hidden), so on a
+      phone a wide table (tool catalogue, engines, audit) lost its right-hand
+      columns, and overflow-wrap:anywhere squeezed the first column to a letter
+      per line. Under 640px a table scrolls inside its own box instead, and the
+      first column keeps a readable minimum. */
+   @media (max-width: 640px) {
+     .settings-main .table, .settings-main table.models { display: block; overflow-x: auto; }
+     .settings-main .table td:first-child, .settings-main table.models td:first-child { min-width: 9em; }
+   }
+   /* ========================== integrator (Wave 4a): narrow-screen tables end */
+
+   /* ============================================================= approvals */
+   /* The header's Approvals control (ui_markup.py; apprRender in
+      ui_script_settings.py). It must stay on screen at every width, so it
+      sheds words instead of disappearing: "Approvals: Ask every action" on a
+      wide window, the mode alone below 1100px, a short label below 760px and
+      the shield alone below 640px. The shield's glyph and colour still say
+      the mode there (check = Ask every action, split = Ask for changes,
+      slash = Don't ask) and its tooltip and aria-label carry the words. A
+      small lock marks a mode the administrator's minimum sets. */
+   .appr { position: relative; flex: 0 0 auto; }
+   .appr-btn { gap: 6px; padding: 0 var(--sp-2); font-size: var(--fs-sm); }
+   .appr-btn .appr-prefix { color: var(--muted); font-weight: 400; }
+   .appr-btn .appr-label, .appr-btn .appr-short { font-weight: 600; }
+   .appr-btn .appr-short, .appr-btn .appr-lock { display: none; }
+   .appr-btn .caret { color: var(--muted); font-size: 10px; }
+   .appr-icon .appr-g { display: none; }
+   .appr-btn[data-mode="all"] .appr-g-all,
+   .appr-btn[data-mode="risky"] .appr-g-risky,
+   .appr-btn[data-mode="off"] .appr-g-off { display: inline; }
+   .appr-btn[data-mode="all"] .appr-icon { color: var(--success); }
+   .appr-btn[data-mode="risky"] .appr-icon { color: var(--accent); }
+   .appr-btn[data-mode="off"] .appr-icon,
+   .appr-btn[data-mode="off"] .appr-label,
+   .appr-btn[data-mode="off"] .appr-short { color: var(--warn); }
+   .appr-btn.locked .appr-lock { display: block; color: var(--muted); }
+   .appr-pop { right: 0; top: calc(100% + 6px); width: min(340px, calc(100vw - 2 * var(--sp-4))); max-width: none; }
+   .appr-head { padding: var(--sp-1) var(--sp-2) var(--sp-2); }
+   .appr-head .hint { margin-top: 2px; }
+   .menu > .appr-opt {
+     flex-direction: column; align-items: flex-start; gap: 2px;
+     min-height: 0; padding: var(--sp-2); white-space: normal; text-align: left;
+   }
+   .appr-opt .appr-opt-title { font-weight: 600; }
+   .appr-opt .appr-opt-help { color: var(--muted); font-size: var(--fs-xs); font-weight: 400; line-height: 1.4; }
+   .menu > .appr-opt.active { background: var(--accent-soft); border-color: var(--accent); }
+   .menu > .appr-opt:disabled { cursor: not-allowed; }
+   .appr-locknote, .appr-unattended { padding: var(--sp-1) var(--sp-2) 0; }
+   @media (max-width: 1100px) {
+     .appr-btn .appr-prefix { display: none; }
+   }
+   @media (max-width: 760px) {
+     .appr-btn .appr-label { display: none; }
+     .appr-btn .appr-short { display: inline; }
+   }
+   @media (max-width: 640px) {
+     .appr-btn .appr-short, .appr-btn .caret { display: none; }
+     .appr-btn { position: relative; width: var(--ctl-h); min-width: var(--ctl-h); padding: 0; }
+     .appr-btn.locked .appr-lock { position: absolute; right: 1px; bottom: 3px; }
+   }
+   /* On a phone the control is not at the header's right edge, so pin its
+      menu to the viewport like the notifications popover. */
+   @media (max-width: 480px) {
+     .appr-pop { position: fixed; top: calc(var(--header-h) + var(--sp-1)); left: var(--sp-3); right: var(--sp-3); width: auto; }
+   }
+   /* ========================================================= approvals end */
 
    /* ============================================================ responsive */
    @media (max-width: 900px) {

@@ -76,6 +76,10 @@ def test_alias_resolved_by_model_switcher():
     mm = app.state.model_manager
     swapped: list = []
     mm.swap = lambda model, adapter=None: swapped.append(model) or True  # never start a server
+    # The select route also restarts on a background thread when the model
+    # changed; unstubbed, that thread launched a real mlx_lm.server during the
+    # next test module (the conftest guard now refuses it).
+    mm.restart = lambda *a, **k: True
     with TestClient(app) as client:
         client.post("/api/auth/login", json={"username": "admin", "password": "adminpw123"})
         r = client.post("/api/models/select", json={"model": "coder"})

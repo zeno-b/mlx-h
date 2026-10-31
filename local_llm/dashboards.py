@@ -271,17 +271,6 @@ async def dash_timed_acquire(gate: Any, **kwargs: Any) -> Any:
     return ticket
 
 
-def dash_request_user_id(request: Any) -> str | None:
-    """The authenticated caller of a finished request, for http.request logs."""
-    try:
-        user = getattr(request.state, "user", None)
-    except Exception:  # noqa: BLE001
-        return None
-    if isinstance(user, dict):
-        return user.get("id")
-    return None
-
-
 # --------------------------------------------------------------------------- #
 # Row tagging (wrapped DAO methods)                                            #
 # --------------------------------------------------------------------------- #
@@ -963,7 +952,6 @@ __all__ = [
     "dash_bind_runtime",
     "dash_note_queue_wait",
     "dash_timed_acquire",
-    "dash_request_user_id",
     "_dash_tag_last_metric",
     "_dash_adapter_for_conversation",
     "dash_tag_feedback",

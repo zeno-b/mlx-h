@@ -12,7 +12,9 @@ recorded who allowed it. This module adds the missing questions:
     A few tools depend on their arguments (o365_mail "send", an HTTP verb).
   * what does policy say?  decide() folds the layers, each able to override the
     one before it:
-        install default (TOOL_APPROVAL_MODE off|risky|all)
+        install default: the stricter of the turn user's approvals mode (the
+          header's Approvals control, else APPROVAL_DEFAULT_MODE, "all") and
+          the administrator floor TOOL_APPROVAL_MODE off|risky|all
           -> global override rows -> agent profile -> role   (administrators)
           -> user override -> conversation override           (the user)
           -> taint escalation -> one-shot approvals -> unattended mapping
@@ -47,14 +49,18 @@ old dispatch site. It reads the turn from the contextvar (turnctx), so the
 signature of ToolRegistry.call is unchanged and tests that replace it with a
 lambda keep working.
 
-Defaults keep today's behaviour exactly: TOOL_APPROVAL_MODE=off with no
-override rows allows every call without touching the database and writes no
-audit rows. Explicit override rows (and agent-profile or role rules) still apply
-with the mode off, so an administrator can deny one tool without turning the
-whole approval flow on.
+Defaults: a turn that belongs to a user asks before every call
+(APPROVAL_DEFAULT_MODE=all) until that user picks Ask for changes or Don't ask
+in the header; an unattended run then gets the refusal with a hint naming that
+control. A turn without a user keeps the old default exactly:
+TOOL_APPROVAL_MODE=off with no override rows allows every call without touching
+the database and writes no audit rows. Explicit override rows (and
+agent-profile or role rules) still apply with the mode off, so an administrator
+can deny one tool without turning the whole approval flow on.
 
 Routes (register_policy, from create_app's extension anchor):
   GET    /api/approvals/pending           the caller's pending approvals
+  GET    /api/me/approval-mode            the caller's mode, default, floor, effective
   GET    /api/tool-policies               overrides visible to the caller + mode
   POST   /api/tool-policies               {scope, scope_id?, tool, decision, expires_in_s?}
   DELETE /api/tool-policies/{policy_id}
@@ -296,6 +302,154 @@ def profile_tool_policy(profile: dict | None) -> dict[str, str]:
     if not isinstance(profile, dict):
         return {}
     return _policy_rules_from(profile.get("tool_policy"))
+
+
+# --------------------------------------------------------------------------- #
+# Per-user approval mode (the header's Approvals control)
+# --------------------------------------------------------------------------- #
+# Why this exists: with TOOL_APPROVAL_MODE=off (the installation default) a
+# small model ran list_files, read 1,500 characters of a 100 KB README, then
+# replaced the whole file with 841 characters and never said so. Nobody was
+# asked. The rule since then is "ask the user before every action, unless they
+# change a setting that is always visible". So every user has their own mode,
+# the user_preferences key approval_mode, which the header shows on every view:
+#
+#   all    "Ask every action"  every tool call waits for a yes (the default)
+#   risky  "Ask for changes"   writes, code, sends and deletes wait; reads run
+#   off    "Don't ask"         nothing waits
+#
+# A user who never chose gets APPROVAL_DEFAULT_MODE (all unless the
+# administrator changed it). TOOL_APPROVAL_MODE keeps its old job as the
+# administrator's floor: the stricter of the two wins, and the override layers
+# below (admin deny is final) apply on top exactly as before. A turn without a
+# user (an internal helper, the CLI's own registry, an eval sandbox with its
+# fixed settings) has nobody whose choice could apply and keeps the floor
+# alone, which is today's behaviour.
+APPROVAL_MODE_RANK = {"off": 0, "risky": 1, "all": 2}
+APPROVAL_MODE_INFO: dict[str, dict[str, str]] = {
+    "all": {"label": "Ask every action", "short": "Ask all",
+            "help": "Every tool call, even reading a file or listing a folder, waits for your yes."},
+    "risky": {"label": "Ask for changes", "short": "Ask changes",
+              "help": "Reading and searching run on their own; writing or deleting files, "
+                      "running code and sending anything wait for your yes."},
+    "off": {"label": "Don't ask", "short": "Don't ask",
+            "help": "Tools run without asking you; administrator rules still apply."},
+}
+# The tool result an unattended run gets when the user's own mode asked, so a
+# scheduled task, an API client or an MCP client says what to change and where.
+APPROVAL_UNATTENDED_HINT = ("approval needed: switch Approvals to Ask for changes or Don't ask "
+                            "in the header to let unattended runs use tools")
+APPROVAL_UNATTENDED_HINT_CHANGES = ("approval needed: switch Approvals to Don't ask in the "
+                                    "header to let unattended runs use tools that change things")
+APPROVAL_UNATTENDED_HINT_ADMIN = ("approval needed: your administrator requires approval for "
+                                  "this tool (Settings > Tools > Approvals), so run it from a chat "
+                                  "where you can answer the prompt")
+
+
+def approval_default_mode(config: Any) -> str:
+    """APPROVAL_DEFAULT_MODE: the mode of a user who never chose one.
+
+    A config object without the field (a stand-in built before it existed)
+    predates the rule and keeps today's behaviour; an unknown value asks.
+    """
+    raw = getattr(config, "approval_default_mode", None)
+    if raw is None:
+        return "off"
+    mode = str(raw).strip().lower()
+    return mode if mode in APPROVAL_MODE_RANK else "all"
+
+
+def stricter_approval_mode(*modes: str) -> str:
+    """The mode that asks the most (all > risky > off); unknown values ask."""
+    best = "off"
+    for mode in modes:
+        mode = mode if mode in APPROVAL_MODE_RANK else "all"
+        if APPROVAL_MODE_RANK[mode] > APPROVAL_MODE_RANK[best]:
+            best = mode
+    return best
+
+
+def _policy_mode_asks(mode: str, risk: str) -> bool:
+    return mode == "all" or (mode == "risky" and risk != "read")
+
+
+def user_approval_choice(db: Any, user_id: str | None) -> str | None:
+    """The approvals mode this user picked, or None when they never chose.
+
+    Read straight from user_preferences on every call (one indexed row): a
+    click in the header must govern the very next tool call, and a cache would
+    need an invalidation path from prefs.py for no measurable gain. A table
+    that cannot be read counts as "never chose", which falls back to
+    APPROVAL_DEFAULT_MODE (asking), never to allowing.
+    """
+    if db is None or not user_id:
+        return None
+    try:
+        from .prefs import PreferenceStore
+        value = PreferenceStore(db).stored(str(user_id)).get("approval_mode")
+    except Exception as exc:  # noqa: BLE001 - fall back to the installation default
+        log(f"tool policy: approvals preference unreadable: {redact_text(str(exc))}",
+            logging.DEBUG)
+        return None
+    return value if value in APPROVAL_MODE_RANK else None
+
+
+def _policy_turn_mode(config: Any, db: Any, turn: TurnContext | None, *,
+                      own_request: bool = False) -> tuple[str, str]:
+    """(mode, source) for this turn's calls.
+
+    source is "admin" when the installation floor decides (no user on the
+    turn, the user's choice is not stricter, or own_request), "user" when the
+    user's explicit choice does and "default" when APPROVAL_DEFAULT_MODE does.
+    own_request: the user typed this call themselves (an @reference), so their
+    own "ask me first" is already answered; the administrator's floor is not.
+    """
+    floor = _policy_mode(config)
+    user_id = getattr(turn, "user_id", None) if turn is not None else None
+    if not user_id or own_request:
+        return floor, "admin"
+    choice = user_approval_choice(db, user_id)
+    chosen = choice or approval_default_mode(config)
+    if APPROVAL_MODE_RANK.get(chosen, 2) > APPROVAL_MODE_RANK[floor]:
+        return chosen, ("user" if choice else "default")
+    return floor, "admin"
+
+
+def approval_state(config: Any, db: Any, user_id: str | None) -> dict:
+    """What the header control shows: the user's choice, the default, the
+    administrator's floor, the effective mode and whether the floor locks it."""
+    floor = _policy_mode(config)
+    default = approval_default_mode(config)
+    choice = user_approval_choice(db, user_id)
+    chosen = choice or default
+    effective = stricter_approval_mode(chosen, floor)
+    locked = APPROVAL_MODE_RANK[floor] > APPROVAL_MODE_RANK.get(chosen, 2)
+    return {
+        "preference": choice,
+        "default": default,
+        "chosen": chosen,
+        "admin_floor": floor,
+        "effective": effective,
+        "locked": locked,
+        "source": "admin" if locked else ("user" if choice else "default"),
+        "label": APPROVAL_MODE_INFO[effective]["label"],
+        "unattended": str(getattr(config, "tool_approval_unattended", "deny") or "deny"),
+        "modes": [{"value": key, **APPROVAL_MODE_INFO[key]} for key in ("all", "risky", "off")],
+    }
+
+
+def _policy_unattended_hint(floor: str, mode_rule: bool, risk: str) -> str:
+    """What an unattended run should tell its caller to change, if anything.
+
+    Only when the ask came from an approvals mode (not an override row, taint
+    or a profile rule, which the header cannot change). When the floor alone
+    would still ask, pointing at the header would send the user in circles.
+    """
+    if not mode_rule:
+        return ""
+    if _policy_mode_asks(floor, risk):
+        return APPROVAL_UNATTENDED_HINT_ADMIN
+    return APPROVAL_UNATTENDED_HINT if risk == "read" else APPROVAL_UNATTENDED_HINT_CHANGES
 
 
 def _policy_fingerprint(args: Any) -> str:
@@ -590,10 +744,37 @@ def record_tool_decision(db: Any, *, tool: str, decision: str, risk: str | None 
         log(f"tool policy: audit write failed: {redact_text(str(exc))}", logging.ERROR)
 
 
+def policy_audit_bound(value: Any, *, end: bool = False) -> tuple[str, bool] | None:
+    """(UTC timestamp for SQL, inclusive) from an ISO date or datetime; None if empty.
+
+    A bare date is a whole UTC day: `since` starts at its midnight, `until`
+    runs to the end of it (the next midnight, exclusive). A datetime without a
+    zone is UTC, like the stored rows. Raises ValueError on anything else.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    date_only = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw))
+    moment = datetime.fromisoformat(raw.replace("Z", "+00:00").replace("z", "+00:00"))
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    moment = moment.astimezone(timezone.utc)
+    if date_only and end:
+        return (moment + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S.%f"), False
+    return moment.strftime("%Y-%m-%d %H:%M:%S.%f"), True
+
+
 def list_tool_decisions(db: Any, *, user_id: str | None = None,
                         conversation_id: str | None = None, tool: str | None = None,
-                        limit: int = 100, before_id: int | None = None) -> list[dict]:
-    """Newest first. user_id None = every user (admin view)."""
+                        limit: int = 100, before_id: int | None = None,
+                        decision: str | None = None, since: Any = None, until: Any = None,
+                        offset: int = 0) -> list[dict]:
+    """Newest first. user_id None = every user (admin view).
+
+    decision / since / until (ISO dates, see policy_audit_bound) filter in SQL,
+    so the audit view's filters cover every row and not only the loaded page.
+    Paging: before_id (keyset, what the UI uses) or offset. ValueError on a bad date.
+    """
     db.ensure_schema(POLICY_SCHEMA_NAME)
     where, params = [], []
     if user_id is not None:
@@ -602,13 +783,24 @@ def list_tool_decisions(db: Any, *, user_id: str | None = None,
         where.append("conversation_id = ?"); params.append(conversation_id)
     if tool:
         where.append("tool = ?"); params.append(tool)
+    if decision:
+        where.append("decision = ?"); params.append(str(decision))
+    # julianday() parses both the stored isoformat ("...T...+00:00") and the
+    # bound, so the comparison is by instant rather than by string shape.
+    for value, end in ((since, False), (until, True)):
+        bound = policy_audit_bound(value, end=end)
+        if bound is not None:
+            op = (">=" if not end else ("<=" if bound[1] else "<"))
+            where.append(f"julianday(created_at) {op} julianday(?)"); params.append(bound[0])
     if before_id:
         where.append("id < ?"); params.append(int(before_id))
     sql = "SELECT * FROM tool_decisions"
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY id DESC LIMIT ?"
-    params.append(max(1, min(int(limit or 100), 1000)))
+    sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
+    # 1001: the route asks for one row past its 1000-row page to learn has_more.
+    params.append(max(1, min(int(limit or 100), 1001)))
+    params.append(max(0, int(offset or 0)))
     out = []
     for row in db.execute(sql, tuple(params)).fetchall():
         item = dict(row)
@@ -680,7 +872,7 @@ def note_tool_result(name: str, tool: Any = None, error: str | None = None,
 def decide(tool_name: str, args: dict | None = None, turn: TurnContext | None = None, *,
            registry: Any = None, config: Any = None, db: Any = None, tool: Any = None,
            conversation_id: str | None = None, consume: bool = False,
-           audit: bool = True) -> Decision:
+           audit: bool = True, own_request: bool = False) -> Decision:
     """Fold every policy layer into one Decision for this call.
 
     `turn` defaults to current_turn(). Pass `registry` (or config/db/tool) when
@@ -690,6 +882,12 @@ def decide(tool_name: str, args: dict | None = None, turn: TurnContext | None = 
     table unless audit=False: the agent loop does not call the registry after
     a deny, so this is the only place that refusal would be recorded. Allows
     are audited by ToolRegistry.call and approvals by the broker.
+
+    The install default is the stricter of the turn user's approvals mode
+    (approval_mode, else APPROVAL_DEFAULT_MODE) and TOOL_APPROVAL_MODE; its
+    rule reads "user-mode:<mode>" when the user's mode decided and
+    "default:<mode>" when the administrator's did. own_request=True skips the
+    user's mode for a call the user typed themselves (reference_refusal).
     """
     if turn is None:
         turn = current_turn()
@@ -707,19 +905,24 @@ def decide(tool_name: str, args: dict | None = None, turn: TurnContext | None = 
     risk = classify_tool_risk(tool_name, args, tool)
     if config is None:
         return Decision("allow", risk, "no tool policy is configured", "unconfigured")
-    if _policy_fast_allow(config, db, turn):
+    mode, mode_source = _policy_turn_mode(config, db, turn, own_request=own_request)
+    if _policy_fast_allow(config, db, turn, mode=mode):
         return Decision("allow", risk, "tool approvals are off", "default:off")
 
-    mode = _policy_mode(config)
+    users = mode_source != "admin"
+    prefix = "user-mode" if users else "default"
     if mode == "off":
-        action, rule, reason = "allow", "default:off", "tool approvals are off"
+        action, rule, reason = "allow", f"{prefix}:off", "tool approvals are off"
     elif mode == "all":
-        action, rule, reason = "ask", "default:all", "every tool call needs approval"
+        action, rule, reason = ("ask", f"{prefix}:all",
+                                "your Approvals setting is Ask every action" if users
+                                else "every tool call needs approval")
     elif risk == "read":
-        action, rule, reason = "allow", "default:risky", "read-only tools run without approval"
+        action, rule, reason = "allow", f"{prefix}:risky", "read-only tools run without approval"
     else:
-        action, rule, reason = ("ask", "default:risky",
-                                f"{tool_name} is a {risk} tool, which needs approval")
+        action, rule, reason = ("ask", f"{prefix}:risky",
+                                f"{tool_name} is a {risk} tool, which needs approval"
+                                + (" (your Approvals setting is Ask for changes)" if users else ""))
 
     user_id, conv = _policy_identity(turn, conversation_id)
     profile = turn.agent_profile if turn is not None else None
@@ -787,8 +990,19 @@ def decide(tool_name: str, args: dict | None = None, turn: TurnContext | None = 
             action, rule = "allow", "unattended:allow"
             reason = f"{reason}; nobody can approve here and unattended calls are allowed"
         else:
+            hint = _policy_unattended_hint(_policy_mode(config),
+                                           rule.startswith(("default:", "user-mode:")), risk)
             action, rule = "deny", "unattended:deny"
             reason = f"{reason}, and nobody can approve it here (unattended run)"
+            if hint:
+                # The refusal is the tool result, so a scheduled task's trace,
+                # an API client and an MCP client all carry what to change.
+                reason = f"{reason}; {hint}"
+                extras = getattr(turn, "extras", None) if turn is not None else None
+                log_event(_policy_log, logging.WARNING, "tool.approval_needed", tool=tool_name,
+                          risk=risk, mode=mode, mode_source=mode_source,
+                          source=(extras or {}).get("source") if isinstance(extras, dict) else None,
+                          turn_id=turn.turn_id if turn is not None else None, hint=hint)
     if audit and action == "deny":
         record_tool_decision(db, tool=tool_name, decision="deny", risk=risk, rule=rule,
                              args=args, user_id=user_id, conversation_id=conv,
@@ -796,8 +1010,13 @@ def decide(tool_name: str, args: dict | None = None, turn: TurnContext | None = 
     return Decision(action, risk, reason, rule, approval_id, approver, latency)
 
 
-def _policy_fast_allow(config: Any, db: Any, turn: TurnContext | None) -> bool:
-    """True when the answer is today's allow without consulting anything."""
+def _policy_fast_allow(config: Any, db: Any, turn: TurnContext | None, *,
+                       mode: str | None = None, own_request: bool = False) -> bool:
+    """True when the answer is today's allow without consulting anything.
+
+    `mode` is the turn's effective mode when the caller already has it; the
+    user's own mode is looked up last, after every check that needs no query.
+    """
     if config is None:
         return True
     if _policy_mode(config) != "off":
@@ -806,12 +1025,16 @@ def _policy_fast_allow(config: Any, db: Any, turn: TurnContext | None) -> bool:
         return False
     if turn is not None and profile_tool_policy(turn.agent_profile):
         return False
+    if mode is None:
+        mode = _policy_turn_mode(config, db, turn, own_request=own_request)[0]
+    if mode != "off":
+        return False
     return not _policy_has_rows(db)
 
 
 def enforce_tool_policy(registry: Any, tool: Any, name: str, args: dict | None,
                         conversation_id: str | None = None, *,
-                        audit_args: Any = None) -> str | None:
+                        audit_args: Any = None, own_request: bool = False) -> str | None:
     """Synchronous fail-closed check run inside ToolRegistry.call.
 
     Returns None to run the call, or the refusal text. "ask" without a
@@ -824,17 +1047,19 @@ def enforce_tool_policy(registry: Any, tool: Any, name: str, args: dict | None,
     config = getattr(registry, "config", None)
     db = getattr(registry, "db", None)
     turn = current_turn()
-    if _policy_fast_allow(config, db, turn):
+    mode = (_policy_turn_mode(config, db, turn, own_request=own_request)[0]
+            if config is not None else "off")
+    if _policy_fast_allow(config, db, turn, mode=mode):
         return None
     decision = decide(name, args, turn, config=config, db=db, tool=tool,
-                      conversation_id=conversation_id, consume=True, audit=False)
+                      conversation_id=conversation_id, consume=True, audit=False,
+                      own_request=own_request)
     if decision.action == "ask":
         decision = Decision(
             "deny", decision.risk,
             f"{decision.reason}; it was not approved and this call path cannot ask",
             f"enforce:{decision.rule}")
     user_id, conv = _policy_identity(turn, conversation_id)
-    mode = _policy_mode(config)
     if decision.action == "deny" or mode != "off" or not decision.rule.startswith("default:"):
         record_tool_decision(
             db, tool=name, decision=decision.action, risk=decision.risk, rule=decision.rule,
@@ -856,6 +1081,10 @@ def reference_refusal(registry: Any, token: str) -> str | None:
     and the same audit row as the tool would, and a fetched page taints the
     turn. "ask" cannot be answered during reference expansion, so it skips the
     reference with a note; the model can still call the tool, which asks.
+
+    The user typed the reference, so their own approvals mode does not ask
+    them again about it (own_request); the administrator's floor and every
+    override row still apply.
     """
     token = str(token or "")
     if token == "diff":
@@ -870,7 +1099,7 @@ def reference_refusal(registry: Any, token: str) -> str | None:
     except Exception:  # noqa: BLE001
         tool = None
     refusal = enforce_tool_policy(registry, tool, name, args,
-                                  audit_args={**args, "via": "@reference"})
+                                  audit_args={**args, "via": "@reference"}, own_request=True)
     if refusal:
         return f"skipped @{token}: {refusal}"
     note_tool_result(name, tool, None)
@@ -1225,6 +1454,13 @@ def register_policy(app, ctx) -> None:
     async def approvals_pending(user: dict = USER):
         return {"approvals": BROKER.pending(user["id"])}
 
+    # The header's Approvals control reads this; it writes the choice through
+    # POST /api/me/preferences {"approval_mode": ...} like every other
+    # preference, then reads this again for the effective (floored) mode.
+    @app.get("/api/me/approval-mode")
+    async def my_approval_mode(user: dict = USER):
+        return await asyncio.to_thread(approval_state, ctx.config, db, user["id"])
+
     @app.get("/api/tool-policies")
     async def tool_policies(scope: str | None = None, scope_id: str | None = None,
                             user: dict = USER):
@@ -1238,9 +1474,14 @@ def register_policy(app, ctx) -> None:
                     visible.append(row)
             rows = visible
         cfg = ctx.config
+        mine = await asyncio.to_thread(approval_state, cfg, db, user["id"])
         return {
             "policies": rows,
             "mode": _policy_mode(cfg),
+            # The caller's own approvals mode (the header control) next to the
+            # administrator floor above, so the panel can say which one rules.
+            "user_mode": mine["chosen"],
+            "effective_mode": mine["effective"],
             "unattended": str(getattr(cfg, "tool_approval_unattended", "deny")),
             "timeout_s": getattr(cfg, "tool_approval_timeout_s", 120),
             "taint": bool(getattr(cfg, "tool_approval_taint", True)),
@@ -1313,13 +1554,30 @@ def register_policy(app, ctx) -> None:
     @app.get("/api/audit/tool-decisions")
     async def tool_decisions(limit: int = 100, conversation_id: str | None = None,
                              tool: str | None = None, user_id: str | None = None,
-                             before_id: int | None = None, user: dict = USER):
+                             before_id: int | None = None, decision: str | None = None,
+                             since: str | None = None, until: str | None = None,
+                             offset: int = 0, user: dict = USER):
+        # A user only ever sees their own rows: user_id is an admin filter.
         scoped = user_id if is_admin(user) else user["id"]
-        rows = await asyncio.to_thread(
-            list_tool_decisions, db, user_id=scoped or None,
-            conversation_id=(conversation_id or None), tool=(tool or None),
-            limit=limit, before_id=before_id)
-        return {"decisions": rows}
+        try:
+            for name, value, end in (("since", since, False), ("until", until, True)):
+                try:
+                    policy_audit_bound(value, end=end)
+                except ValueError:
+                    raise ValueError(f"{name} must be an ISO date or datetime") from None
+            size = max(1, min(int(limit or 100), 1000))
+            # One row past the page says whether an "Older" page exists.
+            rows = await asyncio.to_thread(
+                list_tool_decisions, db, user_id=scoped or None,
+                conversation_id=(conversation_id or None), tool=(tool or None),
+                limit=size + 1, before_id=before_id, decision=(decision or None),
+                since=since, until=until, offset=offset)
+        except ValueError as exc:
+            return JSONResponse({"error": redact_text(str(exc))}, status_code=400)
+        more = len(rows) > size
+        rows = rows[:size]
+        return {"decisions": rows, "has_more": more,
+                "next_before_id": rows[-1]["id"] if more and rows else None}
 
 
 # Re-exported explicitly: the original file was one flat namespace, so private
@@ -1331,6 +1589,16 @@ __all__ = [
     'POLICY_SCOPES',
     'APPROVAL_SCOPES',
     'APPROVAL_MODES',
+    'APPROVAL_MODE_RANK',
+    'APPROVAL_MODE_INFO',
+    'APPROVAL_UNATTENDED_HINT',
+    'APPROVAL_UNATTENDED_HINT_CHANGES',
+    'APPROVAL_UNATTENDED_HINT_ADMIN',
+    'approval_default_mode',
+    'approval_state',
+    'stricter_approval_mode',
+    'user_approval_choice',
+    '_policy_turn_mode',
     'Decision',
     'Resolution',
     'ApprovalBroker',
@@ -1350,6 +1618,7 @@ __all__ = [
     'delete_tool_override',
     'record_tool_decision',
     'list_tool_decisions',
+    'policy_audit_bound',
     'bind_policy',
     'register_policy',
     '_policy_schema',

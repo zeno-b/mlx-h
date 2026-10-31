@@ -110,6 +110,14 @@ def selftest() -> int:
         "vision", "attachments", "audio",
         "tools_extra", "mcp_server",
         "ui_script_integrations", "tool_catalog",
+        "ui_script_charts", "ui_script_ops",
+        "cloud",
+        "dashboards", "elo", "ui_script_dashboards",
+        "companion",
+        "envfile", "setup_cmds",
+        "client",
+        "eval_suites", "evals", "ui_script_evals",
+        "intents",
         # ---- extension modules: one name per feature module, above this line ---- #
     }
     _found = {p.stem for p in _pkg_dir.glob("*.py")} - {"__init__", "__main__"}
@@ -2101,6 +2109,9 @@ def selftest() -> int:
     for _name, _payload in _prov.items():
         _pdb = Database(Path(_agtf.mkdtemp()) / f"{_name}.db")
         _pim = ImportManager(Config(), _pdb)
+        # Staged next to the temp database, like the zip-slip check above:
+        # unpointed, every selftest left four upload.zip folders in data/imports.
+        _pim._staging = (lambda iid, _base=Path(_pdb.db_path).parent: _base / iid)  # type: ignore
         _pbuf = _io.BytesIO()
         with _zip.ZipFile(_pbuf, "w") as _pz:
             _pz.writestr("conversations.json", json.dumps(_payload))

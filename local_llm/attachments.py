@@ -447,6 +447,76 @@ class AttachmentStore:
             log(f"Attachment {att_id}: file not removed ({exc}).", logging.WARNING)
         return True
 
+    def delete_where(self, user_id: str, conversation_id: str | None = None) -> int:
+        """Remove a user's attachments, rows and files: all of them, or only
+        those uploaded into `conversation_id`. Returns how many rows went."""
+        self._ready()
+        sql = "SELECT * FROM attachments WHERE user_id = ?"
+        args: list[Any] = [str(user_id)]
+        if conversation_id is not None:
+            sql += " AND conversation_id = ?"
+            args.append(str(conversation_id))
+        rows = [dict(r) for r in self.db.execute(sql, tuple(args)).fetchall()]
+        for row in rows:
+            self.db.execute("DELETE FROM attachments WHERE id = ?", (row["id"],))
+        self.db.commit()
+        for row in rows:
+            try:
+                self.path_of(row).unlink(missing_ok=True)
+            except (LookupError, OSError) as exc:
+                log(f"Attachment {row['id']}: file not removed ({exc}).", logging.WARNING)
+        if conversation_id is None:
+            try:
+                self._user_dir(user_id).rmdir()   # only when empty: never a sweep
+            except OSError:
+                pass
+        return len(rows)
+
+
+def _att_delete_user(db: Any, user_id: str) -> None:
+    """Database.delete_user hook: the account's uploads, rows and files."""
+    AttachmentStore(db, _ATT_RUNTIME.get("config")).delete_where(user_id)
+
+
+register_user_cleanup(ATTACHMENTS_SCHEMA_NAME, _att_delete_user)
+
+
+def delete_conversation_attachments(db: Any, user_id: str, conversation_id: str) -> int:
+    """The attachments a user uploaded into a conversation they are deleting."""
+    return AttachmentStore(db, _ATT_RUNTIME.get("config")).delete_where(
+        user_id, conversation_id=str(conversation_id))
+
+
+def link_attachments_to_conversation(db: Any, user_id: str, ids: list[str],
+                                     conversation_id: str | None) -> int:
+    """Attach the caller's unlinked uploads to the conversation a turn runs in.
+
+    The composer uploads a file before the chat request exists, so the row is
+    stored with conversation_id NULL and stayed that way: the conversation's
+    attachment list was empty, deleting the conversation left the file behind,
+    and "the file I sent earlier" had nothing to resolve to. The chat route
+    calls this once it knows the turn's conversation. Only rows owned by
+    `user_id` and still unlinked are touched: an upload already filed under a
+    conversation keeps it (re-sending it elsewhere never moves it), and another
+    user's id changes nothing. Returns how many rows were linked.
+    """
+    wanted = sorted({str(i).strip() for i in (ids or ()) if _ATT_ID_RE.match(str(i).strip())})
+    if not wanted or not conversation_id or not str(user_id or ""):
+        return 0
+    store = AttachmentStore(db, _ATT_RUNTIME.get("config"))
+    store._ready()
+    marks = ",".join("?" for _ in wanted)
+    cur = db.execute(
+        f"UPDATE attachments SET conversation_id = ? WHERE id IN ({marks}) "
+        "AND user_id = ? AND conversation_id IS NULL",
+        (str(conversation_id)[:64], *wanted, str(user_id)))
+    db.commit()
+    linked = max(0, int(getattr(cur, "rowcount", 0) or 0))
+    if linked:
+        log_event(_att_logger, logging.DEBUG, "attachments.linked", user_id=user_id,
+                  conversation_id=str(conversation_id), count=linked)
+    return linked
+
 
 # --------------------------------------------------------------------------- #
 # Content parts for a chat turn
@@ -689,12 +759,15 @@ __all__ = [
     '_AttRequest',
     '_att_cfg',
     '_att_clean_name',
+    '_att_delete_user',
     '_att_multipart_available',
     '_att_public',
     '_att_schema',
     'attachment_headers',
     'attachment_text',
     'content_parts_for',
+    'delete_conversation_attachments',
+    'link_attachments_to_conversation',
     'read_upload',
     'register_attachments',
     'sniff_attachment',

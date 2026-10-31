@@ -152,8 +152,10 @@ UI_JS_PANELS = r"""   // ---------------------------------------------------- hi
      // Same reason as newChat: a turn still streaming into the chat we are
      // about to clear keeps running against detached nodes, leaves Send
      // disabled, and charges its tokens and its feedback bar to whichever
-     // conversation happens to be open when it finishes.
-     stopStream();
+     // conversation happens to be open when it finishes. Reopening the SAME
+     // conversation only lets go of the stream: the turn keeps running on
+     // the server and is re-attached below, from its first event.
+     stopStream({ detach: id === conversationId });
      var quiet = !!(opts && opts.quiet);
      try {
        var r = await fetchJSON("/api/conversation/" + encodeURIComponent(id));
@@ -163,10 +165,20 @@ UI_JS_PANELS = r"""   // ---------------------------------------------------- hi
        safeStorageSet("llm_conversation", id);
        chat.innerHTML = "";
        var lastAnswer = null;
+       var lastUser = "";
        msgs.forEach(function(m) {
          if (m.role !== "user" && m.role !== "assistant") return;
          var div = addMessage(m.role, m.content || "");
-         if (m.role === "assistant") lastAnswer = div;
+         // meta: the stored reasoning, tools and stopped marker of an answer
+         // (and the attachment ids of a question, when the server keeps them).
+         if (m.role === "assistant") {
+           lastAnswer = div;
+           lastUser = "";   // answered: a running turn's question is not stored yet
+           chatReplayMeta(div, m.meta);
+         } else {
+           lastUser = m.content || "";
+           if (m.meta && m.meta.attachments) chatRenderMsgAtts(div, m.meta.attachments);
+         }
        });
        if (lastAnswer) setRegenerateTarget(lastAnswer.querySelector(".msg-actions"));
        if (!msgs.length) showChatEmpty();
@@ -175,6 +187,11 @@ UI_JS_PANELS = r"""   // ---------------------------------------------------- hi
        updateContextMeter(0);
        if (!quiet) showView("chat");
        scrollDown(true);
+       // A turn still running for this conversation (the page was reloaded
+       // mid-answer, or the answer is coming in another tab) is followed
+       // live again, and prompts waiting on this user get their cards back.
+       chatResumeActive(id, lastUser);
+       chatLoadPendingDecisions();
      } catch (err) {
        if (!quiet) { uiToast("Could not open conversation: " + err.message, "error"); return; }
        // Boot replay of an id the server does not know for this user (another
@@ -186,6 +203,9 @@ UI_JS_PANELS = r"""   // ---------------------------------------------------- hi
        }
        chat.innerHTML = "";
        showChatEmpty();
+       // A fresh page still owes this user the prompts their other turns
+       // are waiting on (a scheduled task, another tab, another conversation).
+       chatLoadPendingDecisions();
      }
    }
 

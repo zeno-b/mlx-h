@@ -118,6 +118,24 @@ def get_acting_conversation() -> str | None:
     return _acting_conversation.get()
 
 
+def dash_request_user_id(request) -> str | None:
+    """Best-effort acting user id for request-lifecycle logs.
+
+    Auth dependencies (``require_user``) attach the resolved user to
+    ``request.state.user``. The middleware cannot rely on the logging
+    contextvar for this: the auth dependency binds into a *child* context
+    that does not flow back out. Unauthenticated or pre-auth failures
+    simply have no user. Never raises: logging must not take down ASGI.
+    """
+    try:
+        user = getattr(getattr(request, "state", None), "user", None)
+        if isinstance(user, dict):
+            return user.get("id")
+    except Exception:
+        pass
+    return None
+
+
 def new_correlation_id() -> str:
     """A fresh short, URL-safe correlation id."""
     return uuid.uuid4().hex[:16]
@@ -273,8 +291,13 @@ class ContextFilter(logging.Filter):
         # Promote a few common context fields to top-level attributes so both
         # the JSON and text formatters can show them without extra work.
         ctx = record.context
-        record.user_id = ctx.get("user_id")
-        record.route = ctx.get("route")
+        # An explicit field wins over the bound context: the request middleware
+        # logs http.request with the caller it read from request.state, while
+        # its own context never learns the user (auth binds in a child context).
+        # Overwriting it here dropped user_id from every JSON and sink record.
+        own = record.__dict__
+        record.user_id = own.get("user_id") or ctx.get("user_id")
+        record.route = own.get("route") or ctx.get("route")
         record.event = getattr(record, "event", ctx.get("event"))
         return True
 
@@ -420,6 +443,9 @@ class EventSink(logging.Handler):
         user_id = getattr(record, "user_id", None) or fields.get("user_id")
         if user_id:
             fields["user_id"] = user_id
+        route = getattr(record, "route", None)
+        if route and "route" not in fields:
+            fields["route"] = self._clip(route)
         # log_event already redacted its own fields; context values (bound by
         # middleware and dependencies) were not, so scrub the merged set once.
         item["fields"] = redact_obj(fields)
@@ -709,6 +735,7 @@ __all__ = [
     "get_acting_user",
     "set_acting_conversation",
     "get_acting_conversation",
+    "dash_request_user_id",
     "bind_context",
     "reset_context",
     "clear_context",

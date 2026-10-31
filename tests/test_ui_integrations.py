@@ -81,7 +81,7 @@ def test_panels_sit_in_their_sub_tabs():
         later = [html.find(f'data-sub="{t}">', sub_at + 1) for t in tools if t != sub]
         end = min([i for i in later if i > sub_at] + [html.index("</section>", sub_at)])
         assert sub_at < panel_at < end, (sub, panel)
-    agent = html[html.index('data-section="agent"'):]
+    agent = html[re.search(r'<section[^>]*data-section="agent"', html).start():]
     agent = agent[:agent.index("</section>")]
     assert 'data-panel="projects"' in agent
 
@@ -135,8 +135,8 @@ def test_admin_only_blocks_inside_user_panels():
         'id="integTokAllWrap"')[0].rsplit("<", 1)[1]
     policies = _panel("policies")
     for scope in ("profile", "global"):
-        assert re.search(r'<button type="button" class="admin-only" data-value="%s"' % scope,
-                         policies), scope
+        assert re.search(r'<button type="button" class="btn-sm admin-only" data-value="%s"'
+                         % scope, policies), scope
     projects = _panel("projects")
     assert re.search(r'class="[^"]*admin-only[^"]*"[^>]*id="integProjSharedWrap"', projects) or \
         re.search(r'id="integProjSharedWrap"[^>]*class="[^"]*admin-only', projects)
@@ -150,7 +150,7 @@ def test_script_dialect_and_conventions():
     assert "alert(" not in code
     assert not re.search(r"(?<![\w.])confirm\(", code), "confirm() instead of uiConfirm"
     assert "innerHTML = text" not in code
-    assert not re.search(r"\.innerHTML\s*=\s*(?!\"\")", code), "innerHTML with content"
+    assert not re.search(r'\.innerHTML\s*=(?!\s*"")', code), "innerHTML with content"
     for bad in ("<script>", "</script>", "<style>", "</style>"):
         assert bad not in UI_JS_INTEGRATIONS
     assert "\\\\n" not in UI_JS_INTEGRATIONS

@@ -30,7 +30,9 @@ from .tools import *  # noqa: F401,F403
 from .llm import *  # noqa: F401,F403
 from .model_client import *  # noqa: F401,F403
 from .textutil import *  # noqa: F401,F403
+from .intents import *  # noqa: F401,F403
 from .codecheck import check_code, findings_note
+from .cloud import cloud_preflight
 from .taskstate import *  # noqa: F401,F403
 from .toolparse import *  # noqa: F401,F403
 from .turnctx import *  # noqa: F401,F403
@@ -112,6 +114,23 @@ def _ag_turn_fields() -> dict:
     """
     turn = current_turn()
     return {"turn_id": turn.turn_id} if turn is not None and turn.turn_id else {}
+
+
+def _ag_stamp_queue(stats: Any) -> Any:
+    """`stats` with queue_ms set to the turn's admission wait.
+
+    The chat route measures how long the turn waited for a generation slot and
+    leaves it on the TurnContext (extras["queue_ms"]); the model calls in here
+    never see that wait, so their usage events reported 0 for it. Every step
+    of the turn carries the same value: it is the turn's wait, not the step's.
+    """
+    turn = current_turn()
+    if turn is not None and not getattr(stats, "queue_ms", 0):
+        try:
+            stats.queue_ms = float(turn.extras.get("queue_ms") or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            pass
+    return stats
 
 
 def _ag_join_reasoning(parts: "list[tuple[int, str]]") -> str:
@@ -203,6 +222,11 @@ class _AgLane:
         self.reasoning: list[str] = []
         self.cancelled = False
         self.timed_out = False
+        # Reasoning budget (THINK_MAX_TOKENS): characters of <think> text so far,
+        # whether the latest piece was reasoning, and whether the cap stopped it.
+        self.think_chars = 0
+        self.thinking_now = False
+        self.think_capped = False
         self.stop = False                 # a complete call arrived: stop streaming
         self.calls: dict[int, dict] = {}  # detector index -> call state
         self.ended: list[int] = []        # indexes whose call completed, in order
@@ -268,6 +292,283 @@ ESCALATION_TOOLS = {
 }
 
 
+# --------------------------------------------------------------------------- #
+# Intents (upgrade/ROUTING_AND_TOOLING.md P1, P2, P4, P5): the app's own words
+# pick the lane before any model does, and retrieval, attachments and document
+# turns follow what was understood.
+# --------------------------------------------------------------------------- #
+
+# Intents under which a skill may still be autoloaded by word overlap. The
+# others are about the app's own records (save a skill, remember a note, search
+# history), where "add this to skills" overlapping some skill's summary loads a
+# procedure for a task nobody asked for.
+_AG_AUTOLOAD_INTENTS = frozenset({
+    "skill_use", "codebase_review", "codebase_lookup", "kb_query", "kb_overview",
+    "document_create"})
+
+# The research tools that need the network. A document turn researching its
+# knowledge base needs no connection; one researching the web does.
+_AG_WEB_TOOLS = frozenset({"web_search", "fetch_url"})
+
+# Words that ask for more than one pass at a document. Without one, the first
+# successful create_document ends the turn (P5): conversation 2 wrote the same
+# PDF five times from one passage, each "revision" a fresh guess.
+_AG_REVISION_ASK = re.compile(
+    r"(?i)\b(?:revis\w*|iterat\w*|refine\w*|polish\w*|proofread\w*|"
+    r"(?:second|another|two|2)\s+(?:pass|passes|draft|drafts|version|versions)|"
+    r"improve\s+(?:it|on\s+it|the\s+draft)|"
+    r"draft\s+(?:it\s+)?(?:and|then)\s+(?:improve|revise|review|refine))\b")
+
+# Told to the model when a step spent its reasoning budget (THINK_MAX_TOKENS)
+# without reaching an answer. Two wordings for the same reason REASONING and
+# PROSE_REASONING differ: the prose lane must not be reminded of tool JSON.
+_AG_THINK_CAP_TOOLS = (
+    "That is enough reasoning. Using what you worked out above, reply now with only "
+    "the answer, or, if you still need a tool, only the single JSON tool call. Do "
+    "not think out loud again and do not use <think> tags.")
+_AG_THINK_CAP_PROSE = (
+    "That is enough reasoning. Using what you worked out above, reply now with only "
+    "the answer in plain text. Do not think out loud again and do not use <think> "
+    "tags.")
+
+# What a file attached to the turn is, for the one-line summary the router and
+# the intent rules read instead of the raw text.
+_AG_FILE_KINDS = {
+    ".md": "markdown", ".markdown": "markdown", ".txt": "text", ".pdf": "pdf",
+    ".docx": "word document", ".doc": "word document", ".xlsx": "spreadsheet",
+    ".xls": "spreadsheet", ".csv": "csv", ".tsv": "tsv", ".json": "json",
+    ".ipynb": "notebook", ".py": "python", ".html": "html", ".htm": "html",
+    ".yaml": "yaml", ".yml": "yaml", ".pptx": "presentation", ".xml": "xml",
+}
+# The header attachments.content_parts_for puts on each text part.
+_AG_ATTACHED_HEAD = re.compile(
+    r"\A\[(?:attached file|voice message from the user, transcribed): ([^\]\n]{1,200})\]"
+    r"[ \t]*\n?")
+_AG_FRONTMATTER = re.compile(r"\A\s*---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.S)
+
+# What the drafted save_skill call puts in "body" (P4). A 3B model asked to
+# copy six kilobytes of skill text into a JSON string truncates it, escapes it
+# wrongly or summarises it; the file is already on the turn, so the call
+# carries this marker and the agent puts the text back before it runs.
+_AG_ATTACHMENT_BODY = "<the attached file>"
+
+
+def _ag_frontmatter(text: str) -> tuple[dict, str]:
+    """(frontmatter mapping, body) of SKILL.md-style text; ({}, text) without one."""
+    match = _AG_FRONTMATTER.match(text or "")
+    if not match:
+        return {}, (text or "").strip()
+    meta: dict = {}
+    for line in match.group(1).splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key.strip() and not key.lstrip().startswith("#"):
+            meta[key.strip().lower()] = value.strip().strip("'\"")
+    return meta, text[match.end():].strip()
+
+
+def _ag_size(chars: int) -> str:
+    """6012 -> "6 KB": a size a person reads, not a byte count."""
+    if chars < 1024:
+        return f"{chars} bytes"
+    if chars < 1024 * 1024:
+        return f"{max(1, round(chars / 1024))} KB"
+    return f"{chars / (1024 * 1024):.1f} MB"
+
+
+def _ag_attachments(attachments: Any) -> list[dict]:
+    """One record per attached file: name, kind, size, frontmatter and its text.
+
+    Read from the text parts the route built (attachments.content_parts_for
+    heads each with "[attached file: <name>]"); an image part counts as an
+    image with no text. Never raises: a part this does not understand is
+    skipped, the way _ag_split_attachments skips it.
+    """
+    out: list[dict] = []
+    for part in attachments or ():
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        if kind in ("image_url", "input_image", "image"):
+            out.append({"name": "image", "kind": "image", "size": 0, "meta": {},
+                        "text": ""})
+            continue
+        if kind != "text":
+            continue
+        raw = str(part.get("text") or "")
+        head = _AG_ATTACHED_HEAD.match(raw)
+        name = head.group(1).strip() if head else "attachment"
+        text = raw[head.end():] if head else raw
+        if not text.strip():
+            continue
+        meta, _body = _ag_frontmatter(text)
+        suffix = Path(name).suffix.lower()
+        out.append({"name": name,
+                    "kind": _AG_FILE_KINDS.get(suffix, suffix.lstrip(".") or "text"),
+                    "size": len(text.encode("utf-8", "replace")), "meta": meta,
+                    "text": text})
+    return out
+
+
+def _ag_attachment_summary(files: list[dict]) -> str:
+    """"[attached: devils-advocate.md, markdown, 6 KB, frontmatter name=devils-advocate]".
+
+    One line per file. The router used to decide on the 8-token message alone
+    ("add this to skills") and answered `answer`, which rebuilt the prompt with
+    no tools at all; this line is what tells it there is a file and what it is.
+    """
+    lines = []
+    for f in files:
+        bits = [f["name"], f["kind"]]
+        if f["size"]:
+            bits.append(_ag_size(f["size"]))
+        if f["meta"].get("name"):
+            bits.append(f"frontmatter name={str(f['meta']['name'])[:60]}")
+        lines.append("[attached: " + ", ".join(bits) + "]")
+    return "\n".join(lines)
+
+
+def _ag_skill_draft(files: list[dict]) -> dict | None:
+    """save_skill arguments drafted from an attached SKILL.md, or None.
+
+    Needs frontmatter with both a name and a description, which is what makes
+    the file a skill rather than a document that happens to be Markdown.
+    """
+    for f in files:
+        meta = f["meta"]
+        name = re.sub(r"[^a-z0-9]+", "-", str(meta.get("name") or "").lower()).strip("-")
+        description = re.sub(r"\s+", " ", str(meta.get("description") or "")).strip()
+        _meta, body = _ag_frontmatter(f["text"])
+        if name and description and body:
+            # The description whole: it is the user's own one-line summary and
+            # the skill catalogue shows it as written. Bounded only so a pasted
+            # essay in the frontmatter cannot crowd the drafted call.
+            return {"name": name[:64], "description": description[:1000], "body": body,
+                    "file": f["name"]}
+    return None
+
+
+# A token of the message that names a file or a folder: it carries a path
+# separator, an extension or a joining character ("book-to-skill.md",
+# "docs/onboarding", "devils-advocate"). A plain word never does, which is the
+# point: "skills" named no file, and matching it against paths admitted 3467
+# of 3473 indexed documents.
+# Split into runs first and tested second, so a long paste is read in one
+# linear pass rather than backtracked over.
+_AG_PATHISH = re.compile(r"[\w.\-/]+")
+_AG_JOINED = re.compile(r"[^\W_][./\-_][^\W_]")
+
+
+def _ag_named_paths(message: str) -> list[str]:
+    """Path-like tokens of a message, lowercased, URLs left out."""
+    text = re.sub(r"(?i)\bhttps?://\S+", " ", message or "")
+    out = []
+    for token in _AG_PATHISH.findall(text.lower()):
+        token = token.strip("./-_")
+        if (len(token) >= 4 and _AG_JOINED.search(token)
+                and not token.replace(".", "").isdigit()):
+            out.append(token)
+    return out
+
+
+def _ag_path_named(path: str, named: list[str]) -> bool:
+    """Whether the user named this indexed path (or a folder on it)."""
+    low = str(path or "").lower()
+    return any(token in low for token in named)
+
+
+def _ag_doc_key(path: Any) -> str:
+    """A create_document path normalised for the same-path check."""
+    text = str(path or "").strip().replace("\\", "/").lower()
+    while text.startswith("./"):
+        text = text[2:]
+    return text
+
+
+def _ag_fill_skill(args: Any, draft: dict) -> dict:
+    """save_skill arguments with the drafted skill's gaps filled in.
+
+    The body becomes the attached file's text when the model sent the marker,
+    nothing, or a short stand-in for it; a body the model really wrote (most
+    of the file's length) is kept. A missing name or description comes from
+    the frontmatter.
+    """
+    out = dict(args) if isinstance(args, dict) else {}
+    body = str(out.get("body") or "").strip()
+    marker = body.strip("<>\"' ").lower()
+    if (not body or marker in ("the attached file", "attached file", "attachment",
+                                "the attachment", "the attached file's text")
+            or len(body) < min(200, len(draft["body"]) // 2)):
+        out["body"] = draft["body"]
+    if not str(out.get("name") or "").strip():
+        out["name"] = draft["name"]
+    if not str(out.get("description") or "").strip():
+        out["description"] = draft["description"]
+    return out
+
+
+def _ag_not_offered(name: str, offered: "frozenset[str] | None") -> tuple[str, str] | None:
+    """(result, error) for a call to a tool this turn's intent did not offer.
+
+    None when the turn is not narrowed or the tool is one it offered. The
+    text names the tools that are available, so the model's next step is a
+    real one instead of the same call again.
+    """
+    if not offered or name in offered:
+        return None
+    usable = ", ".join(sorted(n for n in offered if n != "final_answer")) or "none"
+    note = (f"{name} is not available for this request, so it was not run. The tools "
+            f"for this request are: {usable}. Use one of them, or answer the user "
+            "with what you already have.")
+    return note, f"{name} is not offered for this request"
+
+
+def _ag_rewrite_refusal(path: str) -> tuple[str, str]:
+    """(result, error) for a second create_document to a path written this turn."""
+    note = (f"{path} was already created in this turn, so it was not written again. "
+            "Answer the user now in one or two sentences about what it contains.")
+    return note, "the document was already written this turn"
+
+
+def _ag_document_done(path: str, content: str, name: str) -> str:
+    """The closing reply of a document turn: what was made and what is in it.
+
+    Built from the Markdown the model handed to create_document, with no model
+    call: the headings are the document's own table of contents, and a 3B model
+    asked to describe a file it just wrote tends to describe a different one.
+    """
+    bullets: list[str] = []
+
+    def add(text: str) -> None:
+        text = re.sub(r"[*_`#>|]+", "", text)
+        text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+        text = re.sub(r"\s+", " ", text).strip(" :-")
+        if len(text) > 110:
+            text = text[:107].rstrip() + "..."
+        if text and text.lower() not in (b.lower() for b in bullets):
+            bullets.append(text)
+
+    lines = (content or "").splitlines()
+    for line in lines:
+        m = re.match(r"^\s{0,3}#{2,3}\s+(.+)$", line)
+        if m:
+            add(m.group(1))
+    if len(bullets) < 2:
+        for line in lines:
+            if len(bullets) >= 4:
+                break
+            stripped = line.strip()
+            if (not stripped or stripped.startswith(("#", "|", "```", "---"))
+                    or re.match(r"^[-*+]\s*$", stripped)):
+                continue
+            stripped = re.sub(r"^(?:[-*+]|\d+[.)])\s+", "", stripped)
+            add(re.split(r"(?<=[.!?])\s", stripped, maxsplit=1)[0])
+    shown = Path(str(path or "")).name or "the document"
+    reply = f"I created **{shown}** ({name})."
+    if bullets:
+        reply += " It covers:\n\n" + "\n".join(f"- {b}" for b in bullets[:4])
+    return reply
+
+
 class Agent:
     """A ReAct-style loop over the local model.
 
@@ -304,7 +605,7 @@ class Agent:
                           cancel: "asyncio.Event | None" = None,
                           token_type: str = "token", think_type: str = "think_token",
                           deadline: float | None = None, stats: Any = None,
-                          known: "set[str] | None" = None):
+                          known: "set[str] | None" = None, think_cap: int = 0):
         """Stream one generation, splitting reasoning, answer and tool calls.
 
         Every lane that streams model text comes through here. Only the main
@@ -324,9 +625,16 @@ class Agent:
         and closing the stream. Cancellation and the deadline are reported on
         the lane (cancelled / timed_out) because every lane words them its
         own way.
+
+        `think_cap` (tokens, 0 = none) stops the stream once that much reasoning
+        has arrived while the model is still reasoning, and sets
+        lane.think_capped; the caller decides what to ask next. Counted in
+        characters (CHARS_PER_TOKEN each) so the cap means the same thing
+        whatever size of chunk a server streams.
         """
         splitter = ThinkSplitter()
         started = time.time()
+        cap_chars = max(0, int(think_cap or 0)) * CHARS_PER_TOKEN
         async for token in stream:
             if cancel is not None and cancel.is_set():
                 lane.cancelled = True
@@ -338,6 +646,9 @@ class Agent:
                                          token_type, think_type, known):
                 yield event
             if lane.stop:
+                break
+            if cap_chars and lane.thinking_now and lane.think_chars >= cap_chars:
+                lane.think_capped = True
                 break
             if deadline is not None and time.time() - started > deadline:
                 lane.timed_out = True
@@ -360,8 +671,10 @@ class Agent:
         for kind, piece in pieces:
             if not piece:
                 continue
+            lane.thinking_now = kind == "think"
             if kind == "think":
                 lane.reasoning.append(piece)
+                lane.think_chars += len(piece)
                 out.append({"type": think_type, "token": piece, "step": step})
             elif lane.detector is None:
                 lane.answer.append(piece)
@@ -558,6 +871,34 @@ class Agent:
         return (action, str(_ag_field(decision, "risk", "") or ""),
                 str(_ag_field(decision, "reason", "") or ""), decision)
 
+    def _ag_confirm_waived(self, turn: Any, decision: Any) -> bool:
+        """True when the user already answered "don't ask me" for this call.
+
+        Intent.confirm_tools re-asks about a call the policy allows (a drafted
+        skill, a codebase_write turn's write_file/edit_file). Two allows are
+        the user's own answer and a confirmation on top would ask again what
+        they just settled: the header's Approvals control showing Don't ask
+        (the always-visible setting the "ask before every action" rule
+        names), and an "always allow" row they wrote from an earlier card
+        (scope tool or conversation, rule "user:..." / "conversation:...").
+        A policy without approval_state (a test's stand-in) waives nothing.
+        """
+        rule = str(_ag_field(decision, "rule", "") or "")
+        if rule.startswith(("user:", "conversation:")):
+            return True
+        policy = _ag_policy()
+        state_of = getattr(policy, "approval_state", None) if policy is not None else None
+        user_id = getattr(turn, "user_id", None)
+        if not callable(state_of) or not user_id:
+            return False
+        try:
+            state = state_of(getattr(self.registry, "config", None) or self.config,
+                             getattr(self.registry, "db", None), user_id)
+        except Exception as exc:  # noqa: BLE001 - keep asking when unsure
+            log(f"approvals state unreadable ({exc}); confirming as before.", logging.DEBUG)
+            return False
+        return isinstance(state, dict) and state.get("effective") == "off"
+
     def _ag_unattended(self, name: str, args: dict, turn: Any) -> str:
         """allow | deny for an "ask" that nobody can answer.
 
@@ -652,7 +993,8 @@ class Agent:
                         announce: bool = True, runner: Any = None,
                         cancel: "asyncio.Event | None" = None,
                         before_run: "list[dict] | None" = None,
-                        short_circuit: "tuple[str, str | None] | None" = None):
+                        short_circuit: "tuple[str, str | None] | None" = None,
+                        confirm: bool = False):
         """Run one tool call: announce it, consult the policy, maybe a human, run it.
 
         The one place a tool call is executed from, for every lane (main loop,
@@ -672,6 +1014,16 @@ class Agent:
         `runner(args) -> (result, error)` replaces the registry call for the
         actions that are not registry tools (delegate_task). `short_circuit`
         reports a result without running or asking (the dedup guard).
+
+        `confirm` is the turn's intent saying this call needs the user's OK
+        (Intent.confirm_tools: saving a skill drafted from an attachment). In
+        an interactive turn a call the policy would simply allow is put to the
+        person through the same approval card, so they see the drafted
+        arguments and can edit them, whatever TOOL_APPROVAL_MODE says, unless
+        the user already said not to be asked (_ag_confirm_waived: Approvals
+        at Don't ask, or their own "always allow" row). It is a
+        confirmation, not a safety gate: with nobody watching, or no approval
+        service to ask through, the policy's own answer stands.
         """
         outcome = _AgDispatched(call_id or _ag_call_id(), name, args)
         extra = dict(extra or {})
@@ -688,6 +1040,39 @@ class Agent:
 
         turn = current_turn()
         action, risk, reason, decision = await self._ag_decide(name, args, turn)
+        confirming = False
+        # Overwrite guard: write_file on an existing file is put to the user
+        # on the approval card (path, size before -> after, diff stat, the
+        # drafted content editable), even when a policy rule would allow
+        # writes, unless their always-visible Approvals setting is Don't ask.
+        # Only the policy's deny is final. A yes is recorded on the turn so
+        # the registry's guard lets exactly that write through.
+        overwrite = (await self._ag_overwrite_card(name, args, turn)
+                     if action != "deny" and runner is None else None)
+        if overwrite is not None:
+            policy = _ag_policy()
+            if policy is not None and getattr(policy, "BROKER", None) is not None:
+                # confirming only when the policy itself allowed: a card that
+                # cannot be shown then leaves the policy's answer (and the
+                # registry's guard) in charge rather than refusing outright.
+                confirming = action == "allow"
+                action, risk = "ask", risk or "write"
+                reason = overwrite["card"]
+            else:
+                overwrite = None
+        if (confirm and action == "allow" and turn is not None
+                and getattr(turn, "interactive", False)
+                and not self._ag_confirm_waived(turn, decision)):
+            policy = _ag_policy()
+            if policy is not None and getattr(policy, "BROKER", None) is not None:
+                action, confirming = "ask", True
+                risk = risk or "write"
+                # The policy's own reason explains an allow ("tool approvals
+                # are off"), which read as the reason for asking on the card.
+                # A file write (codebase_write) names the file, not a "save".
+                reason = (f"check this change to {args.get('path') or 'the file'} before it runs"
+                          if name in ("write_file", "edit_file")
+                          else "check what will be saved before it runs")
         if action == "ask" and (turn is None or not getattr(turn, "interactive", True)):
             action = self._ag_unattended(name, args, turn)
             outcome.decided_by = "policy"
@@ -704,17 +1089,34 @@ class Agent:
                 except Exception as exc:  # noqa: BLE001
                     log(f"could not open an approval for {name} ({exc}).",
                         logging.WARNING)
-            if not approval_id:
+            if not approval_id and confirming:
+                # Only the intent asked, and the policy allows the call: a
+                # confirmation that cannot be shown is not a refusal.
+                action = "allow"
+            elif not approval_id:
                 # Fail closed: the policy said a person must agree, and there
                 # is no way to ask one.
                 action, outcome.decided_by = "deny", "policy"
                 reason = "it needs approval and the approval service is unavailable"
             else:
                 timeout = self._ag_approval_timeout(decision, broker)
+                # A confirmation is about THIS call's drafted arguments, so it
+                # offers no "always" scope: one would write a standing policy
+                # row the intent then overrides on the next turn anyway.
                 ask = {"type": "approval_required", "id": approval_id,
                        "call_id": outcome.call_id, "name": name, "args": args,
                        "risk": risk, "reason": reason, "step": step,
-                       "expires_in": timeout, "scopes": ["once", "conversation", "tool"]}
+                       "expires_in": timeout,
+                       "scopes": (["once"] if confirming or overwrite is not None
+                                  else ["once", "conversation", "tool"])}
+                if confirming:
+                    ask["confirm"] = True
+                if overwrite is not None:
+                    # The numbers behind the card text, for a client that
+                    # wants to lay them out itself.
+                    ask["overwrite"] = {k: overwrite[k] for k in (
+                        "path", "before", "after", "delta", "lines_added",
+                        "lines_removed", "destructive", "most", "alternative")}
                 if self._ag_nested:
                     turn.send(ask)
                 yield ask
@@ -745,6 +1147,12 @@ class Agent:
                             yield {"type": "tool_call", "id": outcome.call_id,
                                    "name": name, "args": edited, "step": step,
                                    "edited": True, **extra}
+                    if overwrite is not None:
+                        # The yes covers the arguments that will run (edited
+                        # or not), so the registry's guard lets this write by.
+                        approve = getattr(self.registry, "approve_overwrite", None)
+                        if callable(approve):
+                            approve(outcome.args, turn)
                 else:
                     action = "deny"
                     if how == "error":
@@ -836,12 +1244,15 @@ class Agent:
     async def forced_prose_answer(self, history: list[dict], user_message: str,
                                   reserve: int, temperature: float | None,
                                   task: "TaskState | None" = None,
-                                  stats: "GenerationStats | None" = None) -> str:
+                                  stats: "GenerationStats | None" = None,
+                                  retrieval: str = "auto") -> str:
         """One last tool-free pass, on the prose prompt.
 
         Used when a step produced nothing usable -- an empty reply, or a tool
         call the model never filled in. The alternative was returning "" and
-        rendering a blank assistant turn.
+        rendering a blank assistant turn. `retrieval` is the turn's intent rule
+        (with_retrieved_context), so the last-resort pass does not pull in the
+        passages the turn itself had ruled out.
         """
         # The forced pass is a last resort, which is exactly when the active
         # task matters most: without the brief this lane answered from the bare
@@ -850,7 +1261,8 @@ class Agent:
         base, _ = self.build_base(history, user_message, reserve, tools=False,
                                   extra_context=brief,
                                   active_code_task=bool(brief and task
-                                                        and task.is_code_task()))
+                                                        and task.is_code_task()),
+                                  retrieval=retrieval)
         nudge = [{"role": "user", "content":
                   "Answer the question above directly, in plain text. Do not output "
                   "JSON and do not call any tool."}]
@@ -1609,7 +2021,7 @@ class Agent:
         tail = partial[-600:]
         system = build_plain_system_prompt(
             self.config.system_prompt_with_identity,
-            reasoning=self.config.reasoning_visible)
+            reasoning=reasoning_prompt_wanted(self.config))
         messages = [{"role": "system", "content": system}]
         if request:
             messages.append({"role": "user", "content": request})
@@ -1680,7 +2092,7 @@ class Agent:
             # that in its first token, and stripping it welded "part one" onto
             # "and part two".
             extra = reasoned.rstrip()
-        yield {"type": "usage", "step": 1, **stats.as_event()}
+        yield {"type": "usage", "step": 1, **_ag_stamp_queue(stats).as_event()}
         if not extra:
             yield {"type": "notice", "info": True,
                    "message": "the model had nothing more to add"}
@@ -1717,9 +2129,122 @@ class Agent:
             **_ag_turn_fields(),
         }
 
+    # --- Intents (upgrade/ROUTING_AND_TOOLING.md P1) ---------------------- #
+    def understand(self, message: str, *, history: list[dict] | None = None,
+                   attachments: Any = None,
+                   files: "list[dict] | None" = None) -> "Intent | None":
+        """What the message asks for in the app's own terms, or None.
+
+        intents.classify reads the UI vocabulary (knowledge base, codebase,
+        skills, memory, history, ...) deterministically, before the router.
+        Everything it decides is checked against this agent's registry here: a
+        tools lane whose tools are all unregistered under the running config is
+        no lane at all, and the turn goes down the existing pipeline instead of
+        being sent to a prompt with nothing to call. A failing rule set never
+        breaks a turn; it routes as before.
+        """
+        files = files if files is not None else _ag_attachments(attachments)
+        try:
+            intent = classify(
+                message,
+                has_attachment=bool(attachments),
+                attachment_names=tuple(f["name"] for f in files),
+                has_history=bool(history),
+                project_basename=self._ag_project_basename(),
+                registered_tools=frozenset(self.registry.names()),
+                enabled=bool(getattr(self.config, "intent_lexicon_enabled", True)))
+        except Exception as exc:  # noqa: BLE001 - the lexicon is an aid, not a gate
+            log(f"intent rules failed ({type(exc).__name__}: {exc}); routing as before.",
+                logging.WARNING)
+            return None
+        if intent is None:
+            return None
+        lane = str(getattr(intent, "lane", "") or "")
+        if lane not in INTENT_LANES:
+            log(f"intent {getattr(intent, 'name', '?')!r} named an unknown lane "
+                f"{lane!r}; routing as before.", logging.WARNING)
+            return None
+        if lane == "tools" and not [n for n in self.intent_tools(intent)
+                                    if n != "final_answer"]:
+            log(f"intent {intent.name!r}: none of its tools are registered here; "
+                "routing as before.", logging.INFO)
+            return None
+        return intent
+
+    def intent_tools(self, intent: "Intent") -> list[str]:
+        """The intent's tool subset: registered tools only, final_answer always included."""
+        names = list(intent.tool_subset or INTENT_TOOL_SUBSETS.get(intent.name, ()))
+        names.append("final_answer")
+        seen: set[str] = set()
+        return [n for n in names
+                if self.registry.get(n) is not None and not (n in seen or seen.add(n))]
+
+    def intent_lookups(self, intent: "Intent", online: bool) -> list[str]:
+        """Research tools a document intent's sources call for, registered only.
+
+        The union of DOCUMENT_RESEARCH_TOOLS for each source, in source order.
+        The network tools drop out offline: a knowledge-base document needs no
+        connection, a web one cannot be researched without it.
+        """
+        names: list[str] = []
+        for source in intent.research_sources or ():
+            for name in DOCUMENT_RESEARCH_TOOLS.get(source, ()):
+                if name in names or self.registry.get(name) is None:
+                    continue
+                if name in _AG_WEB_TOOLS and not online:
+                    continue
+                names.append(name)
+        return names
+
+    def _ag_project_basename(self) -> str:
+        """The folder name of the project this turn works in, or "".
+
+        The pinned workspace root, then the turn's project, then PROJECT_DIR.
+        Names only: nothing here touches the filesystem, so classifying a
+        message can never create a workspace folder as a side effect.
+        """
+        pinned = _ag_lookup("workspaces", "acting_workspace_root")
+        try:
+            root = pinned() if callable(pinned) else None
+        except Exception:  # noqa: BLE001
+            root = None
+        if root:
+            return Path(str(root)).name
+        turn = current_turn()
+        project = getattr(turn, "project", None) if turn is not None else None
+        if isinstance(project, dict):
+            raw = project.get("root") or project.get("root_path")
+            if raw:
+                return Path(str(raw)).expanduser().name
+        pd = str(getattr(self.config, "project_dir", "") or "").strip()
+        return Path(pd).expanduser().name if pd else ""
+
+    def document_reply(self, args: dict) -> str:
+        """The closing reply of a document turn (P5): the file and what is in it.
+
+        Names the file the registry actually wrote (OUTPUTS_DIR may have moved
+        a bare name), falling back to the path the model asked for.
+        """
+        written = list(getattr(self.registry, "documents_written", None) or [])
+        path = str(written[-1] if written else (args.get("path") or ""))
+        suffix = Path(path).suffix.lower() or Path(str(args.get("path") or "")).suffix.lower()
+        return _ag_document_done(path, str(args.get("content") or ""),
+                                 describe_document(suffix) if suffix else "a document")
+
+    def _ag_quick_final(self, answer: str, started: float) -> dict:
+        """A final event for a turn that needed no model call (reply / clarify lanes)."""
+        return {
+            "type": "final", "answer": answer, "steps": 0, "trace": [], "tools_used": [],
+            "elapsed_ms": round((time.time() - started) * 1000),
+            "prompt_tokens": 0, "completion_tokens": 0, "truncated": False,
+            "changed_files": [], "diff": "", "skills_used": [], "documents": [],
+            "checkpoint": None, "reasoning": "", **_ag_turn_fields(),
+        }
+
     async def route(self, message: str, history: list[dict] | None = None,
                     task: "TaskState | None" = None,
-                    stats: "GenerationStats | None" = None) -> dict:
+                    stats: "GenerationStats | None" = None,
+                    attachment_summary: str = "") -> dict:
         """Ask the model how to handle a message, as one structured decision.
 
         The router menu is generated from the registry: every tool that declares
@@ -1739,6 +2264,11 @@ class Agent:
         four words about an artifact look exactly like four words about the
         world. `stats` folds the router's own call into the turn's totals, which
         it was never doing.
+
+        `attachment_summary` is one line per attached file (name, kind, size,
+        frontmatter name), appended to the message the router reads. Without
+        it the router judged "add this to skills" on eight tokens and chose
+        `answer`, never knowing a skill file was attached.
         """
         routable = self.registry.routable()
         if not routable:
@@ -1804,7 +2334,8 @@ class Agent:
             role = turn.get("role")
             if role in ("user", "assistant") and turn.get("content"):
                 context.append({"role": role, "content": str(turn["content"])[:500]})
-        context.append({"role": "user", "content": message[:1000]})
+        context.append({"role": "user", "content": message[:1000] + (
+            "\n" + attachment_summary[:400] if attachment_summary else "")})
 
         # If the reply is unusable, answer from own knowledge rather than
         # defaulting to a search. Prefer the model's knowledge unless it clearly
@@ -1869,7 +2400,8 @@ class Agent:
         return fallback
 
     def with_retrieved_context(self, user_message: str, max_chars: int | None = None,
-                               active_code_task: bool = False) -> str:
+                               active_code_task: bool = False,
+                               retrieval: str = "auto") -> str:
         """Prepend the most relevant knowledge-base passages to the question.
 
         This is the RAG step: when documents have been indexed, the best-matching
@@ -1881,7 +2413,16 @@ class Agent:
         window (see build_base). Sizing it against the whole window instead is
         how a 4KB block of unrelated reference material pushed prompt + reply
         past n_ctx on a six-word question.
+
+        `retrieval` is the turn's intent rule (Intent.retrieval): "off" never
+        injects (a codebase review, a skill or memory turn: the knowledge base
+        is a different corpus), "kb" injects even where the heuristics below
+        would hold back (the user named the knowledge base), "auto" is the
+        heuristics alone. RAG_ENABLED stays the switch over all three.
         """
+        mode = str(retrieval or "auto").strip().lower()
+        if mode == "off":
+            return user_message
         db = getattr(self.registry, "db", None)
         if not self.config.rag_enabled or db is None:
             return user_message
@@ -1895,23 +2436,38 @@ class Agent:
         tokens = rag_query_tokens(user_message)
         if not tokens:
             return user_message
-        # "write a basic c++ crud program" is answered from the model's own
-        # knowledge. Retrieval belongs on a code request only when the user is
-        # pointing at their own files, where the real code is the answer.
-        if is_code_request(user_message) and not refers_to_project(user_message):
+        if mode != "kb":
+            # "write a basic c++ crud program" is answered from the model's own
+            # knowledge. Retrieval belongs on a code request only when the user
+            # is pointing at their own files, where the real code is the answer.
+            if is_code_request(user_message) and not refers_to_project(user_message):
+                return user_message
+            # Mid-task, a follow-up like "add more checks and error handling" is
+            # about the artifact in the task state and nothing else. Retrieval
+            # on it is actively harmful: the FTS query ORs every term, so
+            # "checks", "handling" and "validator" matched indexed Python
+            # documents, and those passages are where skill_validator.py and
+            # seo_health_scorer.py came from in a conversation that was writing
+            # a Bash script.
+            if active_code_task and not refers_to_project(user_message):
+                return user_message
+            # A remark about the previous answer ("doesnt have a main function")
+            # is answered from the conversation, never from the knowledge base.
+            if is_followup_remark(user_message):
+                return user_message
+        # Words too common in this index to say which document is relevant.
+        # "skills" was in 3467 of 3473 indexed paths, so "add this to skills"
+        # admitted any passage at all. They are dropped from both the query
+        # and the overlap test below; a question made only of them retrieves
+        # nothing, which is the honest answer.
+        common = self._ag_common_tokens(db, tokens)
+        kept = tokens - common
+        if not kept:
+            log("knowledge-base lookup skipped: every query word is in more than "
+                f"{self.config.rag_df_ceiling:.0%} of the indexed documents.",
+                logging.DEBUG)
             return user_message
-        # Mid-task, a follow-up like "add more checks and error handling" is
-        # about the artifact in the task state and nothing else. Retrieval on it
-        # is actively harmful: the FTS query ORs every term, so "checks",
-        # "handling" and "validator" matched indexed Python documents, and those
-        # passages are where skill_validator.py and seo_health_scorer.py came
-        # from in a conversation that was writing a Bash script.
-        if active_code_task and not refers_to_project(user_message):
-            return user_message
-        # A remark about the previous answer ("doesnt have a main function") is
-        # answered from the conversation, never from the knowledge base.
-        if is_followup_remark(user_message):
-            return user_message
+        query = " ".join(sorted(kept)) if common else user_message
         try:
             # A project turn retrieves within the project's own RAG scope; the
             # workspace module is optional, so without it this is RAG_SCOPE.
@@ -1920,7 +2476,7 @@ class Agent:
             scope = [p.strip() for p in (raw_scope or "").split(",") if p.strip()]
             # Scope retrieval to the acting user's own + shared documents so one
             # user's imported history never surfaces in another's answers.
-            hits = db.search_documents(user_message, limit=self.config.rag_passages,
+            hits = db.search_documents(query, limit=self.config.rag_passages,
                                        only=scope or None, user_id=get_acting_user())
         except Exception as exc:
             log(f"knowledge-base lookup skipped: {exc}", logging.DEBUG)
@@ -1931,11 +2487,31 @@ class Agent:
         # the first message in this convo" pulled in someone else's transcript and
         # the model answered by inventing a conversation. Requiring real overlap
         # makes retrieval fire only when it has something to contribute.
-        need = 2 if len(tokens) >= 2 else 1
-        hits = [h for h in hits
-                if sum(1 for t in tokens
-                       if t in (str(h.get("chunk", "")) + " "
-                                + str(h.get("path", ""))).lower()) >= need]
+        # Counted on the passage text. The path counts only when the user named
+        # that file or folder ("what does book-to-skill.md say"): matched against
+        # every path, one folder name shared by a whole imported repository let
+        # every passage in it through.
+        named = _ag_named_paths(user_message)
+        need = 2 if len(kept) >= 2 else 1
+
+        def overlap(hit: dict) -> int:
+            text = str(hit.get("chunk", "")).lower()
+            if named and _ag_path_named(str(hit.get("path", "")), named):
+                text += " " + str(hit.get("path", "")).lower()
+            return sum(1 for t in kept if t in text)
+
+        hits = [h for h in hits if overlap(h) >= need]
+        # At most two passages per document, so one long file cannot fill the
+        # whole block with near-copies of itself.
+        per_doc: dict[str, int] = {}
+        capped = []
+        for h in hits:
+            key = str(h.get("path", ""))
+            if per_doc.get(key, 0) >= 2:
+                continue
+            per_doc[key] = per_doc.get(key, 0) + 1
+            capped.append(h)
+        hits = capped
         if not hits:
             return user_message
         budget = max(400, int(self.config.context_size * 0.25) * 4)
@@ -1957,18 +2533,79 @@ class Agent:
                 + "\n\nUsing those passages only where they apply (cite the [path] "
                   "when you do), answer:\n" + user_message)
 
+    # Document frequencies are cached this long. Long enough that a burst of
+    # turns pays for each word once, short enough that indexing new documents
+    # is reflected within a couple of minutes.
+    _AG_DF_TTL_S = 120.0
+    # Below this many indexed documents a frequency ceiling means nothing: in a
+    # three-document index every useful word is in a third of it.
+    _AG_DF_MIN_DOCS = 20
+
+    def _ag_common_tokens(self, db: Any, tokens: "set[str]") -> "set[str]":
+        """Query words found in more than RAG_DF_CEILING of the indexed documents.
+
+        Counted with the FTS index itself (distinct paths whose chunk text
+        holds the word) and cached per word for _AG_DF_TTL_S. Any failure (no
+        FTS5, an index without the expected columns, a stub database) returns
+        no words, which is today's behaviour: the ceiling can only ever take
+        words away, never make retrieval fail.
+        """
+        ceiling = float(getattr(self.config, "rag_df_ceiling", 1.0) or 1.0)
+        if ceiling >= 1.0 or getattr(db, "search_mode", "fts5") != "fts5":
+            return set()
+        execute = getattr(db, "execute", None)
+        if not callable(execute):
+            return set()
+        cache = self.__dict__.setdefault("_ag_df_cache", {})
+        now = time.monotonic()
+
+        def cached(key: str, sql: str, params: tuple) -> int:
+            hit = cache.get((id(db), key))
+            if hit is not None and hit[0] > now:
+                return hit[1]
+            row = execute(sql, params).fetchone()
+            value = int(row[0] if row is not None else 0)
+            cache[(id(db), key)] = (now + self._AG_DF_TTL_S, value)
+            return value
+
+        try:
+            total = cached("", "SELECT COUNT(*) FROM documents", ())
+            if total < self._AG_DF_MIN_DOCS:
+                return set()
+            common = set()
+            for token in tokens:
+                if not re.fullmatch(r"[a-z0-9]+", token):
+                    continue
+                df = cached(token, "SELECT COUNT(DISTINCT path) FROM doc_chunks "
+                                   "WHERE doc_chunks MATCH ?", (f'chunk:"{token}"',))
+                if df > ceiling * total:
+                    common.add(token)
+            return common
+        except Exception as exc:  # noqa: BLE001 - degrade to no ceiling
+            log(f"knowledge-base word frequency unavailable ({exc}); not applying "
+                "RAG_DF_CEILING this turn.", logging.DEBUG)
+            return set()
+
     # What a document turn is allowed to call. Everything else in the registry
     # is ~1600 tokens of a 4096-token window describing tools it will not touch,
     # and that is budget the document itself has to fit in.
     DOCUMENT_TOOLS = ("create_document", "final_answer")
     DOCUMENT_LOOKUP_TOOLS = ("web_search", "fetch_url", "read_file", "search_docs")
 
-    def document_tool_subset(self, research: bool) -> list[str]:
-        """The tools a document turn may use, narrowed to what is registered."""
+    def document_tool_subset(self, research: bool,
+                             lookups: "Sequence[str] | None" = None) -> list[str]:
+        """The tools a document turn may use, narrowed to what is registered.
+
+        `lookups` replaces DOCUMENT_LOOKUP_TOOLS when the turn's intent named
+        where the material comes from (Intent.research_sources: the knowledge
+        base, the codebase, past conversations, the web).
+        """
         names = list(self.DOCUMENT_TOOLS)
         if research:
-            names += list(self.DOCUMENT_LOOKUP_TOOLS)
-        return [n for n in names if self.registry.get(n) is not None]
+            names += list(lookups if lookups else self.DOCUMENT_LOOKUP_TOOLS)
+        seen: set[str] = set()
+        return [n for n in names
+                if self.registry.get(n) is not None and not (n in seen or seen.add(n))]
 
     def build_base(
         self,
@@ -1979,24 +2616,32 @@ class Agent:
         extra_context: str = "",
         active_code_task: bool = False,
         tool_subset: "list[str] | None" = None,
+        retrieval: str = "auto",
     ) -> tuple[list[dict], int]:
         """Assemble [system, trimmed history, user]. This prefix is never cut later.
 
         `tools` picks the lane. The tool-calling prompt is the protocol plus
         every tool spec (~1500 tokens of a 4096-token window); the prose lane
         drops both, and with them the instruction to "reply with a single JSON
-        object", once routing has decided the turn calls nothing.
+        object", once routing has decided the turn calls nothing. `retrieval`
+        is the turn's intent rule, handed to with_retrieved_context.
+
+        The think-first instruction follows reasoning_prompt_wanted (P6): with
+        REASONING_PROMPT=auto it is part of the stable prefix only for a model
+        the catalogue marks as thinking, so switching models can change the
+        prefix fingerprint, and that is intended.
         """
+        reasoning = reasoning_prompt_wanted(self.config)
         system = {
             "role": "system",
             "content": (build_agent_system_prompt(
                             self.config.system_prompt_with_identity, self.registry,
-                            reasoning=self.config.reasoning_visible,
+                            reasoning=reasoning,
                             only=tool_subset)
                         if tools else
                         build_plain_system_prompt(
                             self.config.system_prompt_with_identity,
-                            reasoning=self.config.reasoning_visible,
+                            reasoning=reasoning,
                             registry=self.registry)),
         }
         # Size retrieval against what is left after the parts that cannot be
@@ -2008,7 +2653,7 @@ class Agent:
         user = {"role": "user",
                 "content": self.with_retrieved_context(
                     user_message, max(0, room - RAG_HISTORY_FLOOR) * 4,
-                    active_code_task=active_code_task)}
+                    active_code_task=active_code_task, retrieval=retrieval)}
         # Per-turn context -- an autoloaded procedure, the content behind an
         # @reference -- rides on the USER message, never the system prompt. It is
         # specific to this turn, so putting it in the system prompt would change
@@ -2181,8 +2826,14 @@ class Agent:
         """
         if len(result) <= budget:
             return result, False
-        if not self.config.summarise_tool_results or len(result) <= self.config.summarise_over_chars:
-            return result[:budget] + "\n[truncated]", False
+        # Every cut is marked at the top and the bottom (cut_for_context), and
+        # a read_file result is never summarised: a summary of a file reads as
+        # the file, and the turn that rewrote a 103 KB README from a 1,500-
+        # character slice is what that leads to. A file is paged instead, with
+        # the offset to continue from re-rendered for the part actually kept.
+        if (name == "read_file" or not self.config.summarise_tool_results
+                or len(result) <= self.config.summarise_over_chars):
+            return cut_for_context(name, result, budget), False
         prompt = [
             {"role": "system", "content":
                 "You compress tool output. Reply with only the facts the caller asked for, "
@@ -2196,8 +2847,63 @@ class Agent:
         )
         summary = strip_reasoning(summary).strip()
         if not summary:
-            return result[:budget] + "\n[truncated]", False
-        return f"[condensed from {len(result)} chars]\n{summary[:budget]}", True
+            return cut_for_context(name, result, budget), False
+        return (f"[condensed from {len(result)} chars: a summary of the {name} result, "
+                f"not its exact text]\n{summary[:budget]}"), True
+
+    # ------------------------------------------------------ file safety ----
+    # The agent's half of the overwrite guard and the final-answer hygiene
+    # (tools.py holds the registry half and the wording). Kept together here so
+    # the one rule reads in one place: an existing file is never replaced
+    # without the user seeing it, and the reply always ends with what changed.
+    async def _ag_overwrite_card(self, name: str, args: dict, turn: Any) -> dict | None:
+        """The overwrite preview when this call must be put to the user first.
+
+        write_file on an existing file, in an interactive turn, whatever the
+        policy said, unless the user's Approvals setting (the header control
+        that is always on screen) is Don't ask. Then nothing is asked and the
+        registry's guard alone refuses a write that removes most of a file.
+        """
+        if name != "write_file" or turn is None or not getattr(turn, "interactive", False):
+            return None
+        preview = getattr(self.registry, "overwrite_preview", None)
+        if not callable(preview):
+            return None
+        mode = approval_mode_in_force(self.config, turn, getattr(self.registry, "db", None),
+                                      _ag_policy())
+        if mode == "off":
+            return None
+        try:
+            return await asyncio.to_thread(preview, args)
+        except Exception as exc:  # noqa: BLE001 - the handler's own guard still applies
+            log(f"overwrite preview failed for {args.get('path')!r} ({exc}).", logging.WARNING)
+            return None
+
+    def finalise_answer(self, answer: str, new_files: list[str],
+                        checkpoint_id: str | None) -> tuple[str, list[dict]]:
+        """The reply with scratch labels removed and the Changes footer added.
+
+        The footer is built from the registry's write record and the files on
+        disk, never by the model, and it is appended even when the reply says
+        nothing was written: the turn that overwrote README.md and answered
+        "the README is not available" is exactly the case it is for. A footer
+        the model imitated from an earlier turn is removed first, so the only
+        one the user sees is the true one.
+        """
+        text = strip_changes_footer(strip_protocol_labels(answer))
+        if not new_files:
+            return text, []
+        report = getattr(self.registry, "change_report", None)
+        try:
+            changes = report(list(new_files)) if callable(report) else []
+        except Exception as exc:  # noqa: BLE001
+            log(f"could not build the changes footer: {exc}", logging.WARNING)
+            changes = []
+        if not changes:
+            changes = [{"path": p, "kind": "modified", "before": None, "after": None}
+                       for p in new_files]
+        footer = changes_footer(changes, checkpoint_id, answer_denies_changes(text, changes))
+        return append_below_answer(text, footer), changes
 
     async def resilient_complete(self, messages: list[dict], max_tokens: int,
                                  temperature: float | None,
@@ -2883,11 +3589,62 @@ class Agent:
         # prompt nor the search query keeps the command text. A bare command with
         # no request behind it is ignored.
         forced_lane: str | None = None
+        typed_message = user_message
         _override = routing_override(user_message)
         if _override:
             lane, cleaned = _override
             if cleaned:
                 forced_lane, user_message = lane, cleaned
+
+        # What the user asked for in the app's own terms (P1). The UI names its
+        # features -- knowledge base, codebase, skills, memory, history -- and
+        # people type those words meaning them; the router, one 64-token call
+        # with a six-tool menu, did not, and sent all three reviewed failures
+        # down the wrong lane before the model wrote a word. Decided here, after
+        # the routing override and before anything else reads the message, on
+        # the text as typed (so a /command is visible to the rules) and with a
+        # one-line summary of any attachment rather than its text (P4).
+        # Not for an explicit /search or /no-search, which is the same decision
+        # made by the user; not for a machine-written message (`internal`) or a
+        # helper's delegated task, which are not the user's words.
+        attached_files = _ag_attachments(attachments)
+        attachment_summary = _ag_attachment_summary(attached_files)
+        intent: "Intent | None" = None
+        if (not internal and not self._ag_nested
+                and forced_lane not in ("web_search", "answer")):
+            intent = self.understand(typed_message, history=history,
+                                     attachments=attachments, files=attached_files)
+        if intent is not None:
+            # Metadata only (Intent.as_log): the lane, the source and the
+            # tools, never the message. INFO, because this is the decision a
+            # reviewer needs after the fact and DEBUG is off in daily use.
+            log_event(get_logger("agent"), logging.INFO, "router.decision",
+                      conversation_id=conversation_id, action="intent",
+                      **intent.as_log())
+            yield {"type": "notice", "info": True,
+                   "message": f"Understood as: {intent.name} ({intent.source})",
+                   "intent": intent.name, "intent_source": intent.source}
+            # A slash command the routing override does not know (/code,
+            # /skills, /pdf, ...) is still in the message; the rules hand back
+            # the request behind it, and that is what the model should read.
+            cleaned = str((intent.extras or {}).get("cleaned_message") or "").strip()
+            if intent.source == "slash" and cleaned:
+                user_message = cleaned
+            if intent.lane in ("reply", "clarify"):
+                # A deterministic answer (a capability that is switched off, an
+                # admin action to do in Settings) or the one question that has
+                # to be asked first. No model call: both are already decided.
+                text = str(intent.reply if intent.lane == "reply"
+                           else intent.clarify_question).strip()
+                if text:
+                    yield self._ag_quick_final(text, started)
+                    return
+                log(f"intent {intent.name!r} chose the {intent.lane} lane with "
+                    "nothing to say; routing as before.", logging.WARNING)
+                intent = None
+        intent_lane = intent.lane if intent is not None else ""
+        # The intent's retrieval rule, applied by every prompt this turn builds.
+        retrieval = intent.retrieval if intent is not None else "auto"
 
         # A bare "continue" asks to RESUME the previous answer, not to answer a
         # new question. Without this it went through routing as a fresh prompt:
@@ -3032,8 +3789,12 @@ class Agent:
         # task to follow. While a task is active with an artifact, the artifact
         # is the procedure.
         mid_task = bool(task.is_active() and task.artifact and not reset)
+        # Not on an intent about the app's own records either: "add this to
+        # skills" overlaps some skill's summary as well as any other sentence
+        # does, and loading that procedure hands the model a task nobody set.
         if (self.config.skills_enabled and self.config.skill_autoload
-                and "load_skill" in known and not mid_task):
+                and "load_skill" in known and not mid_task
+                and (intent is None or intent.name in _AG_AUTOLOAD_INTENTS)):
             library = getattr(self.registry, "skills", None)
             try:
                 matched = library.best_match(
@@ -3108,9 +3869,37 @@ class Agent:
                 # re-rendering the document instead.
                 doc_format = task.document_format
                 editing_document = True
+        # Where the intent and the format detector disagree on a fresh request,
+        # the intent is the more specific reading: a document intent with no
+        # format word ("craft a report from the knowledge base") still makes a
+        # file when the rules say which kind, and a tools or prose intent means
+        # the turn is not producing one. An edit of the active document stays
+        # an edit either way: the task state knows more than one message does.
+        if intent is not None and not editing_document:
+            if (intent_lane == "document" and not doc_format
+                    and self.registry.get("create_document") is not None):
+                fmt = str((intent.extras or {}).get("format") or "").strip().lower()
+                fmt = fmt if fmt.startswith(".") or not fmt else "." + fmt
+                doc_format = fmt if re.fullmatch(r"\.[a-z0-9]{1,6}", fmt) else None
+            elif intent_lane in ("tools", "prose"):
+                doc_format = None
         document_directive = ""
         document_research = False
-        if doc_format:
+        # The research tools this document turn gets, when its intent named the
+        # sources (P5): the knowledge base adds search_docs, the codebase the
+        # file tools, history search_past_conversations. Conversation 2 asked
+        # for a PDF "from the knowledge base" and got create_document alone,
+        # because research used to mean the web and nothing else.
+        research_lookups: list[str] = []
+        if doc_format and intent_lane == "document" and intent.research_sources \
+                and not editing_document:
+            wants_web = any(name in _AG_WEB_TOOLS for source in intent.research_sources
+                            for name in DOCUMENT_RESEARCH_TOOLS.get(source, ()))
+            online = bool(wants_web and forced_lane not in ("answer", "kb")
+                          and await has_internet())
+            research_lookups = self.intent_lookups(intent, online)
+            document_research = bool(research_lookups)
+        elif doc_format:
             # "look up as much as you can find about them, then draft the
             # document" is half the request. Sending the model straight to
             # create_document produces a confident page of invented facts, which
@@ -3165,6 +3954,32 @@ class Agent:
                         "**bold**, - bullets, | tables |). Base it on what you found "
                         "and say plainly where the sources were thin rather than "
                         "filling the gaps in. Then answer in one or two sentences."
+                    )
+                if document_research and research_lookups:
+                    # The same two steps, naming the sources the intent found
+                    # in the message instead of assuming the web.
+                    where = {"knowledge_base": "the user's knowledge base",
+                             "codebase": "the project's code",
+                             "history": "past conversations", "web": "the web",
+                             "files": "the user's files"}
+                    sources = [where.get(s, s) for s in intent.research_sources
+                               if any(n in research_lookups
+                                      for n in DOCUMENT_RESEARCH_TOOLS.get(s, ()))]
+                    also = research_lookups[1:]
+                    document_directive = (
+                        "Work in two steps and do NOT skip the first.\n"
+                        f"STEP 1, RESEARCH: the material for this {name} comes from "
+                        f"{' and '.join(sources) or 'your lookup tools'}. Call "
+                        f"{research_lookups[0]} now"
+                        + (f" (you may also use {', '.join(also)})" if also else "")
+                        + " and read what comes back. Do not call create_document "
+                          "yet.\n"
+                        f"STEP 2, WRITE: once you have the findings, call "
+                        f"create_document with path \"{target}\" and the whole "
+                        f"{name} in its content argument as Markdown (# headings, "
+                        "**bold**, - bullets, | tables |). Base it only on what you "
+                        "found and say plainly where it was thin rather than filling "
+                        "the gaps in."
                     )
                 yield {"type": "notice", "info": True,
                        "message": (f"looking things up first, then writing a {name}"
@@ -3245,19 +4060,67 @@ class Agent:
                 + ", but the model answering cannot see images. If the request "
                   "depends on them, say so in one sentence, then help with the "
                   "text.") if part)
+        # "add this to skills" with a SKILL.md attached (P4). Its frontmatter
+        # already holds the name and description and the file is the body, so
+        # the call is drafted here and the model only has to send it back. The
+        # body travels as a marker the step loop swaps for the file's text: a
+        # 3B model asked to copy six kilobytes into a JSON string cuts it short
+        # or rewrites it, and the user asked for the file as it is.
+        skill_draft = None
+        intent_directive = ""
+        if (intent is not None and intent.name == "skill_save" and intent_lane == "tools"
+                and "save_skill" in self.intent_tools(intent)):
+            skill_draft = _ag_skill_draft(attached_files)
+            if skill_draft is not None:
+                drafted = json.dumps(
+                    {"tool": "save_skill",
+                     "args": {"name": skill_draft["name"],
+                              "description": skill_draft["description"],
+                              "body": _AG_ATTACHMENT_BODY}}, ensure_ascii=False)
+                intent_directive = (
+                    f"The user attached a skill file ({skill_draft['file']}) and wants "
+                    "it saved to your skills. Its frontmatter already gives the name "
+                    "and description, so reply with exactly this one tool call and "
+                    f"nothing else:\n{drafted}\nKeep \"{_AG_ATTACHMENT_BODY}\" as the "
+                    "body: the attached file's text is filled in for you.")
+        elif (intent is not None and intent.name == "codebase_write" and intent_lane == "tools"):
+            # "check the codebase and write a readme.md" read 1,500 characters
+            # of a 100 KB README and wrote 841 back over it. The steps are
+            # built in intents.py; only OUTPUTS_DIR is known here, and it is
+            # where a new version goes when the user did not ask to replace.
+            cw_extras = intent.extras or {}
+            intent_directive = codebase_write_guidance(
+                str(cw_extras.get("target") or ""), overwrite=bool(cw_extras.get("overwrite")),
+                outputs_dir=str(getattr(self.config, "outputs_dir", "outputs") or ""))
         extra_context = "\n\n".join(
             part for part in (skill_context, reference_context, attachment_context,
-                              brief, document_directive, kind_hint) if part)
+                              brief, document_directive, kind_hint, intent_directive)
+            if part)
         # A document turn can only ever call create_document (plus a lookup tool
         # when it is researching), so the other twenty-one specs are ~1600
         # tokens of a 4096-token window describing tools it will not touch --
-        # budget the document itself has to fit into.
-        tool_subset = (self.document_tool_subset(document_research)
-                       if doc_format else None)
+        # budget the document itself has to fit into. An intent's tools lane is
+        # narrowed the same way, to the tools that intent can use (P1).
+        if doc_format:
+            tool_subset = self.document_tool_subset(document_research,
+                                                    research_lookups or None)
+        elif intent_lane == "tools":
+            tool_subset = self.intent_tools(intent)
+        else:
+            tool_subset = None
+        # The narrowed prompt alone did not stop a 3B model: on "check the
+        # codebase and write a readme.md" (codebase_write, no web tools in the
+        # prompt) it still called fetch_url on a made-up raw.githubusercontent
+        # URL, and with Approvals at Don't ask that request went out. A call
+        # to a tool the intent did not offer is answered without running it.
+        offered_tools = (frozenset(tool_subset)
+                         if intent_lane == "tools" and not doc_format and tool_subset
+                         else None)
         base, dropped = self.build_base(history, user_message, reserve,
+                                        tools=intent_lane != "prose" or bool(doc_format),
                                         extra_context=extra_context,
                                         active_code_task=bool(brief and task.is_code_task()),
-                                        tool_subset=tool_subset)
+                                        tool_subset=tool_subset, retrieval=retrieval)
         # Reported ONCE per turn, not once per prompt build. This used to fire
         # here and again after the lane was picked, and the internals line
         # restated both, so a single turn said "trimmed N old messages" three
@@ -3313,6 +4176,19 @@ class Agent:
         # switch costs a prompt rebuild and a step, and a model that refuses
         # twice is not going to be talked into it a third time.
         escalated = False
+        if intent_lane == "prose" and not doc_format:
+            # The intent made the router's "answer" decision itself: the prompt
+            # above was built without tools, and the step loop treats it as an
+            # answer-routed turn (the one-lookup gate, escalation) exactly as
+            # if the router had said so.
+            prose_lane = answer_routed = True
+        # Documents this turn has written, by normalised path (P5), and whether
+        # the user asked for more than one pass at one. On an edit of the
+        # active document "revise the intro" names the edit itself: one write.
+        documents_done: dict[str, str] = {}
+        revision_asked = bool(_AG_REVISION_ASK.search(user_message)) and not editing_document
+        # Calls the intent says the user confirms first (Intent.confirm_tools).
+        confirm_tools = frozenset(intent.confirm_tools) if intent is not None else frozenset()
         scratch: list[dict] = []
         seen_calls: list[str] = []
         # Calls refused this turn (by a person or the policy), by signature, so
@@ -3485,7 +4361,8 @@ class Agent:
                 base, dropped = self.build_base(
                     history, user_message, reserve, tools=True,
                     extra_context=extra_context,
-                    active_code_task=bool(brief and task.is_code_task()))
+                    active_code_task=bool(brief and task.is_code_task()),
+                    retrieval=retrieval)
                 prose_lane = False
                 ev = detail(f"switched to agent mode: tool prompt restored "
                             f"({before} -> {messages_tokens(base)} prompt tokens, "
@@ -3535,6 +4412,13 @@ class Agent:
             # versions of a module went out with a function shadowing a builtin
             # and recursing into itself, and each turn built on the last.
             answer = self.checked_answer(answer, task)
+            checkpoint = (self.registry.checkpoint_id
+                          if new_files and self.registry.checkpoint_id else None)
+            # Scratch labels ("TOOL RESULT [read_file]:") out, and the
+            # code-built Changes footer in, at the same single exit: what the
+            # turn did to files is stated by the app, not by the model.
+            final_answer, changes = self.finalise_answer(
+                unwrap_answer(answer), new_files, checkpoint)
             return {
                 "type": "final",
                 # Strip protocol scaffolding HERE, at the one point every lane
@@ -3542,7 +4426,10 @@ class Agent:
                 # and reasoning lanes, the forced pass and the salvage path all
                 # end up in this function. Cleaning at each generation site
                 # instead would mean fourteen places to keep in step.
-                "answer": unwrap_answer(answer),
+                "answer": final_answer,
+                # The rows behind the footer: path, created/modified/removed,
+                # size before and after (bytes).
+                "changes": changes,
                 "steps": step,
                 "trace": trace,
                 "tools_used": [entry["name"] for entry in trace],
@@ -3557,8 +4444,7 @@ class Agent:
                 "documents": list(getattr(self.registry, "documents_written", [])),
                 # Only when something was actually recorded: offering an undo
                 # for a turn that wrote nothing is noise.
-                "checkpoint": (self.registry.checkpoint_id
-                               if new_files and self.registry.checkpoint_id else None),
+                "checkpoint": checkpoint,
                 # What the thinking area showed, so a reload (and an API client
                 # asking for reasoning_content) gets it back. "" when the model
                 # did not reason out loud.
@@ -3580,7 +4466,10 @@ class Agent:
         # to hand back.
         async def settle(answer: str, cost, step: int):
             nonlocal draft
-            if step < self.config.agent_min_steps and not internal:
+            # Not on a document turn (P5): its answer is a sentence about the
+            # file, and a "revise the draft" pass there only ever produced a
+            # second create_document of the same file.
+            if step < self.config.agent_min_steps and not internal and not doc_format:
                 # Thinking harder, on purpose. The model answers as soon as it
                 # can rather than as soon as it should, so below the minimum the
                 # first pass is a draft and goes back for another look.
@@ -3611,7 +4500,7 @@ class Agent:
                 # the cut-off state of the text the user actually gets rather
                 # than of the discarded one.
                 account(drift_stats)
-                yield {"type": "usage", "step": step, **drift_stats.as_event()}
+                yield {"type": "usage", "step": step, **_ag_stamp_queue(drift_stats).as_event()}
                 answer, cost = fixed, drift_stats
             yield {"__settled__": note_if_cut(answer, cost)}
 
@@ -3814,8 +4703,16 @@ class Agent:
         # cannot survive a single generation to be routed normally.
         est_tokens = len(user_message) // CHARS_PER_TOKEN
         trigger_tokens = int(self.config.context_size * self.config.chunk_trigger_ratio)
+        # Cloud fallback first (cloud_preflight): once split, no single request
+        # looks oversized, so a consented cloud turn would never be offered for
+        # the very prompts it exists for. True keeps the prompt whole and the
+        # model call below finds the answer remembered on the turn. Checked
+        # last, so it only runs when the input would be split; off by default.
         if (self.config.chunk_large_prompts and est_tokens > trigger_tokens
-                and len(user_message) > 2000):
+                and len(user_message) > 2000
+                and not await cloud_preflight(
+                    self.config, [*(history or []), {"role": "user", "content": user_message}],
+                    reserve, kind="agent", conversation_id=conversation_id)):
             chunk_tokens = max(256, int(self.config.context_size * self.config.chunk_size_ratio))
             chunk_chars = chunk_tokens * CHARS_PER_TOKEN
             parts = chunk_text(user_message, chunk_chars, overlap=chunk_chars // 10)
@@ -3907,8 +4804,10 @@ class Agent:
         # the answer itself (a number, a page), so we can return it directly.
         # Not when the user attached images: "what is 2+2 in this photo" is a
         # question about the photo, and a shortcut cannot see it.
+        # Not when an intent already decided the lane: the shortcuts guess from
+        # the shape of the text, the intent read what it asks for.
         shortcut = (quick_tool(user_message)
-                    if self.config.fast_path and not can_see else None)
+                    if self.config.fast_path and not can_see and intent is None else None)
         if shortcut and self.registry.get(shortcut[0]) is not None:
             name, args = shortcut
             outcome = None
@@ -3939,6 +4838,12 @@ class Agent:
         # spends a call to be overruled, and a router that answers "answer"
         # would build the tool-free prompt and lock the turn out of the tools
         # that were the whole point of typing the command.
+        elif intent_lane in ("tools", "prose") and not doc_format:
+            # The intent decided the lane (P1), so the router is not asked: the
+            # prompt above already carries the intent's tools, or none. This
+            # is the fix for all three reviewed failures, where the router's
+            # one-call guess of "answer" removed every tool the turn needed.
+            pass
         elif forced_lane == "agent":
             yield {"type": "notice", "info": True,
                    "message": "agent mode: tools are available for this turn"}
@@ -4077,7 +4982,8 @@ class Agent:
                     # request that does not need one, write the code instead.
                     yield {"type": "phase", "label": "deciding how to handle this"}
                     route_stats = GenerationStats()
-                    decision = await self.route(user_message, history, task, route_stats)
+                    decision = await self.route(user_message, history, task, route_stats,
+                                                attachment_summary=attachment_summary)
                     account(route_stats)
                     if decision.get("action") in ("web_search", "fetch_url") and not needs_lookup:
                         decision = {"action": "answer"}
@@ -4090,7 +4996,8 @@ class Agent:
             else:
                 yield {"type": "phase", "label": "deciding how to handle this"}
                 route_stats = GenerationStats()
-                decision = await self.route(user_message, history, task, route_stats)
+                decision = await self.route(user_message, history, task, route_stats,
+                                            attachment_summary=attachment_summary)
                 account(route_stats)
 
             action = decision.get("action")
@@ -4117,10 +5024,14 @@ class Agent:
             if router_unsure:
                 log("router reports it is not confident it knows this; one "
                     "self-issued lookup will be allowed.", logging.INFO)
-            log_event(get_logger("agent"), logging.DEBUG, "router.decision",
+            # INFO, not DEBUG: which lane a turn took is the first question
+            # about any bad answer, and DEBUG is off in daily use. Metadata
+            # only, the same shape as the intent's line above.
+            log_event(get_logger("agent"), logging.INFO, "router.decision",
                       conversation_id=conversation_id, action=decision.get("action"),
-                      online=online, task=task.summary(),
-                      history_messages=len(history), history_dropped=dropped)
+                      intent_source="router", online=online, task=task.summary(),
+                      history_messages=len(history), history_dropped=dropped,
+                      attachments=len(attached_files))
             ev = detail(f"router decision: {json.dumps(decision, ensure_ascii=False)[:200]}"
                         + ("" if online else " (offline)"))
             if ev:
@@ -4195,7 +5106,8 @@ class Agent:
                 base, dropped_prose = self.build_base(
                     history, user_message, reserve, tools=False,
                     extra_context=extra_context,
-                    active_code_task=bool(brief and task.is_code_task()))
+                    active_code_task=bool(brief and task.is_code_task()),
+                    retrieval=retrieval)
                 prose_lane = True
                 # The prose lane drops ~1500 tokens of tool protocol and can
                 # therefore keep more history. It replaces the held report
@@ -4423,6 +5335,8 @@ class Agent:
             yield pending_context
             pending_context = None
 
+        # Reasoning tokens one step may spend (P6); 0 = no cap.
+        think_cap = max(0, int(getattr(self.config, "think_max_tokens", 0) or 0))
         for step in range(1, self.config.agent_max_steps + 1):
             if cancel is not None and cancel.is_set():
                 yield {"type": "cancelled", "step": step, "trace": trace,
@@ -4504,7 +5418,7 @@ class Agent:
                 try:
                     async for event in self.stream_lane(stream, lane, step=step,
                                                         cancel=cancel, stats=stats,
-                                                        known=known):
+                                                        known=known, think_cap=think_cap):
                         yield event
                     buffer = lane.text
                     cancelled = lane.cancelled
@@ -4580,9 +5494,56 @@ class Agent:
                 yield done(self.salvage(conversation_id, note), step, truncated=True)
                 return
 
+            if lane.think_capped and not cancelled:
+                # The step spent its reasoning budget (THINK_MAX_TOKENS) still
+                # thinking (P6). Conversation 3's second step reasoned for all
+                # 2048 tokens of its reply and answered nothing. Ask once for
+                # the answer only, with the reasoning so far in front of the
+                # model; if that is cut off too, what it worked out is the
+                # answer rather than nothing.
+                account(stats)
+                reasoning_log.append((step, lane.thinking))
+                yield {"type": "usage", "step": step,
+                       **_ag_stamp_queue(stats).as_event()}
+                thoughts = lane.thinking.strip()
+                log(f"step {step}: still reasoning after {think_cap} tokens; asking "
+                    "for the answer only.", logging.INFO)
+                yield {"type": "notice", "step": step, "info": True,
+                       "message": f"still thinking after {think_cap} tokens; asking "
+                                  "for the answer now"}
+                retry_messages = list(messages) + [
+                    {"role": "assistant", "content": thoughts or "(thinking)"},
+                    {"role": "user", "content": (_AG_THINK_CAP_PROSE if prose_lane
+                                                 else _AG_THINK_CAP_TOOLS)}]
+                stats = GenerationStats()
+                stream = self.client.stream(attach(retry_messages), gen_reserve,
+                                            step_temperature, stats, kind=gen_kind)
+                lane = _AgLane(ToolCallStreamDetector(known))
+                try:
+                    async for event in self.stream_lane(stream, lane, step=step,
+                                                        cancel=cancel, stats=stats,
+                                                        known=known, think_cap=think_cap):
+                        yield event
+                except Exception as exc:  # noqa: BLE001 - salvaged below
+                    log(f"step {step}: the answer-only retry failed: {exc}",
+                        logging.DEBUG)
+                finally:
+                    await stream.aclose()
+                buffer = lane.text
+                cancelled = lane.cancelled
+                if not cancelled and not strip_reasoning(buffer).strip():
+                    # Salvage: the reasoning is the closest thing to an answer
+                    # this step produced, and it is labelled as such.
+                    worked = "\n\n".join(t for t in (thoughts, lane.thinking.strip()) if t)
+                    log(f"step {step}: the retry reasoned past the cap as well; "
+                        "answering with the reasoning so far.", logging.WARNING)
+                    buffer = ("I ran out of thinking room before reaching a final "
+                              "answer. This is as far as my reasoning got:\n\n"
+                              + (worked or "(nothing usable)"))
+
             account(stats)
             reasoning_log.append((step, lane.thinking))
-            yield {"type": "usage", "step": step, **stats.as_event()}
+            yield {"type": "usage", "step": step, **_ag_stamp_queue(stats).as_event()}
 
             if cancelled:
                 yield {"type": "cancelled", "step": step,
@@ -4649,7 +5610,8 @@ class Agent:
                         logging.WARNING)
                     if bad_names > 2:
                         forced = await self.forced_prose_answer(
-                            history, user_message, reserve, temperature, task)
+                            history, user_message, reserve, temperature, task,
+                            retrieval=retrieval)
                         yield done(forced or "I could not produce an answer for that. "
                                              "Try rephrasing it, or ask me to continue.",
                                    step)
@@ -4720,7 +5682,8 @@ class Agent:
                 # It insisted again: force a plain, tool-free answer on a prompt
                 # that never mentions tools in the first place.
                 direct = await self.forced_prose_answer(
-                    history, user_message, reserve, temperature, task)
+                    history, user_message, reserve, temperature, task,
+                    retrieval=retrieval)
                 # If THAT comes back as "I can't, I have no access", the model
                 # has now said three times over that this turn needs a tool, and
                 # the router's one-shot guess is the only thing still claiming
@@ -4804,7 +5767,8 @@ class Agent:
                 # Out of nudges: one forced tool-free pass beats handing back a
                 # blank turn, which is what yielding "" here did.
                 forced = draft or await self.forced_prose_answer(
-                    history, user_message, reserve, temperature, task)
+                    history, user_message, reserve, temperature, task,
+                    retrieval=retrieval)
                 yield done(forced or "I could not produce an answer for that. Try "
                                      "rephrasing it, or ask me to continue.", step)
                 return
@@ -4919,9 +5883,17 @@ class Agent:
                                 "original question. You cannot see the work it did."})
                 continue
 
+            # The drafted skill (P4): the call carries a marker where the
+            # attached file's text goes, and gets the text back before anyone,
+            # the approval card included, sees the arguments.
+            if name == "save_skill" and skill_draft is not None:
+                args = _ag_fill_skill(args, skill_draft)
             signature = _ag_signature(name, args)
-            short = None
-            if signature in denied_calls:
+            short = _ag_not_offered(name, offered_tools)
+            doc_key = _ag_doc_key(args.get("path")) if name == "create_document" else ""
+            if short is not None:
+                pass                 # not offered: answered without running or asking
+            elif signature in denied_calls:
                 # Asked and refused already this turn: say so again rather
                 # than putting the same question to the user twice.
                 short = (denied_calls[signature], denied_calls[signature])
@@ -4930,10 +5902,16 @@ class Agent:
                     f"You already called {name} with these arguments and received a result. "
                     "Do not repeat it. Answer the user now with what you have, or call a "
                     "different tool.", None)
+            elif doc_key and doc_key in documents_done and not revision_asked:
+                # One write per document per turn unless the user asked for
+                # revisions (P5). Conversation 2 rewrote the same PDF five
+                # times, each a fresh guess rather than an improvement.
+                short = _ag_rewrite_refusal(str(args.get("path") or doc_key))
             outcome = None
             async for event in self._dispatch(name, args, conversation_id, step=step,
                                               call_id=call_id, started=announced,
-                                              cancel=cancel, short_circuit=short):
+                                              cancel=cancel, short_circuit=short,
+                                              confirm=name in confirm_tools):
                 if "__dispatched__" in event:
                     outcome = event["__dispatched__"]
                 else:
@@ -4963,6 +5941,10 @@ class Agent:
                                      describe_document(
                                          Path(str(args.get("path") or "")).suffix.lower()))
                 self.save_task(conversation_id, task)
+            wrote_document = bool(name == "create_document" and not error and not denied
+                                  and short is None)
+            if wrote_document:
+                documents_done[_ag_doc_key(args.get("path"))] = str(args.get("content") or "")
             yield {"type": "tool_result", "id": outcome.call_id, "name": name,
                    "result": result, "error": error,
                    "step": step, "context_chars": len(result_for_model),
@@ -4973,6 +5955,13 @@ class Agent:
                         + (f", error: {error}" if error else ""))
             if ev:
                 yield ev
+            if wrote_document and doc_format and not revision_asked:
+                # The file exists, which is what the turn was for (P5). The
+                # reply names it and lists what is in it, from the Markdown
+                # the model just wrote, with no further model call: another
+                # step here is where the same file got written again.
+                yield done(self.document_reply(args), step)
+                return
 
             scratch.append({"role": "assistant", "content": strip_reasoning(buffer).strip()})
             scratch.append({
@@ -5046,16 +6035,24 @@ class Agent:
                         yield done(answer, step, truncated=True)
                         return
                     continue
+                if name == "save_skill" and skill_draft is not None:
+                    args = _ag_fill_skill(args, skill_draft)
                 signature = _ag_signature(name, args)
-                short = None
-                if signature in denied_calls:
+                short = _ag_not_offered(name, offered_tools)
+                doc_key = _ag_doc_key(args.get("path")) if name == "create_document" else ""
+                if short is not None:
+                    pass             # not offered: answered without running or asking
+                elif signature in denied_calls:
                     short = (denied_calls[signature], denied_calls[signature])
                 elif signature in seen_calls:
                     short = ("Already ran that; use the result you have or try "
                              "another tool.", None)
+                elif doc_key and doc_key in documents_done and not revision_asked:
+                    short = _ag_rewrite_refusal(str(args.get("path") or doc_key))
                 outcome = None
                 async for event in self._dispatch(name, args, conversation_id, step=step,
-                                                  cancel=cancel, short_circuit=short):
+                                                  cancel=cancel, short_circuit=short,
+                                                  confirm=name in confirm_tools):
                     if "__dispatched__" in event:
                         outcome = event["__dispatched__"]
                     else:
@@ -5072,6 +6069,13 @@ class Agent:
                 trace.append({"name": name, "args": args, "result": result[:1000], "error": error})
                 yield {"type": "tool_result", "id": outcome.call_id, "name": name,
                        "result": result, "error": error, "step": step}
+                if (name == "create_document" and not error and not denied
+                        and short is None):
+                    documents_done[_ag_doc_key(args.get("path"))] = str(
+                        args.get("content") or "")
+                    if doc_format and not revision_asked:
+                        yield done(self.document_reply(args), step)
+                        return
                 scratch.append({"role": "assistant", "content": strip_reasoning(buffer).strip()})
                 scratch.append({"role": "user", "content": (
                     outcome.scratch_note() if denied

@@ -2321,14 +2321,18 @@ def test_cross_session_recall_is_a_tool_and_is_per_user():
     db.commit()
     assert "search_past_conversations" in reg.names()
     set_acting_user("me")
-    out, err = reg.call("search_past_conversations", {"query": "libusb"}, None)
-    assert err is None, err
-    assert "libusb for the driver" in out, out
-    # One account must never read another's history.
-    assert "private note" not in out, out
-    out2, _ = reg.call("search_past_conversations", {"query": "nothing matches this"}, None)
-    assert "Nothing in past conversations matches" in out2
-    db.close()
+    try:
+        out, err = reg.call("search_past_conversations", {"query": "libusb"}, None)
+        assert err is None, err
+        assert "libusb for the driver" in out, out
+        # One account must never read another's history.
+        assert "private note" not in out, out
+        out2, _ = reg.call("search_past_conversations", {"query": "nothing matches this"}, None)
+        assert "Nothing in past conversations matches" in out2
+    finally:
+        # Unbound again: a later test in this process would otherwise run as "me".
+        set_acting_user(None)
+        db.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -4063,7 +4067,8 @@ def test_a_request_for_a_file_never_goes_down_the_tool_free_lane():
     calls = [e["name"] for e in events if e.get("type") == "tool_call"]
     assert calls == ["create_document"], calls
     final = [e for e in events if e["type"] == "final"][-1]
-    assert final["documents"] == ["q3.pdf"], final["documents"]
+    # A bare name lands in OUTPUTS_DIR (Phase B, P5), not the project root.
+    assert final["documents"] == ["outputs/q3.pdf"], final["documents"]
     db.close()
 
 
@@ -4097,10 +4102,12 @@ def test_the_documents_list_is_per_turn():
     call = json.dumps({"tool": "create_document",
                        "args": {"path": "one.pdf", "content": "# One"}})
     agent, cfg, db, reg, client = _agent(
-        [call, "Made one.pdf.", '{"action":"answer"}', "TCP is a protocol."],
+        # No "Made one.pdf." step: the first successful create_document ends a
+        # document turn (Phase B, P5).
+        [call, '{"action":"answer"}', "TCP is a protocol."],
         knowledge_triage=True, agent_max_steps=3)
     first = asyncio.run(_run(agent, "write me a pdf about one", []))
-    assert [e for e in first if e["type"] == "final"][-1]["documents"] == ["one.pdf"]
+    assert [e for e in first if e["type"] == "final"][-1]["documents"] == ["outputs/one.pdf"]
     second = asyncio.run(_run(agent, "how do tcp handshakes work", []))
     assert [e for e in second if e["type"] == "final"][-1]["documents"] == []
     db.close()
@@ -4124,10 +4131,12 @@ def test_an_edit_to_a_generated_document_produces_a_new_file():
     The follow-up names no format, no file and no subject. What makes it a
     document turn is that a document is what is being worked on, which means it
     needs task state of its own."""
+    # One reply per turn: a document turn ends at its first successful
+    # create_document and words the closing line itself (Phase B, P5), so no
+    # "Created the invoice PDF." step follows the call any more.
     agent, cfg, db, reg, client = _agent(
-        [_doc_call("construction-invoice.pdf", INVOICE_MD), "Created the invoice PDF.",
-         _doc_call("construction-invoice.pdf", INVOICE_MD + "\nTexcel BV\n"),
-         "Restyled it with the Texcel header."],
+        [_doc_call("construction-invoice.pdf", INVOICE_MD),
+         _doc_call("construction-invoice.pdf", INVOICE_MD + "\nTexcel BV\n")],
         knowledge_triage=True, agent_max_steps=3)
     history = []
     first = asyncio.run(_run(agent, "create a pdf for construction invoice", history))
@@ -4139,7 +4148,7 @@ def test_an_edit_to_a_generated_document_produces_a_new_file():
     calls = [e["name"] for e in second if e.get("type") == "tool_call"]
     assert calls == ["create_document"], f"the edit produced no file: {calls}"
     final = [e for e in second if e["type"] == "final"][-1]
-    assert final["documents"] == ["construction-invoice.pdf"], final["documents"]
+    assert final["documents"] == ["outputs/construction-invoice.pdf"], final["documents"]
     # The edit is applied to the document's SOURCE, which only ever existed in
     # the previous turn's tool call -- the rendered PDF is bytes the model cannot
     # read back, so without recording it the "edit" is a rewrite from memory.
@@ -4154,9 +4163,10 @@ def test_a_format_change_keeps_the_source_and_moves_the_file():
     """"now make it a word document" is the same document in another format. The
     source has to survive and the path has to follow, or the model is told to
     write a .docx to a .pdf."""
+    # One reply per turn: the first successful create_document ends a document
+    # turn (Phase B, P5).
     agent, cfg, db, reg, client = _agent(
-        [_doc_call("invoice.pdf", INVOICE_MD), "Created invoice.pdf.",
-         _doc_call("invoice.docx", INVOICE_MD), "Converted it to Word."],
+        [_doc_call("invoice.pdf", INVOICE_MD), _doc_call("invoice.docx", INVOICE_MD)],
         knowledge_triage=True, agent_max_steps=3)
     asyncio.run(_run(agent, "create a pdf for construction invoice", []))
     events = asyncio.run(_run(agent, "now make it a word document", []))
@@ -4164,7 +4174,7 @@ def test_a_format_change_keeps_the_source_and_moves_the_file():
     assert "Construction Invoice" in prompt, "the source was lost in the conversion"
     assert "invoice.docx" in prompt, "the brief still names the old .pdf path"
     final = [e for e in events if e["type"] == "final"][-1]
-    assert final["documents"] == ["invoice.docx"], final["documents"]
+    assert final["documents"] == ["outputs/invoice.docx"], final["documents"]
     db.close()
 
 
@@ -4455,7 +4465,7 @@ def test_a_document_request_that_asks_for_research_searches_first():
     prompt = "\n".join(m["content"] for p in client.prompts for m in p)
     assert "STEP 1" in prompt and "RESEARCH" in prompt, "never told to look it up"
     final = [e for e in events if e["type"] == "final"][-1]
-    assert final["documents"] == ["end-year-analysis-texcel.docx"], final["documents"]
+    assert final["documents"] == ["outputs/end-year-analysis-texcel.docx"], final["documents"]
     db.close()
 
     # A request with nothing to look up does not pay for the lookup tools.
@@ -4485,7 +4495,7 @@ def test_a_tool_call_cut_off_mid_json_is_not_shown_as_the_answer():
     notices = [e["message"] for e in events if e.get("type") == "notice"]
     assert any("cut off" in n for n in notices), notices
     final = [e for e in events if e["type"] == "final"][-1]
-    assert final["documents"] == ["x.docx"], final["documents"]
+    assert final["documents"] == ["outputs/x.docx"], final["documents"]
     assert "lorem" not in final["answer"], "the half-written call leaked into the answer"
     db.close()
 
