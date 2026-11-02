@@ -3227,8 +3227,14 @@ class ToolRegistry:
         return f"$ {cmd}\n" + self._exec(cmd, shell=True,
                                          timeout=self.config.test_timeout)
 
-    def call(self, name: str, args: dict, conversation_id: str | None = None) -> tuple[str, str | None]:
-        """Run a tool. Returns (result text, error message or None)."""
+    def call(self, name: str, args: dict, conversation_id: str | None = None, *,
+             own_request: bool = False) -> tuple[str, str | None]:
+        """Run a tool. Returns (result text, error message or None).
+
+        own_request: the user asked for this call themselves (they clicked the
+        answer check's "Check"), so their own "ask me first" is answered; the
+        administrator's TOOL_APPROVAL_MODE floor still applies (policy.py).
+        """
         tool = self.get(name)
         start = time.time()
         # Bind on the shared instance for backward compat, but the source of
@@ -3265,7 +3271,8 @@ class ToolRegistry:
         # contextvar, so this signature (and tests that swap call for a
         # lambda) stay as they were. TOOL_APPROVAL_MODE=off with no override
         # rows returns at once: today's behaviour, no database access.
-        refusal = enforce_tool_policy(self, tool, name, args, conversation_id)
+        refusal = enforce_tool_policy(self, tool, name, args, conversation_id,
+                                      own_request=own_request)
         if refusal:
             if self.db:
                 self.db.log_tool_call(conversation_id, name, clean, "", 0.0, refusal,

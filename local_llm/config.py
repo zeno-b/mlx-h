@@ -62,7 +62,9 @@ def is_usable_cutoff(value) -> bool:
 
 @dataclass
 class Config:
-    model: str = DEFAULT_MODEL
+    # The served model: MODEL_ID in .env, read when the Config is built. There
+    # is no built-in default; empty means none is set (cli.main says so).
+    model: str = field(default_factory=lambda: os.environ.get("MODEL_ID", "").strip())
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     # Identity line prepended to the system prompt so the model states who it is
     # rather than falling back on the base model's pretrained identity (e.g.
@@ -269,6 +271,28 @@ class Config:
     # 8GB machine. Roughly char_cap/4 tokens.
     auto_fetch_char_cap: int = field(default_factory=lambda: int(
         os.environ.get("AUTO_FETCH_CHAR_CAP") or _default_fetch_cap(TOTAL_RAM_GB)))
+    # Worker threads for one batch of web searches or page fetches: the pages
+    # read after an agent search, and the answer check below. The work is
+    # network wait, which overlaps on threads; 1 runs every batch one call at
+    # a time, as it was before.
+    search_workers: int = field(default_factory=lambda: int(os.environ.get("SEARCH_WORKERS", "4")))
+    # Auto mode's second look (refine.py). A page left open on a finished
+    # answer for AUTO_REFINE_DELAY_S asks the server to check the answer
+    # against web sources and improve it. Only the web UI in Auto mode asks,
+    # only while the page is open, and never for a question about the user's
+    # own material; 0 switches the check off for everyone.
+    auto_refine: bool = field(default_factory=lambda: os.environ.get("AUTO_REFINE", "1") == "1")
+    auto_refine_delay_s: int = field(default_factory=lambda: int(
+        os.environ.get("AUTO_REFINE_DELAY_S", "60")))
+    # Result pages the check reads. They share the context left over after
+    # the question and the answer, so more pages means a shorter excerpt each.
+    auto_refine_sources: int = field(default_factory=lambda: int(
+        os.environ.get("AUTO_REFINE_SOURCES", "3")))
+    # Rounds one answer gets. Each round after the first reads only pages no
+    # round has read yet; 0 keeps going for as long as the page stays open
+    # (rounds that change nothing space themselves out, up to 16 intervals).
+    auto_refine_max_rounds: int = field(default_factory=lambda: int(
+        os.environ.get("AUTO_REFINE_MAX_ROUNDS", "0")))
     agent_max_steps: int = field(default_factory=lambda: int(os.environ.get("AGENT_MAX_STEPS", "6")))
     # How hard the agent thinks about an ordinary question. A small model answers
     # the instant it can, not the instant it should: four out of five turns used
@@ -902,9 +926,9 @@ class Config:
     # recorded on the parsed call; tool names are never invented.
     tool_call_repair: bool = field(default_factory=lambda: os.environ.get("TOOL_CALL_REPAIR", "1") == "1")
     # Model catalogue (catalog.py). MODEL_ALIASES is a JSON object of
-    # {"alias": "repo/id"} merged over the built-in aliases (fast, balanced,
-    # coder, reasoning, vision, tiny, large). model_alias is informational: the
-    # alias --model / MODEL_ID named, while `model` always holds the resolved id.
+    # {"alias": "repo/id"}, the only aliases there are: none are built in.
+    # model_alias is informational: the alias --model / MODEL_ID named, while
+    # `model` always holds the resolved id.
     model_aliases: str = field(default_factory=lambda: os.environ.get("MODEL_ALIASES", "").strip())
     model_alias: str = ""
     # Benchmark recommendation (deploy.py recommend): the slowest decode speed a
@@ -1203,6 +1227,8 @@ class Config:
         # search_backend is intentionally NOT mutable: the provider is locked to
         # DuckDuckGo Lite and cannot be changed from the UI or the API.
         "search_results", "tool_result_chars", "tool_raw_chars", "auto_fetch_results",
+        "search_workers", "auto_refine", "auto_refine_delay_s", "auto_refine_sources",
+        "auto_refine_max_rounds",
         "disable_thinking", "reasoning_visible", "tool_temperature", "fast_path", "stable_prefix", "knowledge_triage", "agent_escalation",
         "auto_continue", "auto_continue_max",
         "summarise_tool_results", "summarise_over_chars",
@@ -1494,6 +1520,10 @@ class Config:
         self.max_generation_timeout = min(
             7200.0, max(float(self.stall_timeout), self.max_generation_timeout))
         self.auto_fetch_char_cap = min(60000, max(1000, self.auto_fetch_char_cap))
+        self.search_workers = min(8, max(1, self.search_workers))
+        self.auto_refine_delay_s = min(3600, max(10, self.auto_refine_delay_s))
+        self.auto_refine_sources = min(6, max(1, self.auto_refine_sources))
+        self.auto_refine_max_rounds = min(1000, max(0, self.auto_refine_max_rounds))
         # The cap can never be below the ordinary step budget.
         self.hard_step_cap = min(60, max(self.agent_max_steps, self.hard_step_cap))
         self.reasoning_max_steps = min(10, max(2, self.reasoning_max_steps))

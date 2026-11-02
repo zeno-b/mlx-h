@@ -905,6 +905,20 @@ UI_CSS = r"""
    }
    @keyframes gspin { to { transform: rotate(360deg); } }
    body.hide-metrics .gmeta, body.hide-metrics .composer-meta { display: none; }
+   /* Auto mode's answer check: a small timeline of its own under the answer,
+      built from the same trace pieces. The answer it improves on is dimmed. */
+   .refine { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; margin-top: var(--sp-1); }
+   .refine .gactivity .btn { min-height: 22px; padding: 0 var(--sp-2); font-size: var(--fs-xs); }
+   .refine-status { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); margin-left: 6px; font-size: var(--fs-sm); color: var(--muted); }
+   .refine-status .btn { min-height: 22px; padding: 0 var(--sp-2); font-size: var(--fs-xs); }
+   .refine-status:empty, .refine-answer:empty { display: none; }
+   .refine-sources { display: flex; flex-wrap: wrap; gap: var(--sp-1) var(--sp-3); margin: 0 0 0 6px; font-size: var(--fs-xs); }
+   .refine-sources a { color: var(--link); text-decoration: none; overflow-wrap: anywhere; }
+   .refine-sources a:hover { text-decoration: underline; }
+   .gnode.answer.superseded .gtext { opacity: 0.6; }
+   .msg-original { margin-top: var(--sp-2); }
+   .msg-original > summary { cursor: pointer; user-select: none; color: var(--muted); font-size: var(--fs-xs); }
+   .msg-original-body { margin-top: var(--sp-1); color: var(--muted); }
 
    /* ============================================================= feedback */
    .feedback { align-self: flex-start; display: flex; flex-wrap: wrap; gap: var(--sp-1); margin: 0 0 var(--sp-2) 6px; }

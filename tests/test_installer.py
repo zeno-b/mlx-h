@@ -22,6 +22,7 @@ sys.path.insert(0, str(REPO))
 import local_llm.setup_cmds as setup  # noqa: E402
 from local_llm.envfile import (DOTENV_LOADED_VAR, DOTENV_SWITCH_VAR, load_dotenv,  # noqa: E402
                                parse_dotenv)
+from fake_models import fake_hf_cache, fake_model  # noqa: E402
 
 INSTALL_SH = REPO / "install.sh"
 FORMULA = REPO / "packaging" / "homebrew" / "local-llm.rb"
@@ -123,12 +124,16 @@ def test_recommend_starter_follows_tiers_and_keeps_headroom(tmp_path):
     rec64 = setup.recommend_starter(64, tmp_path)
     assert rec64["model_id"].endswith("32B-Instruct-4bit") and rec64["context_size"] == 32768
     assert rec64["max_concurrent_generations"] == 4 and rec64["admission_min_free_mb"] == 1536
-    # 14GB: the tier says 7B, which does not fit the GPU share; step down.
-    rec14 = setup.recommend_starter(14, tmp_path)
+    # 14GB: the tier says 7B. Its name estimates 3.9GB, which fits, so before
+    # the download the 7B stands; downloaded, its real 4.3GB does not fit the
+    # GPU share of a 14GB Mac, and init steps down.
+    assert setup.recommend_starter(14, tmp_path)["model_id"].endswith("7B-Instruct-4bit")
+    with fake_hf_cache() as hub:
+        fake_model(hub, "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit", size_gb=4.3)
+        rec14 = setup.recommend_starter(14, tmp_path)
     assert rec14["model_id"].endswith("3B-Instruct-4bit") and "stepped down" in rec14["reason"]
     for rec in (rec8, rec64, rec14):
-        assert setup.setup_model_fits(rec["model_id"], rec["ram_gb"]) in (True, None) or \
-            rec is rec14
+        assert setup.setup_model_fits(rec["model_id"], rec["ram_gb"], guess=True) is True
 
 
 def test_recommend_starter_prefers_an_applied_benchmark_that_fits(tmp_path):

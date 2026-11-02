@@ -37,6 +37,12 @@ that forgot did real damage:
    since the code under test may swallow the error.
 
 3. Approvals: APPROVAL_DEFAULT_MODE=off for the session (see below).
+
+4. The served model: MODEL_ID is set for the session (see below).
+
+5. The Hugging Face cache: an empty one for the session (see below).
+
+6. The .env file: a temporary one for the session (see below).
 """
 from __future__ import annotations
 
@@ -61,6 +67,31 @@ os.environ["LOG_DIR"] = str(_CT_LOG_DIR)
 #    environment for the same reason. Assigned, not setdefault: a value
 #    exported in the developer's shell must not change what the suite asserts.
 os.environ["APPROVAL_DEFAULT_MODE"] = "off"
+
+# 4. The served model. Nothing is built in any more: MODEL_ID names the model,
+#    and an installation without it refuses to start. The suite builds Config()
+#    everywhere and asserts what a configured install does, so the session names
+#    one, the 8GB starter `deploy.py init` suggests. Assigned for the same reason
+#    as above.
+os.environ["MODEL_ID"] = "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit"
+
+# 5. The Hugging Face cache. The catalogue reads what a model is from its files
+#    in this cache (size, context, thinking, vision, draft siblings), so a test
+#    run against the developer's real cache would assert whatever happens to be
+#    downloaded on that machine. The session gets an empty cache; a test that
+#    needs a downloaded model builds one with tests/fake_models.py. The real
+#    location stays in LOCAL_LLM_TEST_REAL_HF_CACHE for the one test that
+#    checks a real file when it is there.
+os.environ["LOCAL_LLM_TEST_REAL_HF_CACHE"] = os.environ.get("HF_HUB_CACHE") or str(
+    Path(os.environ["HF_HOME"]) / "hub" if os.environ.get("HF_HOME")
+    else Path.home() / ".cache" / "huggingface" / "hub")
+os.environ["HF_HUB_CACHE"] = tempfile.mkdtemp(prefix="llm-test-hf-cache-")
+
+# 6. The .env file. Applying a benchmark recommendation writes MODEL_ID and
+#    CONTEXT_SIZE into .env (diagnostics.apply_recommendation), so a test that
+#    applies one would rewrite the developer's real file. The session's .env is
+#    a temporary path nothing else reads.
+os.environ["LOCAL_LLM_ENV_FILE"] = str(Path(tempfile.mkdtemp(prefix="llm-test-env-")) / ".env")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 

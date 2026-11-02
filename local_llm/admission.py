@@ -147,11 +147,11 @@ def free_memory_bytes(max_age: float = 1.0) -> int | None:
 # --------------------------------------------------------------------------- #
 # KV cost estimate
 # --------------------------------------------------------------------------- #
-# fp16 KV bytes per token of the RAM-tier default model (core._default_model_for_ram),
-# used when the configured model's config.json is not on disk yet (first run,
-# before the download). Values computed from the published Qwen2.5-Coder
-# configs, 2 * layers * kv_heads * head_dim * 2 bytes: 32B (64, 8, 128),
-# 14B (48, 8, 128), 7B (28, 4, 128), 3B (36, 2, 128). Inference from those
+# fp16 KV bytes per token of the starter models `deploy.py init` suggests
+# (setup_cmds._SETUP_LADDER), used when the configured model's config.json is
+# not on disk yet (first run, before the download). Values computed from the
+# published Qwen2.5-Coder configs, 2 * layers * kv_heads * head_dim * 2 bytes:
+# 32B (64, 8, 128), 14B (48, 8, 128), 7B (28, 4, 128), 3B (36, 2, 128). Inference from those
 # model cards, not read from this machine's cache (only the 3B is cached here,
 # and the test checks that one against its real file).
 _ADM_FALLBACK_KV = ((48, 262144), (24, 196608), (14, 57344), (0, 36864))

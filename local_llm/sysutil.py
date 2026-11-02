@@ -383,21 +383,15 @@ DEFAULT_MODEL_CATALOG = [
 ]
 
 
-def hf_cache_dir() -> Path:
-    """Where huggingface_hub keeps downloaded repos."""
-    if os.environ.get("HF_HUB_CACHE"):
-        return Path(os.environ["HF_HUB_CACHE"])
-    if os.environ.get("HF_HOME"):
-        return Path(os.environ["HF_HOME"]) / "hub"
-    return Path.home() / ".cache" / "huggingface" / "hub"
-
-
 def model_is_cached(model_id: str) -> bool:
     """True when the weights are already on disk, so switching is instant.
 
     A miss is not an error: mlx_lm.server downloads on first use. The UI shows
     this so a switch that is about to pull several gigabytes says so up front.
     """
+    # Path("") is the current directory, which always exists.
+    if not str(model_id or "").strip():
+        return False
     if Path(model_id).expanduser().is_dir():
         return True
     folder = "models--" + model_id.replace("/", "--")
@@ -416,7 +410,7 @@ def model_catalog(config: "Config") -> list[dict]:
     # An alias passed straight to Config (deploy.py --list-models --model coder)
     # is shown as the repo it stands for, not as a model called "coder".
     current = resolve_model(config.model, config)
-    if current not in ids:
+    if current and current not in ids:
         ids.insert(0, current)
     # Catalogue metadata (catalog.py) is additive: id/cached/current keep their
     # meaning for every existing caller; the rest says what the model is and
@@ -455,7 +449,6 @@ __all__ = [
     'get_free_port',
     'help_cmd',
     'help_has_flag',
-    'hf_cache_dir',
     'list_adapters',
     'model_catalog',
     'model_is_cached',

@@ -34,6 +34,7 @@ from local_llm.llm import (GenerationStats, PROSE_REASONING_INSTRUCTION,  # noqa
                            REASONING_INSTRUCTION, reasoning_prompt_wanted)
 from local_llm.tools import ToolRegistry  # noqa: E402
 from local_llm.turnctx import TurnContext, reset_current_turn, set_current_turn  # noqa: E402
+from fake_models import LLAMA_TEMPLATE, QWEN3_TEMPLATE, fake_hf_cache, fake_model  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -661,20 +662,83 @@ def _system(model, tools=True, **overrides):
     return base[0]["content"]
 
 
+def _download_both(hub):
+    """The catalogue reads "thinking" from a downloaded model's chat template."""
+    fake_model(hub, THINKING_MODEL, size_gb=4.6, model_type="qwen3", template=QWEN3_TEMPLATE)
+    fake_model(hub, PLAIN_MODEL, size_gb=1.8, model_type="llama", vocab_size=128256,
+               template=LLAMA_TEMPLATE)
+
+
 def test_reasoning_instruction_only_for_catalogue_thinking_models():
-    assert REASONING_INSTRUCTION in _system(THINKING_MODEL)
-    assert PROSE_REASONING_INSTRUCTION in _system(THINKING_MODEL, tools=False)
-    assert REASONING_INSTRUCTION not in _system(PLAIN_MODEL)
-    assert REASONING_INSTRUCTION not in _system("someone/unknown-model-3b")
-    assert PROSE_REASONING_INSTRUCTION not in _system("someone/unknown-model-3b", tools=False)
+    with fake_hf_cache() as hub:
+        _download_both(hub)
+        assert REASONING_INSTRUCTION in _system(THINKING_MODEL)
+        assert PROSE_REASONING_INSTRUCTION in _system(THINKING_MODEL, tools=False)
+        assert REASONING_INSTRUCTION not in _system(PLAIN_MODEL)
+        assert REASONING_INSTRUCTION not in _system("someone/unknown-model-3b")
+        assert PROSE_REASONING_INSTRUCTION not in _system("someone/unknown-model-3b", tools=False)
+    # Not downloaded, a thinking model is unknown, and unknown gets no
+    # instruction: guessing "thinking" is the expensive mistake.
+    assert REASONING_INSTRUCTION not in _system(THINKING_MODEL)
 
 
 def test_reasoning_prompt_always_and_never_override_the_catalogue():
-    assert REASONING_INSTRUCTION in _system(PLAIN_MODEL, reasoning_prompt="always")
-    assert REASONING_INSTRUCTION not in _system(THINKING_MODEL, reasoning_prompt="never")
-    assert REASONING_INSTRUCTION not in _system(THINKING_MODEL, reasoning_visible=False)
+    with fake_hf_cache() as hub:
+        _download_both(hub)
+        assert REASONING_INSTRUCTION in _system(PLAIN_MODEL, reasoning_prompt="always")
+        assert REASONING_INSTRUCTION not in _system(THINKING_MODEL, reasoning_prompt="never")
+        assert REASONING_INSTRUCTION not in _system(THINKING_MODEL, reasoning_visible=False)
+        assert reasoning_prompt_wanted(Config(model=THINKING_MODEL)) is True
     assert Config(reasoning_prompt="sometimes").reasoning_prompt == "auto"
-    assert reasoning_prompt_wanted(Config(model=THINKING_MODEL)) is True
+
+
+# --------------------------------------------------------------------------- #
+# A search the reply implied but never called: the "2027 cold outreach
+# strategy" turn printed "web_search", invented the results, and shipped them.
+# --------------------------------------------------------------------------- #
+def test_a_reply_that_only_names_web_search_runs_the_search():
+    agent, cfg, db, reg, client = _agent(
+        ["web_search\n\nBased on the search results, Tokyo has 9 million people.",
+         "Tokyo has about 14 million people."], auto_fetch_results=0)
+    calls = _record_calls(reg, result="1. Tokyo\n   https://stats.example.org/tokyo\n   14 million")
+    events = _drain(agent, "What is the population of Tokyo?")
+    db.close()
+    assert [name for name, _ in calls] == ["web_search"]
+    assert calls[0][1]["query"] == "What is the population of Tokyo?"
+    assert any("never ran" in e["message"] for e in _of(events, "notice"))
+    answer = _of(events, "final")[-1]["answer"]
+    assert answer.startswith("Tokyo has about 14 million") and "web_search" not in answer
+
+
+def test_a_claimed_search_with_nothing_safe_to_search_is_asked_again():
+    agent, cfg, db, reg, client = _agent(
+        ["Based on the search results, the server timeout in config.py is 30 seconds.",
+         "I have not seen config.py, so I cannot tell you its timeout."])
+    calls = _record_calls(reg)
+    events = _drain(agent, "what timeout does config.py set for the server?")
+    db.close()
+    assert calls == [], "the user's own file is never sent to a search engine"
+    assert "No search was run" in json.dumps(client.prompts[-1])
+    assert _of(events, "final")[-1]["answer"].startswith("I have not seen config.py")
+
+
+def test_a_bare_tool_name_never_reaches_the_answer():
+    agent, cfg, db, reg, client = _agent(["calculator\n\nTwo plus two is four."])
+    _record_calls(reg)
+    events = _drain(agent, "what is two plus two")
+    db.close()
+    assert _of(events, "final")[-1]["answer"] == "Two plus two is four."
+
+
+def test_the_router_hears_when_a_question_is_past_its_training_data():
+    agent, cfg, db, reg, client = _agent(['{"action": "answer", "known": true}'] * 2,
+                                         model_cutoff="2024-06")
+    asyncio.run(agent.route("prepare a 2027 cold outreach strategy"))
+    asyncio.run(agent.route("explain how a heat pump works"))
+    db.close()
+    future, timeless = (json.dumps(p) for p in client.prompts[-2:])
+    assert "at or after your training data" in future
+    assert "at or after your training data" not in timeless
 
 
 def test_a_step_that_thinks_past_the_cap_is_asked_for_the_answer():

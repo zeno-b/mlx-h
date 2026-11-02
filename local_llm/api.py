@@ -82,6 +82,8 @@ from .elo import *  # noqa: F401,F403
 from .companion import *  # noqa: F401,F403
 # Evaluation and regression suites: /api/evals/* (and the EVAL_ON_PROMOTE gate).
 from .evals import *  # noqa: F401,F403
+# Auto mode's answer check against the web: POST /api/chat/refine.
+from .refine import *  # noqa: F401,F403
 # ---- extension imports: one `from .<feature> import *` per feature, above this line ---- #
 
 # Request/Response must be resolvable at MODULE scope: with `from __future__
@@ -1185,6 +1187,12 @@ def create_app(
             "role": user.get("role"),
             "username": user.get("username"),
             "auth_enabled": config.auth_enabled,
+            # Auto mode's answer check (refine.py): the page arms its timer
+            # from these, so a change in Settings reaches open tabs on the
+            # next poll.
+            "auto_refine": config.auto_refine,
+            "auto_refine_delay_s": config.auto_refine_delay_s,
+            "auto_refine_max_rounds": config.auto_refine_max_rounds,
         }
         # Generation queue. Everyone sees the slot counts (a user staring at a
         # "queued" chip deserves to know it is 3 of 3 busy, not a hang); the
@@ -3350,6 +3358,7 @@ def create_app(
     register_elo(app, ctx)
     register_companion(app, ctx)
     register_evals(app, ctx)
+    register_refine(app, ctx)
     # ---- extension routes: one `register_<feature>(app, ctx)` per feature, above this line ---- #
 
     return app

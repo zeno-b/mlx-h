@@ -118,6 +118,7 @@ def selftest() -> int:
         "client",
         "eval_suites", "evals", "ui_script_evals",
         "intents",
+        "refine",
         # ---- extension modules: one name per feature module, above this line ---- #
     }
     _found = {p.stem for p in _pkg_dir.glob("*.py")} - {"__init__", "__main__"}

@@ -7,8 +7,10 @@ sized to match. It is the step install.sh (and the Homebrew wrapper) run after
 the checkout exists:
 
   * the model: an applied benchmark recommendation for this machine
-    (`deploy.py recommend --apply`) when there is one, otherwise core's RAM
-    tier, stepped down while it would not fit with headroom;
+    (`deploy.py recommend --apply`) when there is one, otherwise the starter
+    for its RAM tier (setup_tier_model), stepped down while it would not fit
+    with headroom. It is written as MODEL_ID, the one place the app reads it;
+    nothing is built in;
   * --multi-user turns login on, binds all interfaces and generates a strong
     AUTH_ADMIN_PASSWORD (printed once);
   * --cluster primary also generates NODE_TOKEN; --cluster secondary pairs
@@ -41,23 +43,26 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from .core import (DB_PATH, DEFAULT_MODEL, REQUIRED_MODULES, ROOT, TOTAL_RAM_GB,
+from .core import (DB_PATH, REQUIRED_MODULES, ROOT, TOTAL_RAM_GB,
                    _default_concurrent_generations, _default_context_for_ram,
-                   _default_model_for_ram, bootstrap, in_venv)
+                   bootstrap, hf_cache_dir, in_venv)
 from .catalog import fits_in_ram, model_metadata, read_recommendation, resolve_model
 from .envfile import DOTENV_LOADED_VAR, ENV_FILE_VAR, parse_dotenv
 from .sharding import cluster_cli
-from .sysutil import hf_cache_dir, model_is_cached, port_open
+from .sysutil import model_is_cached, port_open
 
 SERVICE_LABEL = "local.llm.server"
-# The RAM tiers core._default_model_for_ram picks from, largest first. init
-# walks down this ladder while a model would not fit with headroom.
+# The starter models init suggests, largest first, and the RAM each one wants
+# (setup_tier_model). init walks down this ladder while a model would not fit
+# with headroom. A suggestion written into .env as MODEL_ID, never a default
+# the app falls back on: it serves exactly what MODEL_ID names.
 _SETUP_LADDER = (
     "mlx-community/Qwen2.5-Coder-32B-Instruct-4bit",
     "mlx-community/Qwen2.5-Coder-14B-Instruct-4bit",
     "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit",
     "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit",
 )
+_SETUP_LADDER_RAM_GB = (48, 24, 14, 0)
 _SETUP_SECRET_KEY = re.compile(r"PASSWORD|TOKEN|SECRET|(^|_)KEY$")
 _SETUP_BARE_VALUE = re.compile(r"[A-Za-z0-9_./:@,+=-]*")
 _SETUP_TRUE_WORDS = ("true", "yes", "on")
@@ -70,6 +75,18 @@ _SETUP_SERVICE_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:
 # --------------------------------------------------------------------------- #
 # The recommendation
 # --------------------------------------------------------------------------- #
+
+def setup_tier_model(ram_gb: float) -> str:
+    """The starter model for a Mac this size by RAM tier alone, before any fit check.
+
+    Conservative, because unified memory is shared with the OS, the GPU wired
+    limit, the KV cache, the web process and a LoRA run: 8GB Macs get the 3B.
+    """
+    for floor, model in zip(_SETUP_LADDER_RAM_GB, _SETUP_LADDER):
+        if float(ram_gb) >= floor:
+            return model
+    return _SETUP_LADDER[-1]
+
 
 def setup_headroom_gb(ram_gb: float) -> float:
     """RAM kept free beside the weights: the benchmark's default rule."""
@@ -102,7 +119,7 @@ def recommend_starter(ram_gb: float | None = None, data_dir: Path | None = None)
     applied = read_recommendation(data_dir, ram_gb=ram)
     source, reason = "tier", f"RAM tier for {ram:.0f}GB"
     model, context = "", 0
-    if applied and setup_model_fits(str(applied["model_id"]), ram) is not False:
+    if applied and setup_model_fits(str(applied["model_id"]), ram, guess=True) is not False:
         model = str(applied["model_id"])
         try:
             context = int(applied.get("context_size") or 0)
@@ -110,20 +127,20 @@ def recommend_starter(ram_gb: float | None = None, data_dir: Path | None = None)
             context = 0
         source, reason = "benchmark", "measured on this Mac (deploy.py recommend --apply)"
     if not model:
-        # A path that cannot exist keeps core's helpers on the tiers alone.
-        nowhere = data_dir / "__no_recommendation__.json"
-        model = _default_model_for_ram(ram, nowhere)
+        tier = setup_tier_model(ram)
         ladder = list(_SETUP_LADDER)
-        start = ladder.index(model) if model in ladder else len(ladder)
-        for candidate in ladder[start:]:
+        model = tier
+        # guess=True: a starter is usually not downloaded yet, and the catalog
+        # has no built-in sizes any more, only the estimate from the repo name.
+        for candidate in ladder[ladder.index(tier):]:
             model = candidate
-            if setup_model_fits(candidate, ram) is not False:
+            if setup_model_fits(candidate, ram, guess=True) is not False:
                 break
-        if model != _default_model_for_ram(ram, nowhere):
+        if model != tier:
             reason += ", stepped down to keep headroom"
     if not 512 <= context <= 131072:
-        context = _default_context_for_ram(ram, data_dir / "__no_recommendation__.json")
-    meta = model_metadata(model, guess=False) or {}
+        context = _default_context_for_ram(ram)
+    meta = model_metadata(model, guess=True) or {}
     return {
         "model_id": model,
         "context_size": int(context),
@@ -618,18 +635,19 @@ def gather_install_facts(web_port: int = 8000, model_port: int = 8080, *,
     venv_python = root / ".venv" / "bin" / "python"
     venv_machine, venv_missing = (_setup_venv_probe(venv_python) if venv_python.exists()
                                   else ("", None))
+    wanted = os.environ.get("MODEL_ID", "").strip()
     try:
-        model = resolve_model(os.environ.get("MODEL_ID") or DEFAULT_MODEL)
+        model = resolve_model(wanted)
     except Exception:  # noqa: BLE001
-        model = os.environ.get("MODEL_ID") or DEFAULT_MODEL
-    meta = model_metadata(model, guess=True) or {}
+        model = wanted
+    meta = (model_metadata(model, guess=True) or {}) if model else {}
     env_path = Path(os.environ.get(ENV_FILE_VAR, "").strip() or root / ".env").expanduser()
     try:
         env_text = env_path.read_text(encoding="utf-8")
         env_mode = env_path.stat().st_mode & 0o777
     except OSError:
         env_text, env_mode = None, None
-    cached = model_is_cached(model)
+    cached = model_is_cached(model) if model else False
     return {
         "machine": platform.machine(), "translated": _setup_translated(),
         "python": tuple(sys.version_info[:3]), "in_venv": in_venv(),
@@ -683,7 +701,10 @@ def evaluate_install_facts(facts: dict) -> list[tuple[str, str, str]]:
 
     model = str(facts.get("model") or "")
     size = facts.get("model_size_gb")
-    if facts.get("model_cached"):
+    if not model:
+        add("fail", "model", "MODEL_ID is not set: run `deploy.py init` to pick one for this "
+                             "Mac, or add MODEL_ID=<repo id> to .env")
+    elif facts.get("model_cached"):
         add("ok", "model", f"{model} is downloaded")
     else:
         add("warn", "model", f"{model} is not downloaded yet: the first start fetches "
@@ -704,7 +725,9 @@ def evaluate_install_facts(facts: dict) -> list[tuple[str, str, str]]:
 
     ram = float(facts.get("ram_gb") or 0)
     floor = facts.get("model_min_ram_gb")
-    if not size or not floor:
+    if not model:
+        add("info", "ram", f"{ram:.0f}GB")
+    elif not size or not floor:
         add("info", "ram", f"{ram:.0f}GB; {model} is not in the catalogue, so its size is unknown")
     elif ram < float(floor):
         add("fail", "ram", f"{model} (~{float(size):.1f}GB) needs a {floor}GB Mac; this one has "
@@ -781,6 +804,7 @@ def print_install_checks(web_port: int = 8000, model_port: int = 8080, *,
 __all__ = [
     'SERVICE_LABEL',
     '_SETUP_LADDER',
+    '_SETUP_LADDER_RAM_GB',
     '_setup_ask',
     '_setup_env_rows',
     '_setup_free_gb',
@@ -809,5 +833,6 @@ __all__ = [
     'setup_headroom_gb',
     'setup_is_secret',
     'setup_model_fits',
+    'setup_tier_model',
     'setup_write_private',
 ]

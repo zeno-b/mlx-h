@@ -13,6 +13,7 @@ import csv
 import json
 import logging
 import asyncio
+import os
 import platform
 import re
 import shutil
@@ -32,6 +33,7 @@ from .model_server import *  # noqa: F401,F403
 from .backends import *  # noqa: F401,F403
 from .obslog import *  # noqa: F401,F403
 from .catalog import *  # noqa: F401,F403
+from .envfile import dotenv_path, read_dotenv, update_dotenv
 
 
 def export_to_csv(db: Database, path: Path) -> int:
@@ -668,13 +670,50 @@ def _bench_print_recommendation(rec: dict) -> None:
     print(f"  why: {rec['reason']}")
 
 
+def apply_recommendation(rec: dict, data_dir: Path | None = None,
+                         env_file: Path | None = None) -> dict:
+    """Make a recommendation the served model: MODEL_ID and CONTEXT_SIZE into .env.
+
+    .env is the only place the served model comes from (catalog.py), so applying
+    means writing it there. envfile.update_dotenv keeps every other line and
+    comment; the pick is also recorded (recommendation.json) for the switcher's
+    badge and `deploy.py init`. It takes effect on the next start. The running
+    process's environment is left alone: a server that changed MODEL_ID under
+    itself would build per-turn configs for a model it is not serving.
+
+    Returns {"env_file", "record", "updates", "shadowed"}; shadowed lists the
+    variables the process environment sets to something else than the file,
+    which win over it, so the change would not take until they are unset.
+    """
+    if not rec or not rec.get("model_id"):
+        raise ValueError("nothing to apply: the recommendation has no model")
+    updates: dict = {"MODEL_ID": str(rec["model_id"])}
+    if rec.get("context_size"):
+        updates["CONTEXT_SIZE"] = int(rec["context_size"])
+    target = Path(env_file) if env_file is not None else dotenv_path()
+    before = read_dotenv(target)
+    shadowed = [key for key in updates
+                if os.environ.get(key) is not None and os.environ.get(key) != before.get(key)]
+    record = write_recommendation(rec, data_dir)
+    written = update_dotenv(updates, target, environ={})
+    return {"env_file": str(written), "record": str(record), "updates": updates,
+            "shadowed": shadowed}
+
+
 def _bench_apply(rec: dict) -> int:
     if not rec.get("model_id"):
         print("Nothing applied.")
         return 1
-    path = write_recommendation(rec)
-    print(f"Wrote {path}. It becomes the default MODEL_ID / CONTEXT_SIZE on the next "
-          "start, unless those are set in the environment.")
+    try:
+        done = apply_recommendation(rec)
+    except OSError as exc:
+        print(f"Could not write the .env file: {exc}")
+        return 1
+    pairs = " ".join(f"{key}={value}" for key, value in done["updates"].items())
+    print(f"Wrote {pairs} to {done['env_file']}. Restart to serve it.")
+    for key in done["shadowed"]:
+        print(f"  {key} is also set in this shell's environment, which wins over .env: "
+              f"unset it for the new value to take.")
     extras = []
     if rec.get("backend") and rec["backend"] != DEFAULT_BACKEND:
         extras.append(f"MODEL_BACKEND={rec['backend']}")
@@ -736,7 +775,8 @@ def recommend_cli(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="deploy.py recommend",
                                      description="Recommend a model from saved sweeps.")
     parser.add_argument("--apply", action="store_true",
-                        help="Write it as this machine's default MODEL_ID / CONTEXT_SIZE.")
+                        help="Write it into .env as MODEL_ID and CONTEXT_SIZE (served from "
+                             "the next start).")
     parser.add_argument("--file", default="", help="A sweep file under DATA_DIR/bench.")
     args = parser.parse_args(argv)
     doc = load_bench_run(bench_dir() / args.file) if args.file else latest_bench_run()
@@ -800,7 +840,7 @@ class _BenchJob:
         self.state: dict = {"running": False, "started_at": None, "finished_at": None,
                             "done": 0, "total": 0, "current": "", "error": "",
                             "file": "", "recommendation": None, "applied": False,
-                            "log": []}
+                            "env_file": "", "log": []}
 
     def progress(self, done: int, total: int, current: str) -> None:
         with self.lock:
@@ -848,12 +888,15 @@ def _bench_job_body(job: _BenchJob, ctx: Any, opts: dict) -> None:
             rss_sampler=ctx.extras.get("bench_rss_sampler"),
             progress=job.progress, out=job.line)
         applied = False
+        env_file = ""
         if opts["apply"] and (doc.get("recommendation") or {}).get("model_id"):
-            write_recommendation(doc["recommendation"])
-            applied = True
+            done = apply_recommendation(doc["recommendation"])
+            applied, env_file = True, done["env_file"]
+            job.line(f"Wrote MODEL_ID={done['updates']['MODEL_ID']} to {env_file}; "
+                     "it is served from the next start.")
         with job.lock:
             job.state.update(file=doc.get("file", ""), recommendation=doc.get("recommendation"),
-                             applied=applied)
+                             applied=applied, env_file=env_file)
     except Exception as exc:  # noqa: BLE001
         log(f"Benchmark sweep failed: {exc}", logging.WARNING)
         with job.lock:
@@ -999,6 +1042,7 @@ __all__ = [
     '_bench_sizes',
     '_bench_tree_rss_mb',
     '_report_against_baseline',
+    'apply_recommendation',
     'bench_cli',
     'bench_matrix',
     'benchmark',

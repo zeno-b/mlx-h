@@ -339,6 +339,8 @@ UI_JS_MODELS = r"""   // -------------------------------------------------------
 
    async function regenerateLast() {
      if (busy) { uiToast("Wait for the current answer to finish.", "warn"); return; }
+     // The answer being regenerated is the one a check would be about.
+     chatRefineCancel();
      try {
        var r = await fetchJSON("/api/conversation/" + encodeURIComponent(conversationId) + "/regenerate",
                                { method: "POST" });

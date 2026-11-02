@@ -1,8 +1,8 @@
 """Allows `python -m local_llm` to run the app exactly like the old script.
 
 `python -m` imports the package (whose __init__ imports everything, core
-included) before this file runs, so core's import-time defaults (DEFAULT_MODEL
-from MODEL_ID, APP_NAME, the login throttle...) are already computed when .env
+included) before this file runs, so core's import-time defaults (the RAM
+tiers, APP_NAME, the login throttle...) are already computed when .env
 could first be read here. When .env sets anything new, re-exec the same
 command once with those variables in the environment, so `python -m local_llm`
 and `python3 deploy.py` see the same configuration. The loader marks the

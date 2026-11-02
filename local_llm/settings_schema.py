@@ -806,6 +806,29 @@ SETTINGS_FIELDS: list[dict[str, Any]] = [
         "Most characters of a fetched page that may enter the prompt, so one large "
         "page cannot exhaust the context during prefill.",
         "number", min=1000, max=60000, step=500, unit="chars"),
+    _ss("search_workers", "tools", "Web", "Parallel searches",
+        "Searches and page fetches one batch runs at once, on worker threads. 1 runs "
+        "them one after another.",
+        "range", min=1, max=8, step=1),
+    _ss("auto_refine", "tools", "Web", "Keep checking answers against the web",
+        "In Auto mode, an answer left open in the page is checked against web sources "
+        "after the interval below, and again after every interval, each round reading "
+        "pages no earlier round read. An improved answer replaces the old one. "
+        "Questions about your own files or documents are never sent.",
+        "switch"),
+    _ss("auto_refine_delay_s", "tools", "Web", "Check interval",
+        "How long a finished answer stays untouched in an open page before the first "
+        "round, and between rounds. Rounds that change nothing wait longer, up to 16 "
+        "intervals.",
+        "number", min=10, max=3600, step=5, unit="s"),
+    _ss("auto_refine_max_rounds", "tools", "Web", "Rounds per answer",
+        "How many rounds one answer gets. 0 keeps checking for as long as the page "
+        "stays open.",
+        "number", min=0, max=1000, step=1),
+    _ss("auto_refine_sources", "tools", "Web", "Pages read by the check",
+        "Result pages the check reads. They share the context left after the question "
+        "and the answer, so more pages means a shorter excerpt of each.",
+        "range", min=1, max=6, step=1),
     _ss_info("search_backend", "tools", "Web", "Search provider",
              "Locked to DuckDuckGo Lite; no other provider exists.", "SEARCH_BACKEND"),
     _ss_info("allow_local_fetch", "tools", "Web", "Fetch local addresses",

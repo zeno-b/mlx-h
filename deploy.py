@@ -5,7 +5,7 @@ Every flag behaves exactly as before; the implementation now lives in the
 local_llm package next to this file.
 
 Before the package is imported, ./.env (or LOCAL_LLM_ENV_FILE) is applied to
-the environment, because local_llm.core computes DEFAULT_MODEL and other
+the environment, because local_llm.core computes the RAM tiers and other
 defaults at import time. Variables already set in the environment win. The
 loader is imported by file path: importing it as local_llm.envfile would run
 the package __init__, which imports everything, before the file was read.

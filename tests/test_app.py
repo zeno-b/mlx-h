@@ -1144,6 +1144,95 @@ def test_watchdog_spots_a_dead_generation_thread_in_the_backend_log():
     shutil.rmtree(root, ignore_errors=True)
 
 
+@contextlib.contextmanager
+def _watched_manager(**kw):
+    """A ready manager whose watchdog scans a throwaway model_server.log."""
+    mm = _manager(**kw)
+    restarts = []
+    mm._watchdog_restart = lambda reason: restarts.append(reason)
+    mm.status = "ready"
+
+    class _Alive:
+        def poll(self):
+            return None
+
+    mm.proc = _Alive()
+    root = Path(tempfile.mkdtemp())
+    saved_log_dir = model_server_mod.LOG_DIR
+    model_server_mod.LOG_DIR = root
+    log_path = root / "model_server.log"
+    log_path.touch()
+    mm._log_scan_pos = 0
+    try:
+        yield mm, restarts, log_path
+    finally:
+        model_server_mod.LOG_DIR = saved_log_dir
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _append_log(path: Path, data: bytes) -> None:
+    with path.open("ab") as handle:
+        handle.write(data)
+
+
+def test_watchdog_spots_the_death_record_newer_mlx_lm_writes():
+    """mlx-lm 0.32.2 catches the exception itself, so there is no "Exception in
+    thread" line, and the restart reason should carry the cause it logs."""
+    with _watched_manager() as (mm, restarts, log_path):
+        _append_log(log_path, (
+            b"2026-11-01 19:24:50,123 - ERROR - mlx_lm.server generation thread died: "
+            b"[metal::malloc] Attempting to allocate 21474836480 bytes which is greater "
+            b"than the maximum allowed buffer size of 17179869184 bytes.\n"
+            b"Traceback (most recent call last):\n"
+            b"  File \"mlx_lm/server.py\", line 544, in _run_generate\n"
+            b"    self._generate()\n"
+            b"ValueError: [metal::malloc] Attempting to allocate 21474836480 bytes\n"))
+        assert mm._watchdog_cheap_checks() is False
+        assert len(restarts) == 1, restarts
+        assert "[metal::malloc] Attempting to allocate" in restarts[0], restarts
+
+
+def test_watchdog_spots_a_request_refused_by_a_dead_generation_thread():
+    with _watched_manager() as (mm, restarts, log_path):
+        # A prompt that quotes the error is logged inside a record, not as a
+        # traceback line, and must not restart anything.
+        _append_log(log_path, (
+            b"2026-11-01 19:24:40,000 - ERROR - JSONDecodeError: Expecting value - "
+            b"Raw body: {\"content\": \"RuntimeError: generation thread died\"}\n"))
+        assert mm._watchdog_cheap_checks() is False
+        assert restarts == [], restarts
+        # The traceback of a request that was in flight when the thread died.
+        _append_log(log_path, (
+            b"Traceback (most recent call last):\n"
+            b"  File \"mlx_lm/server.py\", line 1160, in _await_response\n"
+            b"    raise RuntimeError(\"generation thread died\") from None\n"
+            b"RuntimeError: generation thread died\n"))
+        assert mm._watchdog_cheap_checks() is False
+        assert len(restarts) == 1, restarts
+
+
+def test_a_failed_probe_does_not_read_its_own_log_line_as_proof_of_life():
+    """A server that answers every completion with an error writes an access
+    line per probe. That line used to wipe the failure streak every time."""
+    access_404 = b"127.0.0.1 - - [x] \"POST /v1/chat/completions HTTP/1.1\" 404 -\n"
+    with _watched_manager(probe_failures=3, probe_interval=0.0) as (mm, restarts, log_path):
+        for _ in range(2):
+            assert mm._watchdog_cheap_checks() is True, "quiet log should be probed"
+            _append_log(log_path, access_404)       # written by the probe itself
+            mm._watchdog_record_probe(False)
+        assert mm._probe_failures == 2
+        # Output the probe did not cause is the backend working again.
+        _append_log(log_path, b"2026-11-01 19:30:00,000 - INFO - Prompt processing progress: 1/1\n")
+        assert mm._watchdog_cheap_checks() is False
+        assert mm._probe_failures == 0
+        for _ in range(3):
+            assert mm._watchdog_cheap_checks() is True, "quiet log should be probed"
+            _append_log(log_path, access_404)
+            mm._watchdog_record_probe(False)
+        assert len(restarts) == 1, restarts
+        assert "not generating" in restarts[0], restarts
+
+
 def test_watchdog_needs_consecutive_probe_failures_before_restarting():
     """A slow server must not be mistaken for a dead one."""
     mm = _manager(probe_failures=3)

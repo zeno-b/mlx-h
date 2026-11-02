@@ -9,6 +9,7 @@ switcher unresolved, and a new module missing from the bundle or the selftest.
 from __future__ import annotations
 
 import ast
+import json
 import re
 import sys
 import tempfile
@@ -20,9 +21,13 @@ import local_llm.config as config_mod  # noqa: E402
 config_mod.DATA_DIR = Path(tempfile.mkdtemp(prefix="llm-test-wave2-"))
 
 from local_llm.backends import _backends_resolve_draft, backend_names, get_backend  # noqa: E402
-from local_llm.catalog import BUILTIN_MODEL_ALIASES, draft_for, resolve_model  # noqa: E402
+from local_llm.catalog import draft_for, resolve_model  # noqa: E402
 from local_llm.config import ADAPTER_DIR, Config  # noqa: E402
 from local_llm.model_server import ModelServerManager  # noqa: E402
+from fake_models import fake_hf_cache, fake_model  # noqa: E402
+
+CODER_7B = "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
+QWEN_05B = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
 
 ROOT = Path(__file__).resolve().parent.parent
 PKG = ROOT / "local_llm"
@@ -59,20 +64,25 @@ def test_engine_registered_and_listed_by_route():
 
 
 def test_draft_model_auto_uses_catalog():
-    target = next(mid for mid in (resolve_model(a) for a in BUILTIN_MODEL_ALIASES)
-                  if draft_for(mid))
-
     class _M:
         draft_model = "auto"
-        model_id = target
+        model_id = CODER_7B
 
-    picked, note = _backends_resolve_draft(_M())
-    assert picked == draft_for(target) and "catalogue" in note
+    # The catalogue finds a draft among the downloaded models: a same-tokenizer
+    # sibling a quarter of the size or less.
+    with fake_hf_cache() as hub:
+        fake_model(hub, CODER_7B, size_gb=4.3)
+        fake_model(hub, QWEN_05B, size_gb=0.28)
+        assert draft_for(CODER_7B) == QWEN_05B
+        picked, note = _backends_resolve_draft(_M())
+    assert picked == QWEN_05B and "catalogue" in note
 
 
 def test_alias_resolved_by_model_switcher():
     from fastapi.testclient import TestClient
     app, cfg = _build_app()
+    # MODEL_ALIASES (Settings) is the only place an alias comes from.
+    cfg.model_aliases = json.dumps({"coder": CODER_7B})
     mm = app.state.model_manager
     swapped: list = []
     mm.swap = lambda model, adapter=None: swapped.append(model) or True  # never start a server
@@ -84,8 +94,8 @@ def test_alias_resolved_by_model_switcher():
         client.post("/api/auth/login", json={"username": "admin", "password": "adminpw123"})
         r = client.post("/api/models/select", json={"model": "coder"})
         assert r.status_code == 200, r.text
-    assert swapped == [resolve_model("coder")] and swapped[0] != "coder"
-    assert cfg.model == resolve_model("coder")
+    assert swapped == [CODER_7B] == [resolve_model("coder", cfg)]
+    assert cfg.model == CODER_7B
 
 
 def _quoted_names(source: str, start: str, end_marker: str) -> set[str]:

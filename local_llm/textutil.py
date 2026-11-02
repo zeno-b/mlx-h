@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import json
 import re
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from .core import *  # noqa: F401,F403
 from .config import *  # noqa: F401,F403
 from .tools import *  # noqa: F401,F403
 from .model_client import *  # noqa: F401,F403
+from .toolparse import strip_reasoning
 
 
 def _is_trivial(text: str) -> bool:
@@ -2095,11 +2096,79 @@ def search_subject(previous: str | None) -> str | None:
     text = " ".join(raw.strip().split())
     if not text or len(text) > 200:
         return None
-    if _PASTED_MATERIAL.search(raw):
-        return None
-    if _SEARCH_OWN.search(text) or refers_to_project(text) or is_code_request(text):
+    if own_material(raw):
         return None
     return text
+
+
+# A first line that is nothing but a tool's name: "web_search", "`web_search`",
+# "web_search()", "functions.web_search", "Tool: web_search". What a small
+# model prints when it means to call the tool and does not write the call.
+_BARE_TOOL_LINE = re.compile(
+    r"^\s*(?:(?:tool|action|call)\s*:\s*)?(?:functions\.|tools?[./])?`?"
+    r"([A-Za-z_][A-Za-z0-9_]*)`?\s*(?:\(\s*\))?\s*:?\s*$", re.I)
+# A reply saying it searched, or citing results of a search: grounding that is
+# only true when a search actually ran this turn.
+_CLAIMED_SEARCH = re.compile(
+    r"\b(?:based\s+on|according\s+to|from|per)\s+(?:the|my|these|those|our)\s+"
+    r"(?:web\s+|online\s+|internet\s+)?search(?:es)?(?:\s+results?)?\b"
+    r"|\b(?:the|my)\s+(?:web\s+)?search(?:\s+results?)?\s+(?:show|shows|showed|indicate|"
+    r"indicates|suggest|suggests|reveal|reveals|found|returned)\b"
+    r"|\bI\s+(?:searched|have\s+searched|looked\s+(?:it|this|that)\s+up|did\s+a\s+"
+    r"(?:quick\s+)?(?:web\s+)?search|ran\s+a\s+(?:web\s+)?search)\b", re.I)
+
+
+def bare_tool_name(text: str | None, known: Any = ()) -> str | None:
+    """The tool a reply names on its first line and nothing else, or None.
+
+    Only the first non-empty line counts, and only a name in `known`: "Summary"
+    alone on a line is a heading, "web_search" alone is a call that was never
+    written.
+    """
+    names = set(known or ())
+    for line in strip_reasoning(text or "").splitlines():
+        if not line.strip():
+            continue
+        match = _BARE_TOOL_LINE.match(line)
+        name = match.group(1) if match else ""
+        return name if name in names else None
+    return None
+
+
+def drop_bare_tool_line(text: str | None, known: Any = ()) -> str:
+    """The reply without a leading line that is only a tool's name (see bare_tool_name)."""
+    raw = str(text or "")
+    if bare_tool_name(raw, known) is None:
+        return raw
+    lines = raw.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    return "\n".join(lines[1:]).strip()
+
+
+def claims_search_results(text: str | None) -> bool:
+    """True when a reply says it searched or cites search results.
+
+    Only honest when a search ran this turn; the agent checks that, this only
+    reads the words. "Search engines rank results by..." is about search, not
+    a claim to have done one, and does not match.
+    """
+    return bool(_CLAIMED_SEARCH.search(strip_reasoning(text or "")))
+
+
+def own_material(text: str | None) -> bool:
+    """True when text reads as the user's OWN material, which never goes to a search engine.
+
+    Pasted code, output or config, a request about their project, a file or a
+    document: the tests search_subject applies to a follow-up's previous turn,
+    shared with the answer check (refine.py), which applies them to the
+    question it is about to search for and to every query the model proposes.
+    """
+    raw = text or ""
+    if _PASTED_MATERIAL.search(raw):
+        return True
+    flat = " ".join(raw.split())
+    return bool(_SEARCH_OWN.search(flat) or refers_to_project(flat) or is_code_request(flat))
 
 
 # Freshness, with a calendar rather than a word list.
@@ -2301,6 +2370,10 @@ __all__ = [
     'QUESTION_DEPTHS',
     'explicit_search_request',
     'search_subject',
+    'own_material',
+    'bare_tool_name',
+    'claims_search_results',
+    'drop_bare_tool_line',
     'needs_fresh_facts',
     'is_hedged_answer',
     'NEED_MARKER',

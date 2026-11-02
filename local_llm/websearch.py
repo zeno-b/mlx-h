@@ -13,12 +13,16 @@ compatible with the original module.
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import html
 import ipaddress
 import re
 import socket
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import Any, Callable
 
 from .core import *  # noqa: F401,F403
 from .config import *  # noqa: F401,F403
@@ -39,6 +43,71 @@ USER_AGENT = (
 MAX_FETCH_BYTES = 2_000_000
 
 _ALLOWED_FETCH_SCHEMES = {"http", "https"}
+
+# Most worker threads one batch of searches or page fetches may use, whatever
+# SEARCH_WORKERS says. The work is network wait, so threads overlap it well;
+# the cap keeps one batch from opening more connections to a single engine
+# than looks like a person using it.
+_PARALLEL_MAX_WORKERS = 8
+
+
+def search_workers(config: Any, wanted: int) -> int:
+    """Worker threads for a batch of `wanted` network jobs (SEARCH_WORKERS caps it)."""
+    try:
+        cap = int(getattr(config, "search_workers", 4) or 1)
+    except (TypeError, ValueError):
+        cap = 4
+    return max(1, min(_PARALLEL_MAX_WORKERS, cap, int(wanted or 1)))
+
+
+def parallel_map(fn: Callable[[Any], Any], items: Any,
+                 workers: int) -> list[tuple[Any, BaseException | None]]:
+    """fn(item) for every item on up to `workers` threads; (result, error) in input order.
+
+    Every job runs in a copy of the caller's context, so the acting user, the
+    conversation and the turn (the contextvars the approval policy and the
+    tool log read inside ToolRegistry.call) are the same on each worker thread
+    as on the calling one. A plain ThreadPoolExecutor.submit would run the job
+    with an empty context, and the policy would judge the call as nobody's.
+    A job that raises fills its own slot with (None, exc); the others are not
+    affected.
+    """
+    batch = list(items)
+
+    def run(item: Any) -> tuple[Any, BaseException | None]:
+        try:
+            return fn(item), None
+        except Exception as exc:  # noqa: BLE001 - reported in the item's slot
+            return None, exc
+
+    if workers <= 1 or len(batch) <= 1:
+        return [run(item) for item in batch]
+    with ThreadPoolExecutor(max_workers=min(int(workers), len(batch)),
+                            thread_name_prefix="parallel") as pool:
+        futures = [pool.submit(contextvars.copy_context().run, run, item) for item in batch]
+        return [future.result() for future in futures]
+
+
+async def thread_task(fn: Callable[[Any], Any], item: Any,
+                      gate: "asyncio.Semaphore | None" = None) -> tuple[Any, BaseException | None]:
+    """fn(item) on a worker thread, as (result, error); waits for `gate` first.
+
+    For a caller that starts several of these and consumes them one at a
+    time, which parallel_map (it waits for the whole batch) cannot do. An
+    exception comes back as a value, so a task nobody ends up awaiting never
+    logs "Task exception was never retrieved". asyncio.to_thread copies the
+    caller's context into the thread, as parallel_map does.
+    """
+    async def run() -> tuple[Any, BaseException | None]:
+        try:
+            return await asyncio.to_thread(fn, item), None
+        except Exception as exc:  # noqa: BLE001 - reported to whoever awaits
+            return None, exc
+
+    if gate is None:
+        return await run()
+    async with gate:
+        return await run()
 
 
 def guard_public_url(url: str) -> None:
@@ -272,5 +341,8 @@ __all__ = [
     "USER_AGENT",
     "_ddg_unwrap",
     "guard_public_url",
+    "parallel_map",
+    "search_workers",
     "strip_html",
+    "thread_task",
 ]

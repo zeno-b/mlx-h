@@ -29,6 +29,7 @@ from local_llm.model_server import ModelServerManager  # noqa: E402
 from local_llm.tools import ToolRegistry  # noqa: E402
 from local_llm.training import RetrainManager  # noqa: E402
 from local_llm.turnctx import current_turn  # noqa: E402
+from fake_models import fake_hf_cache, fake_model  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -324,16 +325,23 @@ def test_served_vision_asks_engine_and_model():
 
     text_model = "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit"
     vl_model = "mlx-community/Qwen2.5-VL-3B-Instruct-4bit"
-    assert vision_mod.served_vision(None, cfg(text_model))[0] is False
-    # mlx-lm declares "vision" but cannot run Gemma 3's vision tower.
-    assert vision_mod.served_vision(None, cfg("mlx-community/gemma-3-4b-it-4bit"))[0] is False
-    assert vision_mod.served_vision(None, cfg(vl_model, "mlx-vlm"))[0] is True
-    assert vision_mod.served_vision(None, cfg(text_model, "mlx-vlm"))[0] is False
-    assert vision_mod.served_vision(None, cfg(text_model, mode="on"))[0] is True
-    assert vision_mod.served_vision(None, cfg(vl_model, "mlx-vlm", "off"))[0] is False
-    manager = SimpleNamespace(backend=get_backend("mlx-vlm"), model_id=vl_model,
-                              decode_concurrency=0, kv_bits=0)
-    assert vision_mod.served_vision(manager, cfg(text_model))[0] is True
+    # What a model can see is read from its downloaded config.json (a
+    # vision_config is a vision tower); nothing is assumed before that.
+    with fake_hf_cache() as hub:
+        fake_model(hub, text_model, size_gb=1.7)
+        fake_model(hub, vl_model, size_gb=2.0, model_type="qwen2_5_vl", vision=True)
+        assert vision_mod.served_vision(None, cfg(text_model))[0] is False
+        # mlx-lm declares "vision" but cannot run Gemma 3's vision tower.
+        assert vision_mod.served_vision(None, cfg("mlx-community/gemma-3-4b-it-4bit"))[0] is False
+        assert vision_mod.served_vision(None, cfg(vl_model, "mlx-vlm"))[0] is True
+        assert vision_mod.served_vision(None, cfg(text_model, "mlx-vlm"))[0] is False
+        assert vision_mod.served_vision(None, cfg(text_model, mode="on"))[0] is True
+        assert vision_mod.served_vision(None, cfg(vl_model, "mlx-vlm", "off"))[0] is False
+        manager = SimpleNamespace(backend=get_backend("mlx-vlm"), model_id=vl_model,
+                                  decode_concurrency=0, kv_bits=0)
+        assert vision_mod.served_vision(manager, cfg(text_model))[0] is True
+        # A model not downloaded yet is unknown, so mlx-vlm's own word stands.
+        assert vision_mod.served_vision(None, cfg("someone/not-downloaded-3B", "mlx-vlm"))[0] is True
 
 
 # --------------------------------------------------------------------------- #

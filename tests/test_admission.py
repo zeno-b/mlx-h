@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -331,6 +332,22 @@ def test_cost_tokens_counts_prompt_and_reply_and_caps_at_context():
 
 
 def test_kv_bytes_per_token_from_the_cached_qwen_config():
+    # conftest gives the session an empty cache; this test reads the machine's
+    # real one, where the model may be.
+    real = os.environ.get("LOCAL_LLM_TEST_REAL_HF_CACHE")
+    old = os.environ.get("HF_HUB_CACHE")
+    if real:
+        os.environ["HF_HUB_CACHE"] = real
+    try:
+        _kv_bytes_from_the_cached_qwen_config()
+    finally:
+        if old is None:
+            os.environ.pop("HF_HUB_CACHE", None)
+        else:
+            os.environ["HF_HUB_CACHE"] = old
+
+
+def _kv_bytes_from_the_cached_qwen_config():
     repo = "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit"
     snaps = hf_cache_dir() / ("models--" + repo.replace("/", "--")) / "snapshots"
     configs = sorted(snaps.glob("*/config.json")) if snaps.is_dir() else []

@@ -1,12 +1,17 @@
-"""A tiny standard-library .env loader, run before anything reads the environment.
+"""A tiny standard-library .env loader and writer, run before anything reads the environment.
 
-Why it exists: core.py computes DEFAULT_MODEL, the RAM tiers' companions and a
-handful of other constants at IMPORT time from os.environ, and Config reads the
-rest when it is built. Until now `.env` only took effect when the shell or a
+Why it exists: core.py computes the RAM tiers, APP_NAME and a handful of other
+constants at IMPORT time from os.environ, and Config reads the rest (MODEL_ID
+included) when it is built. Until now `.env` only took effect when the shell or a
 process manager exported it, which `deploy.py init` and the launchd service
 cannot rely on. deploy.py and `python -m local_llm` therefore load the file
 before the package is imported (deploy.py loads this module by path so the
 package __init__, which imports everything, does not run first).
+
+The model settings (MODEL_ID, MODEL_ALIASES, WHISPER_MODEL, TTS_MODEL) live
+ONLY here: nothing is built in, and when the web UI is told which model to run
+it writes the choice back with update_dotenv(), so the next start reads the
+same value from the same place.
 
 The rules are deliberately boring so a value means the same thing here, in a
 shell (`set -a; . ./.env`) and in `env $(cat .env | xargs)`:
@@ -30,6 +35,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from pathlib import Path
 
 # Same rule as core.ROOT: the project root holds deploy.py, one level above this
@@ -46,6 +52,11 @@ DOTENV_LOADED_VAR = "LOCAL_LLM_ENV_LOADED"
 
 _ENVFILE_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ENVFILE_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "$": "$"}
+# A value that needs no quoting in .env, a shell or launchd.
+_ENVFILE_BARE_VALUE = re.compile(r"[A-Za-z0-9_./:@,+=-]*")
+# One writer at a time: two Settings saves racing would otherwise each read
+# the old file and the second rename would drop the first one's change.
+_ENVFILE_WRITE_LOCK = threading.Lock()
 
 
 def dotenv_path() -> Path:
@@ -173,6 +184,98 @@ def load_dotenv(path: Path | str | None = None, override: bool = False,
     return applied
 
 
+def env_line(key: str, value: object) -> str:
+    """KEY=value that this loader, `set -a; . .env` and launchd all read the same."""
+    text = str(value)
+    if _ENVFILE_BARE_VALUE.fullmatch(text):
+        return f"{key}={text}"
+    if "'" not in text and "\n" not in text:
+        return f"{key}='{text}'"
+    escaped = (text.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
+               .replace("\n", "\\n"))
+    return f'{key}="{escaped}"'
+
+
+def _envfile_key_of(line: str) -> str:
+    """The variable an active KEY=VALUE line sets, or "" for anything else."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return ""
+    if stripped.startswith("export ") or stripped.startswith("export\t"):
+        stripped = stripped[len("export"):].lstrip()
+    key = stripped.split("=", 1)[0].strip() if "=" in stripped else ""
+    return key if _ENVFILE_KEY.match(key) else ""
+
+
+def _envfile_placeholder_of(line: str) -> str:
+    """The variable a commented-out `# KEY=...` example line names, or ""."""
+    stripped = line.strip()
+    if not stripped.startswith("#"):
+        return ""
+    return _envfile_key_of(stripped.lstrip("#").strip())
+
+
+def update_dotenv(updates: dict[str, object | None], path: Path | str | None = None,
+                  environ: dict | None = None) -> Path:
+    """Set (or, with None, remove) variables in the .env file, keeping everything else.
+
+    An existing KEY= line is rewritten in place and any later duplicate of it
+    dropped; a new key goes right after its commented `# KEY=` example when the
+    file has one (so it stays in its section), else at the end. Comments, order
+    and every other line survive byte for byte. The file is replaced atomically
+    and stays private (0600): it holds secrets. The same values are applied to
+    the environment, so this process and the next start agree.
+
+    Raises OSError when the file cannot be written and ValueError for a key
+    that is not a variable name. Loading being switched off (LOCAL_LLM_DOTENV=0)
+    is the caller's to report: the file is still the one place to keep it.
+    """
+    for key in updates:
+        if not _ENVFILE_KEY.match(str(key)):
+            raise ValueError(f"{key!r} is not an environment variable name")
+    env = os.environ if environ is None else environ
+    target = Path(path) if path is not None else dotenv_path()
+    with _ENVFILE_WRITE_LOCK:
+        try:
+            lines = target.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            lines = ["# Local LLM settings. Variables already set in the environment win.",
+                     "# This file holds secrets: keep it private (mode 600), never commit it."]
+        pending = dict(updates)
+        out: list[str] = []
+        for line in lines:
+            key = _envfile_key_of(line)
+            if key and key in updates:
+                if key in pending:
+                    value = pending.pop(key)
+                    if value is not None:
+                        out.append(env_line(key, value))
+                continue        # a removed key, or a duplicate of one just written
+            out.append(line)
+        # Keys not in the file yet: after their commented example, else at the end.
+        for key in [k for k, v in pending.items() if v is not None]:
+            spot = next((i for i, line in enumerate(out)
+                         if _envfile_placeholder_of(line) == key), None)
+            if spot is None:
+                out.append(env_line(key, pending[key]))
+            else:
+                out.insert(spot + 1, env_line(key, pending[key]))
+        text = "\n".join(out).rstrip("\n") + "\n"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + ".tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+    for key, value in updates.items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = str(value)
+    return target
+
+
 # The single-file build (deploy_bundled.py) has no deploy.py to run the loader
 # first. bundle.py lists this module first, so applying .env here still lands
 # before core computes its import-time defaults. Inside the package this never
@@ -189,9 +292,13 @@ __all__ = [
     'ENVFILE_ROOT',
     'ENV_FILE_VAR',
     '_envfile_double_quoted',
+    '_envfile_key_of',
     '_envfile_parse_value',
+    '_envfile_placeholder_of',
     'dotenv_path',
+    'env_line',
     'load_dotenv',
     'parse_dotenv',
     'read_dotenv',
+    'update_dotenv',
 ]

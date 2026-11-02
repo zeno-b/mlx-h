@@ -29,9 +29,8 @@ from .backends import *  # noqa: F401,F403
 _LOG_SCAN_CHUNK = 256 * 1024
 
 # Failures that kill mlx_lm.server's single generation thread while leaving the
-# HTTP server answering 200 on /v1/models and /health. There is no HTTP-visible
-# symptom at all: completions simply hang forever. The traceback goes to the
-# child's stdout/stderr, which is the log file below, and nowhere else.
+# HTTP server answering 200 on /v1/models. The traceback goes to the child's
+# stdout/stderr, which is the log file below, and nowhere else.
 # The patterns now live on the backend spec (backends.MLXLM_FATAL_PATTERNS);
 # this name is kept for anything that still imports it.
 _FATAL_BACKEND_PATTERNS = MLXLM_FATAL_PATTERNS
@@ -157,6 +156,9 @@ class ModelServerManager:
         # generation thread's traceback lands there and nowhere else.
         self._log_scan_pos = 0
         self._log_scan_tail = b""
+        # Where the log ended after the last failed probe. The probe's own
+        # request writes there too, and that is not proof of life.
+        self._probe_log_mark = 0
         self._probe_failures = 0
         self._last_probe_at = 0.0
         self._probe_grace_until = 0.0
@@ -398,11 +400,13 @@ class ModelServerManager:
            request will ever be answered, because mlx_lm.server runs generation
            on ONE thread and does not restart it. This is the signal that
            matters: the process stays alive and keeps returning 200 from
-           /v1/models and /health while every completion hangs forever.
+           /v1/models while every completion hangs forever (older builds) or
+           fails with "generation thread died" (newer ones).
         3. The log has gone quiet, so ask for one real token. A completion is
-           the only evidence that generation works; no status endpoint reports
-           it. Requires several consecutive failures so a slow server is not
-           mistaken for a dead one.
+           the only evidence that generation works on every build; older ones
+           have no status endpoint that reports it. Requires several
+           consecutive failures so a slow server is not mistaken for a dead
+           one, and a failed probe's own access line is not proof of life.
 
         The probe runs with NO lock held: it can block for probe_timeout, and a
         stop() or a retrain must not queue behind it.
@@ -434,7 +438,7 @@ class ModelServerManager:
                     f"model server generation thread died ({fatal})"
                 )
                 return False
-            if advanced:
+            if advanced and self._log_scan_pos > self._probe_log_mark:
                 # The backend is writing prefill progress, cache stats or access
                 # lines, so it is demonstrably working. Nothing to probe.
                 self._probe_failures = 0
@@ -462,6 +466,14 @@ class ModelServerManager:
                 self._probe_failures = 0
                 return
             self._probe_failures += 1
+            # The failed probe left its own access line in the log. Without a
+            # mark the next scan reads it as the backend working and wipes
+            # this count, so a server that answers every completion with an
+            # error was never restarted.
+            try:
+                self._probe_log_mark = (LOG_DIR / "model_server.log").stat().st_size
+            except OSError:
+                pass
             log(
                 "Watchdog: model server answered nothing to a one-token probe "
                 f"({self._probe_failures}/{self.probe_failures}).",
@@ -486,6 +498,7 @@ class ModelServerManager:
         if size < self._log_scan_pos:      # rotated or truncated under us
             self._log_scan_pos = 0
             self._log_scan_tail = b""
+            self._probe_log_mark = 0
         if size <= self._log_scan_pos:
             return False, ""
         try:
@@ -503,16 +516,22 @@ class ModelServerManager:
         for pattern in (self.backend.fatal_patterns or ()):
             found = pattern.search(window)
             if found:
-                return True, found.group(0).decode("utf-8", "replace").strip()
+                # The whole line, not just the match: newer mlx-lm writes the
+                # cause after it ("generation thread died: <cause>").
+                start = window.rfind(b"\n", 0, found.start()) + 1
+                end = window.find(b"\n", found.end())
+                line = window[start:] if end < 0 else window[start:end]
+                return True, line.decode("utf-8", "replace").strip()[:300]
         return True, ""
 
     def _probe_generation(self) -> bool:
         """True only if the server actually produced a token.
 
         Synchronous on purpose: this runs on the watchdog thread, which has no
-        event loop. /health returns a hard-coded {"status": "ok"} and
-        /v1/models lists repositories, so neither proves anything about the
-        generation thread. Only a completion does.
+        event loop. Older mlx_lm.server builds answer /health with a hard-coded
+        {"status": "ok"} and /v1/models lists repositories, so neither proves
+        anything about the generation thread on every build. Only a completion
+        does.
         """
         import httpx
         try:

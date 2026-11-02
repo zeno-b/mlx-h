@@ -111,6 +111,8 @@ UI_JS_CHAT = r"""
    // {detach: true} it is left running (reopening the same conversation
    // re-attaches to it). The Stop button goes through chatStop() instead.
    function stopStream(opts) {
+     // The answer check belongs to the answer on screen, which is about to go.
+     chatRefineCancel();
      var run = chatRun;
      if (run) {
        run.detached = true;
@@ -129,6 +131,8 @@ UI_JS_CHAT = r"""
    function setChatMode(mode) {
      if (["auto", "chat", "agent"].indexOf(mode) < 0) mode = "auto";
      chatMode = mode;
+     // The answer check is Auto mode's; leaving Auto takes it back.
+     if (mode !== "auto") chatRefineCancel();
      if (!modeSeg) return;
      Array.prototype.forEach.call(modeSeg.querySelectorAll("button[data-value]"), function(b) {
        var on = b.getAttribute("data-value") === mode;
@@ -1262,6 +1266,8 @@ UI_JS_CHAT = r"""
        return;
      }
 
+     // A check of the previous answer would only hold the model up now.
+     chatRefineCancel();
      input.value = "";
      input.style.height = "auto";
      clearRegenerate();
@@ -1273,6 +1279,9 @@ UI_JS_CHAT = r"""
      var projectId = chatSelectValue("projectSel");
      var agentId = chatSelectValue("agentSel");
      var run = chatBeginRun(message, { projectId: projectId });
+     // What the answer check (chatRefineArm) needs to know about the turn.
+     run.agentId = agentId;
+     run.hadAttachments = atts.length > 0;
      // max_tokens and temperature are deliberately absent: the server fills
      // them from this user's preferences, so the web UI, the CLI and API
      // clients all get the same per-user defaults. The optional fields go
@@ -1658,7 +1667,9 @@ UI_JS_CHAT = r"""
          }
          trace.turn.appendChild(wrap);
        }
-       setRegenerateTarget(addFeedbackBar(run.message, event.answer || ""));
+       var feedbackBar = addFeedbackBar(run.message, event.answer || "");
+       setRegenerateTarget(feedbackBar);
+       chatRefineArm(run, trace, event, feedbackBar);
        // Both routes are ADMIN. Every non-admin answer used to fire two
        // requests that could only ever come back 403.
        if (roleIsAdmin()) {
@@ -1688,6 +1699,439 @@ UI_JS_CHAT = r"""
        run.answered = true;
        run.ended = true;
      }
+   }
+
+   // ---------------------------------------------------- answer check ---
+   // Auto mode keeps working on the question after it has answered (POST
+   // /api/chat/refine, refine.py). Once an answer has been on screen for the
+   // check interval (AUTO_REFINE_DELAY_S, 60s unless the health poll says
+   // otherwise) the server runs a round: it searches the web, reads pages no
+   // earlier round read, and either confirms the answer or writes a better
+   // one, which it stores in place of the old. Then the page waits another
+   // interval and asks for the next round, for as long as it stays open in
+   // Auto mode (AUTO_REFINE_MAX_ROUNDS caps it when set). A round that changes
+   // nothing doubles the wait, up to sixteen intervals; one that improves the
+   // answer resets it. Sending, a new chat, another conversation, another mode
+   // or Stop ends the series; a closed page drops the stream, which ends the
+   // round on the server. Which answers may be checked is the server's call
+   // (it never searches for the user's own material): a first round it skips
+   // shows nothing, because nobody asked. When the user's approvals setting
+   // asks before every action, the server says {"ask": true} and the page
+   // asks once for the whole series.
+   var refineEnabled = true;
+   var refineDelayMs = 60000;
+   var refineMaxRounds = 0;      // 0: as many rounds as the page stays open for
+   var refineBackoffCap = 16;  // a quiet series waits at most this many intervals
+   var refineSeries = null;      // the answer being worked on (see chatRefineArm)
+
+   // The switch, the interval and the round cap ride on the health poll, so
+   // a change in Settings reaches open tabs within a few seconds.
+   function chatRefineSettings(data) {
+     if (!data) return;
+     if (typeof data.auto_refine === "boolean") {
+       refineEnabled = data.auto_refine;
+       if (!refineEnabled) chatRefineCancel();
+     }
+     var secs = Number(data.auto_refine_delay_s);
+     if (secs > 0) refineDelayMs = secs * 1000;
+     var cap = Number(data.auto_refine_max_rounds);
+     if (cap >= 0) refineMaxRounds = cap;
+   }
+
+   // Called at every answer's final event. A turn that ran in a project, as
+   // an agent profile or with attachments read the user's own material, and
+   // one that wrote files has nothing to check: those are never armed.
+   function chatRefineArm(run, trace, event, bar) {
+     chatRefineCancel();
+     if (!refineEnabled || chatMode !== "auto") return;
+     if (!run.turnId || !event.answer || run.projectId || run.agentId || run.hadAttachments) return;
+     if ((event.documents && event.documents.length)
+         || (event.changed_files && event.changed_files.length)) return;
+     var series = {
+       conversationId: run.conversationId, turnId: run.turnId, messageId: null,
+       trace: trace, message: run.message, answer: event.answer, bar: bar,
+       round: 0, consent: false, delayMs: refineDelayMs, timer: null,
+       sources: [], run: null, box: null, ended: false
+     };
+     refineSeries = series;
+     chatRefineSchedule(series, refineDelayMs);
+   }
+
+   function chatRefineSchedule(series, ms) {
+     if (series.timer) clearTimeout(series.timer);
+     series.timer = setTimeout(function() { chatRefineFire(series); }, ms);
+     if (series.box) {
+       var mins = Math.max(1, Math.round(ms / 60000));
+       chatRefineStatus(series, "next check in " + (ms < 90000 ? Math.round(ms / 1000) + "s"
+         : mins + " min"), true);
+     }
+   }
+
+   // End the series: no more rounds, a running one is cancelled on the
+   // server. What finished rounds did (the improved answer, the log) stays.
+   function chatRefineEnd(series, note) {
+     if (!series || series.ended) return;
+     series.ended = true;
+     if (series.timer) { clearTimeout(series.timer); series.timer = null; }
+     var rr = series.run;
+     series.run = null;
+     if (rr) {
+       rr.cancelled = true;
+       if (rr.turnId) {
+         postJSON("/api/chat/turns/" + encodeURIComponent(rr.turnId) + "/cancel", {})
+           .catch(function() { /* already gone */ });
+       }
+       rr.controller.abort();
+       chatRefineRoundDone(series, rr);
+     }
+     if (refineSeries === series) refineSeries = null;
+     if (!series.box) return;
+     if (!series.round && !series.sources.length) {
+       // Nothing ever ran: leave no trace of the check at all.
+       if (series.box.parentNode) series.box.parentNode.removeChild(series.box);
+       series.box = null;
+       return;
+     }
+     chatRefineStatus(series, note || "", false);
+   }
+
+   // Sending, New chat, another conversation, another mode, Regenerate.
+   function chatRefineCancel() {
+     if (refineSeries) chatRefineEnd(refineSeries, "stopped checking");
+   }
+
+   function chatRefineFire(series) {
+     series.timer = null;
+     if (refineSeries !== series || series.ended) return;
+     if (!refineEnabled || chatMode !== "auto" || series.conversationId !== conversationId
+         || !series.trace.turn.isConnected) {
+       chatRefineEnd(series, "");
+       return;
+     }
+     if (refineMaxRounds && series.round >= refineMaxRounds) {
+       chatRefineEnd(series, "checked " + series.round + " times");
+       return;
+     }
+     // A turn is running, or something is half-typed in the composer: the
+     // next message is coming, and a round started now would only be
+     // cancelled by it. Look again after another interval.
+     if (busy || chatRun || input.value.trim()) {
+       chatRefineSchedule(series, refineDelayMs);
+       return;
+     }
+     chatRefineRound(series);
+   }
+
+   // Wait longer after a round that changed nothing; reset after one that did.
+   function chatRefineBackoff(series, improved) {
+     series.delayMs = improved ? refineDelayMs
+       : Math.min(series.delayMs * 2, refineDelayMs * refineBackoffCap);
+     return series.delayMs;
+   }
+
+   async function chatRefineRound(series) {
+     var rr = { controller: new AbortController(), turnId: null, tools: {}, rt: null,
+                round: series.round + 1, started: Date.now(), timer: null,
+                cancelled: false, ended: false };
+     series.run = rr;
+     var body = { conversation_id: series.conversationId, turn_id: series.turnId };
+     if (series.messageId) body.message_id = series.messageId;
+     if (series.consent) body.consent = true;
+     var res;
+     try {
+       res = await fetch("/api/chat/refine", {
+         method: "POST",
+         headers: { "Content-Type": "application/json" },
+         signal: rr.controller.signal,
+         body: JSON.stringify(body)
+       });
+     } catch (err) {
+       if (series.run === rr) series.run = null;
+       if (!rr.cancelled && !series.ended) chatRefineSchedule(series, chatRefineBackoff(series, false));
+       return;
+     }
+     if (rr.cancelled || series.ended) return;
+     var type = res.headers.get("content-type") || "";
+     if (!res.ok || !res.body || type.indexOf("text/event-stream") < 0) {
+       series.run = null;
+       var info = null;
+       if (res.ok && type.indexOf("application/json") >= 0) {
+         try { info = await res.json(); } catch (err) { info = null; }
+       }
+       if (series.ended) return;
+       if (info && info.ask && !series.consent) { chatRefineAsk(series, info); return; }
+       var why = String((info && info.skipped) || "");
+       // Model restarting, a busy server, another tab's round in flight, or
+       // a round asked for too early: try again later. Anything else ends
+       // the series: silently before the first round (nobody asked), with
+       // the reason after one.
+       if (res.status >= 500 || /too soon|already running/.test(why)) {
+         chatRefineSchedule(series, chatRefineBackoff(series, false));
+       } else {
+         chatRefineEnd(series, why ? "stopped checking: " + why : "");
+       }
+       return;
+     }
+     chatRefineOpenRound(series, rr);
+     try {
+       await readSSE(res, function(frame) {
+         if (rr.cancelled || frame.data === "[DONE]") return;
+         var event;
+         try { event = JSON.parse(frame.data); } catch (err) { return; }
+         if (event && typeof event === "object") chatRefineEvent(series, rr, event);
+       });
+     } catch (err) {
+       if (!rr.cancelled && !rr.ended) chatRefineLog(series, "round " + rr.round + " was interrupted");
+     } finally {
+       chatRefineRoundDone(series, rr);
+       if (series.run === rr) series.run = null;
+       // A stream that ended without a verdict (interrupted, or the server
+       // went away) is retried later, like a busy server.
+       if (!rr.cancelled && !rr.ended && !series.ended) {
+         chatRefineSchedule(series, chatRefineBackoff(series, false));
+       }
+     }
+   }
+
+   // The series' block under the answer, built on the first round (or the
+   // first question): a log of finished rounds, the live round, the improved
+   // answer, the sources it cites and a status line with Stop.
+   function chatRefineBox(series) {
+     if (series.box) return series.box;
+     var box = document.createElement("div");
+     box.className = "refine";
+     var log = document.createElement("div");
+     log.className = "trace";
+     var live = document.createElement("div");
+     live.className = "trace";
+     var answerHost = document.createElement("div");
+     answerHost.className = "refine-answer";
+     var status = document.createElement("div");
+     status.className = "refine-status";
+     box.appendChild(log); box.appendChild(live); box.appendChild(answerHost);
+     box.appendChild(status);
+     series.trace.turn.appendChild(box);
+     series.box = box;
+     series.log = log;
+     series.live = live;
+     series.answerHost = answerHost;
+     series.statusEl = status;
+     // traceAnswer writes the improved answer into answerHost.
+     series.answerView = { turn: answerHost, trace: log, answer: null };
+     scrollDown();
+     return box;
+   }
+
+   function chatRefineStatus(series, text, withStop) {
+     if (!series.statusEl) return;
+     var el = series.statusEl;
+     while (el.firstChild) el.removeChild(el.firstChild);
+     if (text) {
+       var label = document.createElement("span");
+       label.textContent = text;
+       el.appendChild(label);
+     }
+     if (withStop) {
+       el.appendChild(makeBtn("Stop", "Stop checking this answer against the web",
+         function() { chatRefineEnd(series, "stopped checking"); }));
+     }
+   }
+
+   function chatRefineLog(series, text) {
+     if (!series.log) return;
+     traceNotice({ trace: series.log }, text, true);
+   }
+
+   // The user's approvals setting asks before every action, so the series
+   // asks as well: once, for every round's searches and page reads, and only
+   // when a round would otherwise run. A yes is sent as consent with every
+   // round, which the server treats as the user's own request; the
+   // administrator's floor still holds.
+   function chatRefineAsk(series, info) {
+     if (series.ended || !refineEnabled || chatMode !== "auto"
+         || series.conversationId !== conversationId || !series.trace.turn.isConnected) return;
+     chatRefineBox(series);
+     var pages = Number(info && info.pages) || 3;
+     chatRefineStatus(series, "Keep checking this answer against the web? Every minute or so it "
+       + "searches for your question again and reads up to " + pages + " page"
+       + (pages === 1 ? "" : "s") + " it has not read yet, while this page stays open.", false);
+     var el = series.statusEl;
+     el.appendChild(makeBtn("Keep checking", "Check this answer against the web now and keep improving it",
+       function() {
+         series.consent = true;
+         chatRefineStatus(series, "", false);
+         if (busy || chatRun) { chatRefineSchedule(series, refineDelayMs); return; }
+         chatRefineRound(series);
+       }));
+     el.appendChild(makeBtn("Not now", "Leave this answer as it is",
+       function() { chatRefineEnd(series, ""); }));
+     scrollDown();
+   }
+
+   function chatRefineOpenRound(series, rr) {
+     chatRefineBox(series);
+     chatRefineStatus(series, "", false);
+     var activity = document.createElement("div");
+     activity.className = "gactivity";
+     var spin = document.createElement("span"); spin.className = "gspin";
+     var label = document.createElement("span"); label.className = "glabel";
+     label.textContent = (rr.round > 1 ? "round " + rr.round + ": " : "")
+       + "checking this answer against the web…";
+     var elapsed = document.createElement("span"); elapsed.className = "gelapsed";
+     var stop = makeBtn("Stop", "Stop checking this answer", function() {
+       chatRefineEnd(series, "stopped checking");
+     });
+     activity.appendChild(spin); activity.appendChild(label);
+     activity.appendChild(elapsed); activity.appendChild(stop);
+     series.box.insertBefore(activity, series.answerHost);
+     rr.activity = activity;
+     rr.label = label;
+     // A round's steps and its draft go in the live area; the draft only
+     // replaces the improved answer if the round ends with a change.
+     rr.rt = { turn: series.live, trace: series.live, answer: null };
+     rr.timer = setInterval(function() {
+       var next = Math.round((Date.now() - rr.started) / 1000) + "s";
+       if (elapsed.textContent !== next) elapsed.textContent = next;
+     }, 1000);
+     scrollDown();
+   }
+
+   function chatRefineLabel(rr, text) {
+     if (!rr.label) return;
+     var next = (rr.round > 1 ? "round " + rr.round + ": " : "")
+       + String(text || "").split("\n")[0].slice(0, 64);
+     if (rr.label.textContent !== next) rr.label.textContent = next;
+   }
+
+   // Tear down a round's live parts: the activity line, its steps, its draft.
+   function chatRefineRoundDone(series, rr) {
+     if (rr.timer) { clearInterval(rr.timer); rr.timer = null; }
+     if (rr.activity && rr.activity.parentNode) rr.activity.parentNode.removeChild(rr.activity);
+     if (rr.rt && rr.rt.answer && rr.rt.answer.mdTimer) clearTimeout(rr.rt.answer.mdTimer);
+     if (series.live) {
+       while (series.live.firstChild) series.live.removeChild(series.live.firstChild);
+     }
+   }
+
+   function chatRefineHost(url) {
+     try { return new URL(url).host || url; } catch (err) { return String(url || ""); }
+   }
+
+   // The pages a check read, as links numbered the way the answer cites them
+   // (an explicit index, else the position). Every href goes through safeHref.
+   function chatRefineSourceRow(sources) {
+     var row = document.createElement("div");
+     row.className = "refine-sources";
+     (sources || []).forEach(function(s, i) {
+       var url = typeof s === "string" ? s : (s && s.url);
+       var href = safeHref(url);
+       if (!href) return;
+       var a = document.createElement("a");
+       a.href = href;
+       a.target = "_blank";
+       a.rel = "noopener noreferrer";
+       a.title = url;
+       var n = (s && s.index) || (i + 1);
+       a.textContent = "[" + n + "] " + ((s && s.title) || chatRefineHost(url));
+       row.appendChild(a);
+     });
+     return row.childNodes.length ? row : null;
+   }
+
+   function chatRefineEvent(series, rr, event) {
+     var type = event.type;
+     if (type === "start") {
+       rr.turnId = event.turn_id || rr.turnId;
+       if (event.message_id) series.messageId = event.message_id;
+     } else if (type === "phase") {
+       chatRefineLabel(rr, event.label);
+     } else if (type === "queued") {
+       chatRefineLabel(rr, "waiting for the model to be free…");
+     } else if (type === "tool_call") {
+       var card = traceTool(rr.rt, event.name === "web_search" ? "search" : "read", event.args);
+       card.argsEl.textContent = event.label || JSON.stringify(event.args || {});
+       card.node.classList.add("running");
+       if (event.id) rr.tools[event.id] = card;
+     } else if (type === "tool_result") {
+       var done = event.id ? rr.tools[event.id] : null;
+       if (done) {
+         done.node.classList.remove("running");
+         done.body.textContent = event.error ? String(event.error) : (event.result || "");
+         done.node.classList.add(event.error ? "failed" : "ok");
+         done.pill.textContent = event.error ? "failed" : "ok";
+       }
+     } else if (type === "notice") {
+       traceNotice(rr.rt, event.message || "", event.info !== false);
+     } else if (type === "token") {
+       var draft = traceAnswer(rr.rt);
+       draft.raw = (draft.raw || "") + event.token;
+       if (!draft.rendered) draft.text.textContent = draft.raw;
+       scheduleMarkdown(draft);
+     } else if (type === "final") {
+       chatRefineFinal(series, rr, event);
+     } else if (type === "error") {
+       rr.ended = true;
+       chatRefineLog(series, "round " + rr.round + " failed: "
+         + String(event.error || "unknown error").slice(0, 160));
+       chatRefineRoundDone(series, rr);
+       if (!series.ended) chatRefineSchedule(series, chatRefineBackoff(series, false));
+     } else if (type === "cancelled") {
+       rr.ended = true;
+       chatRefineEnd(series, "stopped checking");
+     }
+   }
+
+   function chatRefineFinal(series, rr, event) {
+     rr.ended = true;
+     chatRefineRoundDone(series, rr);
+     series.round = event.round || rr.round;
+     if (event.message_id) series.messageId = event.message_id;
+     var fresh = event.sources || [];
+     var label = "Round " + series.round + ": ";
+     if (event.changed && event.answer) {
+       // The final text is authoritative: a short improved answer may never
+       // have streamed at all (it sat in the verdict hold-back).
+       var view = traceAnswer(series.answerView);
+       if (view.mdTimer) { clearTimeout(view.mdTimer); view.mdTimer = null; }
+       renderMarkdown(event.answer, view.text);
+       view.raw = event.answer;
+       view.lastRendered = event.answer;
+       view.rendered = true;
+       view.node.classList.remove("pending");
+       var original = series.trace.answer;
+       if (original && original.node) original.node.classList.add("superseded");
+       updateContextMeter(estimateTokens(event.answer) - estimateTokens(series.answer));
+       series.answer = event.answer;
+       // Ratings and Regenerate now belong to the improved answer.
+       if (series.bar && series.bar.parentNode) {
+         series.bar.parentNode.removeChild(series.bar);
+         series.bar = addFeedbackBar(series.message, event.answer);
+         setRegenerateTarget(series.bar);
+       }
+       chatRefineLog(series, label + "improved the answer with " + fresh.length + " new page"
+         + (fresh.length === 1 ? "" : "s"));
+     } else if (event.reason === "confirmed" && fresh.length) {
+       chatRefineLog(series, label + "checked " + fresh.length + " new page"
+         + (fresh.length === 1 ? "" : "s") + ": no changes needed");
+     } else {
+       chatRefineLog(series, label + "no change (" + (event.reason || "nothing new") + ")");
+     }
+     if (fresh.length) {
+       series.sources = series.sources.concat(fresh);
+       if (series.sourceRow && series.sourceRow.parentNode) {
+         series.sourceRow.parentNode.removeChild(series.sourceRow);
+       }
+       series.sourceRow = chatRefineSourceRow(series.sources);
+       if (series.sourceRow) series.box.insertBefore(series.sourceRow, series.statusEl);
+     }
+     if (!event.stored) {
+       chatRefineEnd(series, "stopped checking: the conversation moved on");
+     } else if (refineMaxRounds && series.round >= refineMaxRounds) {
+       chatRefineEnd(series, "checked " + series.round + " times");
+     } else if (!series.ended) {
+       chatRefineSchedule(series, chatRefineBackoff(series, !!event.changed));
+     }
+     scrollDown();
    }
 
    // ----------------------------------------------------- event helpers ---
@@ -2287,7 +2731,13 @@ UI_JS_CHAT = r"""
        div.insertBefore(det, div.firstChild);
      }
      var tools = chatToolNames(meta.tools);
-     if (tools.length || meta.cancelled) {
+     // web_check: Auto mode's answer check ran on this answer (refine.py).
+     // The stored text is the improved one when it changed anything; the
+     // original stays one click away.
+     var check = (meta.web_check && typeof meta.web_check === "object") ? meta.web_check : null;
+     var checkCount = check && Array.isArray(check.sources) ? check.sources.length : 0;
+     var checkRounds = check ? (Number(check.rounds) || 1) : 0;
+     if (tools.length || meta.cancelled || checkCount) {
        var line = document.createElement("div");
        line.className = "msg-meta";
        if (tools.length) {
@@ -2302,7 +2752,32 @@ UI_JS_CHAT = r"""
          pill.textContent = "stopped";
          line.appendChild(pill);
        }
+       if (checkCount) {
+         var checked = document.createElement("span");
+         checked.className = "pill" + (check.changed ? " ok" : "");
+         var pages = checkCount + " web source" + (checkCount === 1 ? "" : "s");
+         checked.textContent = checkRounds > 1
+           ? (check.changed ? "improved over " : "checked over ") + checkRounds + " rounds, " + pages
+           : (check.changed ? "improved with " : "checked against ") + pages;
+         line.appendChild(checked);
+       }
        div.insertBefore(line, actions);
+     }
+     if (check && check.original) {
+       var orig = document.createElement("details");
+       orig.className = "msg-original";
+       var origSum = document.createElement("summary");
+       origSum.textContent = "Answer before the web check";
+       var origBody = document.createElement("div");
+       origBody.className = "msg-body msg-original-body";
+       renderMarkdown(String(check.original), origBody);
+       orig.appendChild(origSum);
+       orig.appendChild(origBody);
+       div.insertBefore(orig, actions);
+     }
+     if (check) {
+       var row = chatRefineSourceRow(check.sources);
+       if (row) div.insertBefore(row, actions);
      }
    }
 
@@ -2534,6 +3009,7 @@ UI_JS_CHAT = r"""
          contextSize = data.context_size;
          updateContextMeter(0);
        }
+       chatRefineSettings(data);
        // The pill says one thing at a glance; everything else goes to the
        // tooltip, which has room to wrap.
        var state = healthState(data.model_status);

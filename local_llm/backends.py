@@ -260,16 +260,28 @@ def public_backends(config: Any = None) -> list[dict]:
 # --------------------------------------------------------------------------- #
 # Helpers shared by the mlx-lm family
 # --------------------------------------------------------------------------- #
-# The generation thread's death leaves the HTTP server answering 200 on
-# /v1/models and /health while every completion hangs forever. The traceback
-# goes to the child's stdout/stderr (the log file) and nowhere else.
+# mlx_lm.server runs generation on ONE thread and never restarts it. Older
+# builds let the exception kill the thread ("Exception in thread ... (_generate)")
+# and every later completion hangs forever. Newer builds (0.32.2 does this) catch
+# it, log "<time> - ERROR - mlx_lm.server generation thread died: <cause>", and
+# fail every later completion with "generation thread died". Either way the
+# process stays up and the evidence goes to the child's stdout/stderr (the log
+# file) and nowhere else.
+_MLXLM_THREAD_DIED = re.compile(rb"mlx_lm\.server generation thread died")
+_METAL_CMD_FAILED = re.compile(rb"Command buffer execution failed")
+_METAL_OOM = re.compile(rb"kIOGPUCommandBufferCallbackErrorOutOfMemory")
+_MLXLM_THREAD_EXC = re.compile(rb"Exception in thread [^\n]*\(_generate\)")
+# The traceback of a request that was in flight when the thread died. Anchored
+# to the start of a line, which only a traceback gives it: a log record that
+# quotes a request starts with its timestamp.
+_MLXLM_REFUSED = re.compile(rb"(?m)^RuntimeError: generation thread died")
+# Order matters: the watchdog reports the line of the first pattern that
+# matches, so the lines that carry the cause come first.
 MLXLM_FATAL_PATTERNS = (
-    re.compile(rb"Exception in thread [^\n]*\(_generate\)"),
-    re.compile(rb"Command buffer execution failed"),
-    re.compile(rb"kIOGPUCommandBufferCallbackErrorOutOfMemory"),
+    _MLXLM_THREAD_DIED, _METAL_CMD_FAILED, _METAL_OOM, _MLXLM_THREAD_EXC, _MLXLM_REFUSED,
 )
 # Metal out-of-memory kills any MLX engine's generation, not only mlx-lm's.
-METAL_FATAL_PATTERNS = MLXLM_FATAL_PATTERNS[1:]
+METAL_FATAL_PATTERNS = (_METAL_CMD_FAILED, _METAL_OOM)
 
 
 def _backends_has_flag(help_text: str, flag: str) -> bool:
@@ -748,8 +760,9 @@ _TURBO_SERIAL_PROBE_TIMEOUT = 90.0
 
 def _turbo_decode_cap(ram_gb: float) -> int:
     # Every decode slot holds a live KV sequence in the same unified memory as
-    # the weights; the cap is what each RAM tier can carry next to its default
-    # model (core.py tiers) without the batch itself becoming the OOM.
+    # the weights; the cap is what each RAM tier can carry next to the starter
+    # model `deploy.py init` suggests for it (setup_cmds._SETUP_LADDER) without
+    # the batch itself becoming the OOM.
     if ram_gb < 12:
         return 3
     if ram_gb < 24:

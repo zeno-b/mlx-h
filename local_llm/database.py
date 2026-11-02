@@ -1406,6 +1406,26 @@ class Database:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def update_message(self, message_id: int, content: str, meta: dict | None = None,
+                       user_id: str | None = None) -> bool:
+        """Rewrite one stored message in place: content, token estimate and meta.
+
+        The answer check (refine.py) replaces an answer it improved and keeps
+        the original in meta. Appending the better answer as a second message
+        instead would put two assistant turns in a row, which several chat
+        templates refuse outright. False when no row matched (deleted, or not
+        this user's).
+        """
+        sql = "UPDATE messages SET content = ?, est_tokens = ?, meta = ? WHERE id = ?"
+        params: list[Any] = [content, estimate_tokens(content),
+                             json.dumps(meta) if meta else None, int(message_id)]
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            params.append(user_id)
+        cursor = self.execute(sql, tuple(params))
+        self.commit()
+        return cursor.rowcount > 0
+
     def can_access_conversation(self, conversation_id: str, user_id: str | None) -> bool:
         """True if the conversation is empty (new) or owned by this user.
 

@@ -64,7 +64,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="All-in-one local LLM server, chat UI, feedback, and retraining loop."
     )
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    # None: Config reads MODEL_ID from .env. There is no built-in model.
+    parser.add_argument("--model", default=None)
     parser.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT)
     parser.add_argument("--model-port", type=int, default=int(os.environ.get("MODEL_PORT", "8080")))
     parser.add_argument("--web-port", type=int, default=int(os.environ.get("WEB_PORT", "8000")))
@@ -175,6 +176,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "runs that will not fit (env TRAIN_AUTOPILOT=1).")
     # ---- extension flags: default=None so config.py stays the single source of defaults; above this line ---- #
     return parser
+
+
+def _cli_model_kwargs(args) -> dict:
+    """{"model": --model} when the flag was given, else {} so Config reads MODEL_ID."""
+    return {"model": args.model} if getattr(args, "model", None) else {}
 
 
 def build_config(args) -> Config:
@@ -323,7 +329,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.bench:
         ensure_dirs()
         sys.exit(benchmark(
-            Config(model=args.model, model_port=args.model_port),
+            Config(**_cli_model_kwargs(args), model_port=args.model_port),
             baseline_path=DATA_DIR / "bench_baseline.json",
             save=args.bench_save,
         ))
@@ -333,7 +339,8 @@ def main(argv: list[str] | None = None) -> None:
         early_db = Database(DB_PATH)
         try:
             if args.list_models:
-                catalog_config = Config(model=args.model, model_catalog=args.model_catalog)
+                catalog_config = Config(**_cli_model_kwargs(args),
+                                        model_catalog=args.model_catalog)
                 for entry in model_catalog(catalog_config):
                     marker = "*" if entry["current"] else " "
                     state = "cached" if entry["cached"] else "not downloaded"
@@ -404,13 +411,17 @@ def main(argv: list[str] | None = None) -> None:
         log("These override the environment. Delete that file to go back to "
             "the .env / default values.")
 
-    # Announce the model and where the RAM-based default came from, so it is
-    # obvious on a new machine why a particular model was chosen.
-    if os.environ.get("MODEL_ID"):
+    # Announce the model and where it came from. Nothing is built in, so a
+    # start with no MODEL_ID (and no --model or saved choice) stops here and
+    # says what to set, instead of launching a model server with no model.
+    if not config.model:
+        sys.exit("No model is set. Add MODEL_ID=<Hugging Face repo id or local folder> to "
+                 ".env (or run `python3 deploy.py init`, which picks one for this Mac), "
+                 "then start again.")
+    if args.model:
+        log(f"Model: {config.model} (from --model)")
+    elif os.environ.get("MODEL_ID"):
         log(f"Model: {config.model} (from MODEL_ID)")
-    elif args.model == DEFAULT_MODEL:
-        log(f"Model: {config.model} (auto-selected for {TOTAL_RAM_GB:.0f}GB RAM; "
-            f"set MODEL_ID to override)")
     else:
         log(f"Model: {config.model}")
     if os.environ.get("CONTEXT_SIZE"):
@@ -579,6 +590,7 @@ if __name__ == "__main__":
 # Re-exported explicitly: the original file was one flat namespace, so private
 # helpers (leading underscore) must cross module boundaries too.
 __all__ = [
+    '_cli_model_kwargs',
     'build_config',
     'main',
     'subcommands',

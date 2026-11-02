@@ -203,10 +203,15 @@ class ChatTurn:
 
     def __init__(self, turn_id: str, user_id: str | None, conversation_id: str | None,
                  *, resumable: bool = False, detachable: bool = True,
-                 interactive: bool = True, max_events: int = _STREAMS_MAX_EVENTS):
+                 interactive: bool = True, max_events: int = _STREAMS_MAX_EVENTS,
+                 kind: str = "chat"):
         self.turn_id = turn_id
         self.user_id = user_id
         self.conversation_id = conversation_id
+        # "chat" answers a message; "refine" is the answer check (refine.py),
+        # which works on a conversation without being its running turn, so a
+        # reloaded page never re-attaches to it as if it were an answer.
+        self.kind = kind
         self.resumable = resumable
         self.detachable = detachable
         self.interactive = interactive
@@ -350,6 +355,7 @@ class ChatTurn:
 
     def snapshot(self) -> dict:
         return {"turn_id": self.turn_id, "conversation_id": self.conversation_id,
+                "kind": self.kind,
                 "status": self.status, "seq": self.seq, "done": self.done,
                 "started_at": self.started_at, "finished_at": self.finished_at,
                 "resumable": self.resumable, "interactive": self.interactive,
@@ -390,11 +396,23 @@ class TurnRegistry:
             return None
         return turn
 
-    def active_for(self, user_id: str | None, conversation_id: str | None = None) -> list[ChatTurn]:
+    def active_for(self, user_id: str | None, conversation_id: str | None = None,
+                   kind: str = "chat") -> list[ChatTurn]:
         found = [t for t in self._turns.values()
-                 if t.user_id == user_id and not t.done
+                 if t.user_id == user_id and not t.done and t.kind == kind
                  and (not conversation_id or t.conversation_id == conversation_id)]
         return sorted(found, key=lambda t: t.started_at, reverse=True)
+
+    def latest_for(self, user_id: str | None, conversation_id: str | None,
+                   kind: str = "chat") -> ChatTurn | None:
+        """The conversation's most recently started turn of `kind`, running or finished."""
+        latest = None
+        for turn in self._turns.values():          # insertion order breaks a tie
+            if (turn.user_id == user_id and turn.kind == kind
+                    and turn.conversation_id == conversation_id
+                    and (latest is None or turn.started_at >= latest.started_at)):
+                latest = turn
+        return latest
 
     def prune(self, now: float | None = None) -> None:
         now = time.time() if now is None else now

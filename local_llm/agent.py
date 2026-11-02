@@ -36,6 +36,7 @@ from .cloud import cloud_preflight
 from .taskstate import *  # noqa: F401,F403
 from .toolparse import *  # noqa: F401,F403
 from .turnctx import *  # noqa: F401,F403
+from .websearch import *  # noqa: F401,F403
 
 
 # --------------------------------------------------------------------------- #
@@ -194,6 +195,75 @@ class _AgDispatched:
         return (f"TOOL RESULT [{self.name}]: {self.result}. Do not call it again "
                 "with the same arguments; find another way, or answer with what "
                 "you have.")
+
+
+class _AgPrefetch:
+    """Result pages fetched ahead of the auto-fetch loop that reads them.
+
+    The loop after a web_search reads one page at a time: fetch, extract with
+    the model, next. Fetching is network wait and extracting is model time, so
+    the two overlap: this keeps the pages the loop will need next downloading
+    on worker threads (SEARCH_WORKERS at once) while the model reads the
+    current one, and a dead link that takes the whole tool timeout to fail no
+    longer holds up the pages behind it. It starts no more fetches than the
+    loop still needs good pages, so a turn downloads what it did before, only
+    sooner.
+
+    The loop's own fetch_url dispatch still runs for every page, in the same
+    order, with the same events; it collects the finished download through
+    its runner hook after the policy has decided. Only a call the policy
+    plainly allows is started early. One that needs a person or is denied is
+    left to that dispatch, and ToolRegistry.call re-checks the policy on the
+    worker thread regardless.
+    """
+
+    def __init__(self, agent: Any, conversation_id: str | None, urls: list[str]) -> None:
+        self._agent = agent
+        self._cid = conversation_id
+        self._urls = list(urls)
+        self._next = 0
+        self._started: dict[str, asyncio.Task] = {}
+        self._gate = asyncio.Semaphore(search_workers(agent.config, len(self._urls)))
+
+    def _fetch(self, url: str) -> tuple[str, str | None]:
+        return self._agent.registry.call("fetch_url", {"url": url}, self._cid)
+
+    async def top_up(self, count: int) -> None:
+        """Have `count` pages downloading or downloaded that the loop has not taken yet."""
+        turn = current_turn()
+        while len(self._started) < count and self._next < len(self._urls):
+            url = self._urls[self._next]
+            self._next += 1
+            action, _risk, _reason, _decision = await self._agent._ag_decide(
+                "fetch_url", {"url": url}, turn)
+            if action == "allow":
+                self._started[url] = asyncio.ensure_future(
+                    thread_task(self._fetch, url, self._gate))
+
+    def runner(self, url: str) -> Any:
+        """The _dispatch runner that hands over `url`'s download, or None when it was not started."""
+        task = self._started.pop(url, None)
+        if task is None:
+            return None
+
+        async def run(args: dict) -> tuple[str, str | None]:
+            if str(args.get("url") or "") != url:
+                # The approval card edited the address: fetch what was approved.
+                return await asyncio.to_thread(self._agent.registry.call, "fetch_url",
+                                               args, self._cid)
+            value, exc = await task
+            if exc is not None:
+                text = f"{type(exc).__name__}: {exc}"
+                return text, text
+            return value
+
+        return run
+
+    def close(self) -> None:
+        """Drop the downloads the loop never took. A fetch already on its thread finishes unread."""
+        for task in self._started.values():
+            task.cancel()
+        self._started.clear()
 
 
 # Matches a tool name in the opening of a streamed call, for the formats that
@@ -1282,6 +1352,39 @@ class Agent:
     _NAME_NOISE = re.compile(r"(?i)^[`'\"\s]*(?:functions?|tools?)?[./]?([a-z_][a-z0-9_]*)"
                              r"\s*(?:\(\s*\))?[`'\"\s]*$")
 
+    def implied_lookup(self, text: str, known: set[str], user_message: str,
+                       searched: bool) -> tuple[tuple[str, dict] | None, str]:
+        """The web search a reply implied without calling it: (call, why).
+
+        Two shapes, both from a 3B model in the tool lane (the "2027 cold
+        outreach strategy" turn did both at once). It prints the tool's name on
+        a line of its own, "web_search", and then the answer it imagines the
+        tool returned; or it skips the name and says "based on the search
+        results" when no search ran this turn. parse_tool_call rightly finds
+        no call in either, and the invented answer went to the user as though
+        it were grounded, with tool_count=0. The search the reply implied is
+        run instead: web_search with the question as the query, and only when
+        search_subject says the question is safe to send (never the user's own
+        material). The caller's gates (the answer-lane lookup rule, the dedup
+        guard) still apply to it like to any call.
+
+        why is "" when nothing was implied, a log reason when a call is
+        returned, and "claimed" when the reply pretended but no safe query
+        exists: the caller then asks once for an answer that does not.
+        """
+        if "web_search" not in known:
+            return None, ""
+        named = bare_tool_name(text, known) == "web_search"
+        claimed = not searched and claims_search_results(text)
+        if not (named or claimed):
+            return None, ""
+        query = search_subject(user_message)
+        if not query:
+            return None, "claimed"
+        why = ("the reply named web_search without calling it" if named
+               else "the reply cited search results no search produced")
+        return ("web_search", {"query": query}), why
+
     def repair_tool_call(self, name: str, args: dict, known: set[str]) -> tuple[str, dict] | None:
         """Map an invalid tool name onto the tool the model obviously meant.
 
@@ -2325,6 +2428,17 @@ class Agent:
             " names a specific product, person, version, event or number you are"
             " not sure you have actually seen. Saying known when you have not"
             " seen it is the mistake this field exists to catch."
+            # A year at or past the weights' cutoff is the one recency signal
+            # no model judgement is needed for, and the router waved it
+            # through: "a 2027 cold outreach strategy" was routed to answer,
+            # the answer then reported it needed a lookup, and the turn paid a
+            # whole extra generation to escalate. It is a hint, not an
+            # override: writing about 2027 can still be answer.
+            + (" This message concerns a period at or after your training data, so"
+               " facts about it (current figures, trends, events, prices, versions)"
+               " are not in your weights: choose the lookup tool when the answer"
+               " depends on such facts. Writing and reasoning can still be answer."
+               if needs_fresh_facts(message, self.config.model_cutoff) else "")
             + " Reply with only the JSON object."
         )
 
@@ -2890,7 +3004,10 @@ class Agent:
         the model imitated from an earlier turn is removed first, so the only
         one the user sees is the true one.
         """
-        text = strip_changes_footer(strip_protocol_labels(answer))
+        # A first line that is only a tool's name is a call the model never
+        # wrote ("web_search" above a made-up answer), not part of the answer.
+        text = strip_changes_footer(strip_protocol_labels(
+            drop_bare_tool_line(answer, self.registry.names())))
         if not new_files:
             return text, []
         report = getattr(self.registry, "change_report", None)
@@ -4206,6 +4323,8 @@ class Agent:
         bad_names = 0
         # Tool calls that ran out of reply budget mid-JSON this turn.
         cut_calls = 0
+        # Asked once already to stop claiming a search that never ran.
+        pretend_retry = False
         # Subagents spawned this turn. Capped so a parent cannot delegate in a
         # loop, which on a 3B model is a real failure mode rather than a
         # theoretical one.
@@ -4570,108 +4689,118 @@ class Agent:
                 retrieval_started = time.time()
                 good = 0
                 idx = 0
-                for url in candidates:
-                    if good >= want:
-                        break
-                    # Skip listing/aggregator/JS-shell URLs before spending a
-                    # fetch on them; their HTML is navigation, not article text.
-                    if is_low_value_url(url):
-                        yield {"type": "notice", "info": True,
-                               "message": f"skipping a listing/aggregator page: {url[:60]}"}
-                        continue
-                    signature = "fetch_url:" + json.dumps({"url": url}, sort_keys=True,
-                                                          ensure_ascii=False, default=str)
-                    if signature in seen_calls:
-                        continue
-                    fetched = None
-                    async for event in self._dispatch("fetch_url", {"url": url},
-                                                      conversation_id, step=0,
-                                                      extra={"auto": True},
-                                                      cancel=cancel):
-                        if "__dispatched__" in event:
-                            fetched = event["__dispatched__"]
-                        else:
-                            yield event
-                    page, page_err = fetched.result, fetched.error
-                    yield {"type": "tool_result", "id": fetched.call_id,
-                           "name": "fetch_url", "result": page,
-                           "error": page_err, "step": 0, "auto": True}
-                    seen_calls.append(_ag_signature("fetch_url", fetched.args))
-                    url = str(fetched.args.get("url") or url)
-                    if cancel is not None and cancel.is_set():
-                        break
-                    if page_err:
-                        continue  # a dead link is not fatal; the snippets remain
-                    # If the fetched page is mostly markup/nav with little prose,
-                    # treat it as a failed fetch: do not extract from it and do
-                    # not let it into the synthesis prompt (empty extractions plus
-                    # a junk-filled context are exactly what stalls on 8GB).
-                    if is_thin_page(page):
-                        yield {"type": "notice", "info": True,
-                               "message": f"source had little readable text, skipping: {url[:60]}"}
-                        continue
-                    trace.append({"name": "fetch_url", "args": {"url": url},
-                                  "result": page[:1000], "error": None})
-                    good += 1
-                    idx = good
-                    page_budget = min(budget, self.config.auto_fetch_char_cap)
-                    page_text, _ = await self.compress_tool_result(
-                        "fetch_url", page[:self.config.auto_fetch_char_cap * 4], page_budget)
-                    ev = detail(f"source {idx}: fetched {len(page)} chars, reading "
-                                f"{len(page_text)} into a {self.config.reasoning_tokens}-token pass")
-                    if ev:
-                        yield ev
-                    # Extraction is best-effort and fast-fail: stream with a
-                    # per-source time cap, and on a stall keep whatever streamed
-                    # and MOVE ON. It must never fall into a retry-with-wait
-                    # (that compounding is what turned a stall into minutes).
-                    yield {"type": "reason_step", "step": idx, "total": want,
-                           "label": f"reading source {idx}: {url[:70]}"}
-                    extract_messages = [
-                        {"role": "system", "content":
-                            "Read this one source and note only what is relevant to "
-                            "answering the question, concisely. If the source does not "
-                            "address it, say so in a few words."},
-                        {"role": "user", "content":
-                            f"Question: {user_message[:500]}\n\nSource {idx} "
-                            f"({url}):\n{page_text}\n\nRelevant findings from this source:"},
-                    ]
-                    estats = GenerationStats()
-                    estream = self.client.stream(extract_messages, self.config.reasoning_tokens, 0.0, estats, kind="reasoning")
-                    started_src = time.time()
-                    elane = _AgLane()
-                    try:
-                        async for event in self.stream_lane(
-                                estream, elane, step=idx, cancel=cancel,
-                                token_type="reason_token", stats=estats,
-                                deadline=self.config.reasoning_step_timeout):
-                            yield event
-                        if elane.timed_out:
+                # The pages this loop will read keep downloading on worker
+                # threads while the model reads the one before (_AgPrefetch).
+                prefetch = _AgPrefetch(self, conversation_id, [
+                    u for u in candidates if not is_low_value_url(u)
+                    and _ag_signature("fetch_url", {"url": u}) not in seen_calls])
+                try:
+                    for url in candidates:
+                        if good >= want:
+                            break
+                        await prefetch.top_up(want - good)
+                        # Skip listing/aggregator/JS-shell URLs before spending a
+                        # fetch on them; their HTML is navigation, not article text.
+                        if is_low_value_url(url):
                             yield {"type": "notice", "info": True,
-                                   "message": f"source {idx} slow; keeping partial and moving on"}
-                    except Exception as exc:
-                        # Best-effort: no retry. Whatever streamed is kept.
-                        yield {"type": "notice", "info": True,
-                               "message": f"source {idx} could not be read ({self.client.classify_error(exc)}); skipping"}
-                    finally:
-                        await estream.aclose()
-                    account(estats)
-                    reasoning_log.append((idx, elane.thinking))
-                    finding = strip_reasoning(elane.text).strip()
-                    took = time.time() - started_src
-                    yield {"type": "reason_done", "step": idx, "conclusion": finding[:200]}
-                    ev = detail(f"source {idx}: extracted {len(finding)} chars in {took:.1f}s")
-                    if ev:
-                        yield ev
-                    if finding:
-                        source_notes.append(f"[{idx}] {url}: {finding[:400]}")
-                        self.partial_add(conversation_id, f"## Source {idx}: {url}\n{finding}")
-                    # Total retrieval budget: if we have spent too long across all
-                    # sources, stop fetching more and work with what we have.
-                    if time.time() - retrieval_started > self.config.retrieval_deadline:
-                        yield {"type": "notice", "info": True,
-                               "message": "retrieval time budget reached; answering with what I have"}
-                        break
+                                   "message": f"skipping a listing/aggregator page: {url[:60]}"}
+                            continue
+                        signature = "fetch_url:" + json.dumps({"url": url}, sort_keys=True,
+                                                              ensure_ascii=False, default=str)
+                        if signature in seen_calls:
+                            continue
+                        fetched = None
+                        async for event in self._dispatch("fetch_url", {"url": url},
+                                                          conversation_id, step=0,
+                                                          extra={"auto": True},
+                                                          cancel=cancel,
+                                                          runner=prefetch.runner(url)):
+                            if "__dispatched__" in event:
+                                fetched = event["__dispatched__"]
+                            else:
+                                yield event
+                        page, page_err = fetched.result, fetched.error
+                        yield {"type": "tool_result", "id": fetched.call_id,
+                               "name": "fetch_url", "result": page,
+                               "error": page_err, "step": 0, "auto": True}
+                        seen_calls.append(_ag_signature("fetch_url", fetched.args))
+                        url = str(fetched.args.get("url") or url)
+                        if cancel is not None and cancel.is_set():
+                            break
+                        if page_err:
+                            continue  # a dead link is not fatal; the snippets remain
+                        # If the fetched page is mostly markup/nav with little prose,
+                        # treat it as a failed fetch: do not extract from it and do
+                        # not let it into the synthesis prompt (empty extractions plus
+                        # a junk-filled context are exactly what stalls on 8GB).
+                        if is_thin_page(page):
+                            yield {"type": "notice", "info": True,
+                                   "message": f"source had little readable text, skipping: {url[:60]}"}
+                            continue
+                        trace.append({"name": "fetch_url", "args": {"url": url},
+                                      "result": page[:1000], "error": None})
+                        good += 1
+                        idx = good
+                        page_budget = min(budget, self.config.auto_fetch_char_cap)
+                        page_text, _ = await self.compress_tool_result(
+                            "fetch_url", page[:self.config.auto_fetch_char_cap * 4], page_budget)
+                        ev = detail(f"source {idx}: fetched {len(page)} chars, reading "
+                                    f"{len(page_text)} into a {self.config.reasoning_tokens}-token pass")
+                        if ev:
+                            yield ev
+                        # Extraction is best-effort and fast-fail: stream with a
+                        # per-source time cap, and on a stall keep whatever streamed
+                        # and MOVE ON. It must never fall into a retry-with-wait
+                        # (that compounding is what turned a stall into minutes).
+                        yield {"type": "reason_step", "step": idx, "total": want,
+                               "label": f"reading source {idx}: {url[:70]}"}
+                        extract_messages = [
+                            {"role": "system", "content":
+                                "Read this one source and note only what is relevant to "
+                                "answering the question, concisely. If the source does not "
+                                "address it, say so in a few words."},
+                            {"role": "user", "content":
+                                f"Question: {user_message[:500]}\n\nSource {idx} "
+                                f"({url}):\n{page_text}\n\nRelevant findings from this source:"},
+                        ]
+                        estats = GenerationStats()
+                        estream = self.client.stream(extract_messages, self.config.reasoning_tokens, 0.0, estats, kind="reasoning")
+                        started_src = time.time()
+                        elane = _AgLane()
+                        try:
+                            async for event in self.stream_lane(
+                                    estream, elane, step=idx, cancel=cancel,
+                                    token_type="reason_token", stats=estats,
+                                    deadline=self.config.reasoning_step_timeout):
+                                yield event
+                            if elane.timed_out:
+                                yield {"type": "notice", "info": True,
+                                       "message": f"source {idx} slow; keeping partial and moving on"}
+                        except Exception as exc:
+                            # Best-effort: no retry. Whatever streamed is kept.
+                            yield {"type": "notice", "info": True,
+                                   "message": f"source {idx} could not be read ({self.client.classify_error(exc)}); skipping"}
+                        finally:
+                            await estream.aclose()
+                        account(estats)
+                        reasoning_log.append((idx, elane.thinking))
+                        finding = strip_reasoning(elane.text).strip()
+                        took = time.time() - started_src
+                        yield {"type": "reason_done", "step": idx, "conclusion": finding[:200]}
+                        ev = detail(f"source {idx}: extracted {len(finding)} chars in {took:.1f}s")
+                        if ev:
+                            yield ev
+                        if finding:
+                            source_notes.append(f"[{idx}] {url}: {finding[:400]}")
+                            self.partial_add(conversation_id, f"## Source {idx}: {url}\n{finding}")
+                        # Total retrieval budget: if we have spent too long across all
+                        # sources, stop fetching more and work with what we have.
+                        if time.time() - retrieval_started > self.config.retrieval_deadline:
+                            yield {"type": "notice", "info": True,
+                                   "message": "retrieval time budget reached; answering with what I have"}
+                            break
+                finally:
+                    prefetch.close()
 
                 if source_notes:
                     joined = "\n".join(source_notes)
@@ -5552,6 +5681,28 @@ class Agent:
                 return
 
             call = parse_tool_call(buffer, known)
+            if call is None:
+                searched = any(t.get("name") in LOOKUP_TOOLS and not t.get("error")
+                               for t in trace)
+                implied, why = self.implied_lookup(buffer, known, user_message, searched)
+                if implied is not None:
+                    log(f"step {step}: {why}; running the search it implied.", logging.INFO)
+                    yield {"type": "notice", "step": step, "info": True,
+                           "message": "the reply described a search it never ran; running it"}
+                    call = implied
+                elif why == "claimed" and not pretend_retry and step < self.config.agent_max_steps:
+                    pretend_retry = True
+                    log(f"step {step}: the reply cited a search that never ran and the "
+                        "question is not safe to search; asking for an honest answer.",
+                        logging.INFO)
+                    scratch.append({"role": "assistant",
+                                    "content": drop_bare_tool_line(buffer, known)[:600]})
+                    scratch.append({"role": "user", "content":
+                                    "No search was run in this turn, so do not say you "
+                                    "searched or cite search results, and do not print a "
+                                    "tool name. Answer from your own knowledge and say "
+                                    "plainly where you are unsure."})
+                    continue
 
             # A tool call that ran out of reply budget partway through its JSON.
             # parse_tool_call correctly refuses it -- and the branch below then

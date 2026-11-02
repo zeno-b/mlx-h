@@ -81,7 +81,9 @@ def wire_model_name(model: Any) -> str:
     """A model name in the compat convention (bare names become raw/<name>)."""
     name = str(model or "").strip()
     if not name:
-        name = alias_of(DEFAULT_MODEL) or DEFAULT_MODEL
+        # The served model (MODEL_ID); with none set, the default agent.
+        served = os.environ.get("MODEL_ID", "").strip()
+        name = alias_of(served) or served or "agent"
     # "agent" (the default agent) is a compat name of its own; prefixing it
     # would ask for a served model called "agent" and get a 404.
     if name.startswith(("raw/", "agent/")) or name == "agent":

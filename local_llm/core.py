@@ -44,12 +44,12 @@ WORKSPACE_DIR = ROOT / "workspace"
 DB_PATH = DATA_DIR / "feedback.db"
 
 def _detect_total_ram_gb() -> float:
-    """Physical RAM in GB, so the default model can scale to the machine.
+    """Physical RAM in GB, so the context window and memory caps scale to the machine.
 
     Uses sysctl hw.memsize on macOS (the target platform), falls back to
     os.sysconf where available, and returns 8.0 if neither works. Any failure is
-    non-fatal: a wrong guess only affects which default model is chosen, and an
-    explicit MODEL_ID always overrides it.
+    non-fatal: a wrong guess only affects the RAM-scaled defaults, and every one
+    of them has an environment variable that overrides it.
     """
     try:
         import subprocess
@@ -65,75 +65,26 @@ def _detect_total_ram_gb() -> float:
         return 8.0
 
 
-def _ram_recommendation(ram_gb: float, path: Path | None = None) -> dict:
-    """The applied benchmark recommendation for a machine of this size, or {}.
-
-    `deploy.py recommend --apply` (catalog.write_recommendation) writes
-    DATA_DIR/recommendation.json stamped with the RAM it was measured on. A
-    file from a machine of a different size is ignored, so a copied data
-    directory cannot pin a 32B onto an 8GB Mac, and asking "what is the
-    default for 64GB?" on this machine still gets the tier answer. No file
-    means the tiers below, exactly as before the benchmark existed.
-    """
-    import json
-    target = path if path is not None else DATA_DIR / "recommendation.json"
-    try:
-        data = json.loads(Path(target).read_text(encoding="utf-8"))
-        measured = float(data.get("ram_gb") or 0)
-    except Exception:
-        return {}
-    if not isinstance(data, dict) or abs(measured - float(ram_gb)) >= 1.0:
-        return {}
-    return data
+def hf_cache_dir() -> Path:
+    """Where huggingface_hub keeps downloaded repos (HF_HUB_CACHE, else HF_HOME/hub)."""
+    if os.environ.get("HF_HUB_CACHE"):
+        return Path(os.environ["HF_HUB_CACHE"]).expanduser()
+    if os.environ.get("HF_HOME"):
+        return Path(os.environ["HF_HOME"]).expanduser() / "hub"
+    return Path.home() / ".cache" / "huggingface" / "hub"
 
 
-def _default_model_for_ram(ram_gb: float, recommendation: Path | None = None) -> str:
-    """Pick a coding model that fits comfortably alongside the KV cache, the web
-    process and headroom for training, given the machine's RAM.
-
-    The thresholds are deliberately conservative because unified memory is shared
-    with the OS and the GPU wired limit. Bigger machines get a bigger, stronger
-    model; 8GB Macs stay on the 3B that has carried this setup. Override any of
-    this with MODEL_ID. A measured recommendation for this machine (see
-    _ram_recommendation) replaces the tier guess, and only when MODEL_ID is unset.
-    """
-    if not os.environ.get("MODEL_ID"):
-        picked = str(_ram_recommendation(ram_gb, recommendation).get("model_id") or "").strip()
-        if picked:
-            return picked
-    if ram_gb >= 48:
-        return "mlx-community/Qwen2.5-Coder-32B-Instruct-4bit"   # ~18GB
-    if ram_gb >= 24:
-        return "mlx-community/Qwen2.5-Coder-14B-Instruct-4bit"   # ~8GB
-    if ram_gb >= 14:
-        return "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"    # ~4.3GB
-    return "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit"        # ~1.9GB
-
-
-def _default_context_for_ram(ram_gb: float, recommendation: Path | None = None) -> int:
+def _default_context_for_ram(ram_gb: float) -> int:
     """Pick a context window sized to the machine.
 
     Context sits in the KV cache, which shares unified memory with the model
-    weights, the web process, and the OS. Because bigger machines also run bigger
-    models (see _default_model_for_ram), these tiers account for the heavier
-    weights and still leave headroom: an 8GB Mac stays at a safe 4k, roomier
-    machines get proportionally more so they chunk less and keep more history.
-    The chunking thresholds derive from this value, so making context RAM-aware
-    makes chunk sizing RAM-aware too. Override with CONTEXT_SIZE.
-
-    A measured recommendation's context applies only while CONTEXT_SIZE is
-    unset AND the model is the recommended one: a window sized for a 3B is
-    not a safe default for whatever MODEL_ID names instead.
+    weights, the web process, and the OS. Bigger machines tend to run bigger
+    models, so these tiers still leave headroom for heavier weights: an 8GB Mac
+    stays at a safe 4k, roomier machines get proportionally more so they chunk
+    less and keep more history. The chunking thresholds derive from this value,
+    so making context RAM-aware makes chunk sizing RAM-aware too. Override with
+    CONTEXT_SIZE (`deploy.py recommend --apply` writes the measured one there).
     """
-    if not os.environ.get("CONTEXT_SIZE"):
-        rec = _ram_recommendation(ram_gb, recommendation)
-        env_model = os.environ.get("MODEL_ID", "").strip()
-        try:
-            rec_ctx = int(rec.get("context_size") or 0)
-        except (TypeError, ValueError):
-            rec_ctx = 0
-        if 512 <= rec_ctx <= 131072 and (not env_model or env_model == rec.get("model_id")):
-            return rec_ctx
     if ram_gb >= 48:
         return 32768
     if ram_gb >= 24:
@@ -285,9 +236,9 @@ class GenerationGate:
             self.release()
 
 
-# Total RAM is detected once at import. MODEL_ID overrides the RAM-based choice.
+# Total RAM is detected once at import. There is no default model: MODEL_ID in
+# .env names it, and the web UI asks for one (and writes it there) when unset.
 TOTAL_RAM_GB = _detect_total_ram_gb()
-DEFAULT_MODEL = os.environ.get("MODEL_ID") or _default_model_for_ram(TOTAL_RAM_GB)
 # The default system prompt. Edit the triple-quoted text below freely — each
 # paragraph is a single line your editor soft-wraps, so you can rewrite it like
 # plain text. Set the SYSTEM_PROMPT environment variable to override it entirely.
@@ -697,7 +648,6 @@ __all__ = [
     'LOGIN_WINDOW_S',
     'DATA_DIR',
     'DB_PATH',
-    'DEFAULT_MODEL',
     'DEFAULT_SYSTEM_PROMPT',
     'EXPORTS_DIR',
     'REPLAY_FILE',
@@ -721,12 +671,12 @@ __all__ = [
     '_default_prompt_cache_bytes',
     'GenerationBusy',
     'GenerationGate',
-    '_default_model_for_ram',
     '_default_reasoning_tokens',
     '_detect_total_ram_gb',
     'bootstrap',
     'ensure_dirs',
     'estimate_tokens',
+    'hf_cache_dir',
     'in_venv',
     'iso',
     'log',

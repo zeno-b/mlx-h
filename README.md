@@ -175,10 +175,12 @@ python3 deploy.py
 
 `deploy.py init` never overwrites an existing `.env`: it writes `.env.new` beside
 it and prints what differs (`--force` replaces it and keeps `.env.bak`). Without
-init, copy `.env.example` to `.env` and edit it; every variable is optional and
-the defaults scale with RAM.
+init, copy `.env.example` to `.env` and set `MODEL_ID` (a Hugging Face repo id or
+a local folder): it is the one setting with no default, and the app stops and
+says so when it is missing. Every other variable is optional and its default
+scales with RAM.
 
-The app prints the detected RAM, the chosen model and context window, and the URL
+The app prints the detected RAM, the model and context window it runs, and the URL
 to open (a free port is picked if the preferred one is busy). `deploy.py` and
 `python -m local_llm` read `.env` (or the file `LOCAL_LLM_ENV_FILE` names)
 themselves before anything else, so no `export` is needed. A variable already set
@@ -234,7 +236,7 @@ every variable with placeholders. Highlights:
 
 | Group | Variables |
 |-------|-----------|
-| Model/core | `MODEL_ID`, `CONTEXT_SIZE`, `MAX_TOKENS`, `TEMPERATURE`, `HISTORY_TURNS`, `WEB_PORT`, `MODEL_PORT` |
+| Model/core | `MODEL_ID` (required: the model to serve, no default), `CONTEXT_SIZE`, `MAX_TOKENS`, `TEMPERATURE`, `HISTORY_TURNS`, `WEB_PORT`, `MODEL_PORT` |
 | Logging | `LOG_LEVEL`, `LOG_FORMAT`, `LOG_DIR`, `LOG_CHAT_CONTENT`, `LOG_MAX_BYTES`, `LOG_BACKUP_COUNT`, `LOG_RETENTION_DAYS` |
 | Auth | `AUTH_ENABLED`, `AUTH_ADMIN_USERNAME`, `AUTH_ADMIN_PASSWORD`, `AUTH_SESSION_TTL_HOURS`, `AUTH_COOKIE_SECURE`, `AUTH_ALLOW_TEST_USER`, `AUTH_TEST_USERNAME`, `AUTH_TEST_PASSWORD`, `LOGIN_MAX_FAILURES`, `LOGIN_WINDOW_S` |
 | Entra/OIDC | `OIDC_ENABLED`, `OIDC_TENANT_ID`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI`, `OIDC_ADMIN_EMAILS`, `OIDC_ADMIN_GROUPS`, `OIDC_ADMIN_ROLES`, `OIDC_DEFAULT_ROLE` |
@@ -254,7 +256,7 @@ every variable with placeholders. Highlights:
 | Task continuity | `TASK_STATE_ENABLED`, `TASK_ARTIFACT_CHARS`, `DRIFT_CHECK_ENABLED`, `ARTIFACT_REPLY_HEADROOM`, `DEBUG_PROMPTS` (see [Multi-turn task continuity](#multi-turn-task-continuity)) |
 | Training | `TRAIN_MIN_EXAMPLES`, `TRAIN_EPOCHS`, `TRAIN_ITERS`, `TRAIN_LR`, `TRAIN_SEQ_LEN`, `TRAIN_BATCH_SIZE`, `TRAIN_NUM_LAYERS`, `TRAIN_FINE_TUNE_TYPE`, `TRAIN_LORA_RANK`, `TRAIN_TOOL_RATIO`, `TRAIN_TOOL_QUALITY`, `TRAIN_REPLAY_RATIO`, `TRAIN_VAL_SPLIT`, `TRAIN_VAL_CHECK`, `TRAIN_TIMEOUT`, `TRAIN_MAX_BACKUPS`, `AUTO_RETRAIN_THRESHOLD` (see [Feedback and LoRA retraining](#feedback-and-lora-retraining)) |
 | Import | `IMPORT_MAX_ZIP_BYTES`, `IMPORT_MAX_FILES`, `IMPORT_MAX_UNCOMPRESSED_BYTES`, `IMPORT_MAX_FILE_BYTES` |
-| Search | `SEARCH_RESULTS` (provider is locked to DuckDuckGo Lite) |
+| Search | `SEARCH_RESULTS` (provider is locked to DuckDuckGo Lite), `SEARCH_WORKERS` (searches and page fetches one batch runs at once, default 4, capped at 8), `AUTO_REFINE`, `AUTO_REFINE_DELAY_S`, `AUTO_REFINE_SOURCES`, `AUTO_REFINE_MAX_ROUNDS` (see [Answer check in Auto mode](#answer-check-in-auto-mode)) |
 | Networking | `ALLOWED_ORIGINS` (extra CORS origins behind a proxy; `*` is refused) |
 
 ### Producing files
@@ -442,9 +444,11 @@ Secrets (`AUTH_ADMIN_PASSWORD`, `OIDC_CLIENT_SECRET`, `O365_CLIENT_SECRET`,
 logs — the config endpoint reports only whether each is set.
 
 Most defaults are derived from the machine's RAM rather than hard-coded, so an
-8GB MacBook and a 64GB Studio each get a sensible model, context window,
-reasoning budget, fetch cap and generation concurrency without configuration.
-`python3 deploy.py --print-config` prints the resolved values.
+8GB MacBook and a 64GB Studio each get a sensible context window, reasoning
+budget, fetch cap and generation concurrency without configuration. The model is
+the exception: nothing is built in, `MODEL_ID` names it, and `deploy.py init`
+writes one that fits the machine. `python3 deploy.py --print-config` prints the
+resolved values.
 
 Admins can change every runtime-safe setting live from **Settings** (or
 `POST /api/config`) without a restart, including `LOG_LEVEL`, `LOG_CHAT_CONTENT`
@@ -1055,21 +1059,31 @@ repo id made the server reload the base weights without the feedback adapter.
 
 ### Model catalogue, aliases and the benchmark sweep
 
-`MODEL_ID`, `--model` and the model switcher accept an alias as well as a repo
-id: `tiny`, `fast`, `balanced`, `coder`, `reasoning`, `vision` and `large` are
-built in, and `MODEL_ALIASES` (JSON `{"name": "repo-id"}`) adds or overrides
-them. `deploy.py models [--json]` lists the catalogue with each entry's aliases,
-metadata, whether it fits in this Mac's RAM and which one is recommended.
+Nothing is served by default: `MODEL_ID` names the model. The switcher suggests a
+short list of known MLX models plus the ids in `MODEL_CATALOG`, and
+`MODEL_ALIASES` (JSON `{"name": "repo-id"}`) gives short names that `MODEL_ID`,
+`--model` and the switcher accept in place of a repo id. Those are the only
+aliases; none are built in. What the catalogue says about a model (size, RAM
+floor, context window, whether it thinks, its tool-call format, a vision tower,
+a smaller sibling to draft with) is read from the model's own files once it is
+downloaded, and estimated from the repo name before that, so a model nobody
+listed is described as well as one somebody did. `deploy.py models [--json]`
+lists the catalogue with each entry's aliases, metadata, whether it fits in this
+Mac's RAM and which one is recommended.
 
 `deploy.py bench --sweep [--models ... --contexts ... --backends ...]` measures
 decode rate, time to first token and peak memory for every model, context and
 backend cell that fits and is downloaded (it records why it skipped the rest),
 and refuses while a model server is running. `deploy.py recommend [--apply]`
 picks the best model that decodes at least `BENCH_MIN_DECODE_TPS` tokens/s with
-`BENCH_HEADROOM_GB` to spare and writes `DATA_DIR/recommendation.json`, which is
-used only when `MODEL_ID` (and, for its context, `CONTEXT_SIZE`) is unset and
-only on a Mac with the same RAM. `deploy.py --bench` still works. Admins get the
-same through `GET /api/bench/results`, `GET /api/bench/recommendation`,
+`BENCH_HEADROOM_GB` to spare. `--apply` writes it into `.env` as `MODEL_ID` and
+`CONTEXT_SIZE`, keeping every other line, so it is served from the next start (a
+value exported in the shell still wins, and the command says so). It also
+records the pick in `DATA_DIR/recommendation.json`, which the switcher marks as
+recommended and `deploy.py init` suggests on a Mac with the same RAM.
+`deploy.py --bench` still works. Admins get the same through
+`GET /api/bench/results`,
+`GET /api/bench/recommendation`,
 `GET /api/bench/status` and `POST /api/bench/run` (`{"confirm": true}`; 409
 while anything is generating or training); `GET /api/models/aliases` is open to
 every signed-in user.
@@ -1652,7 +1666,58 @@ This is a hard constraint, enforced in the search backend, the tool layer,
 configuration (there is no variable to select another engine — `SEARCH_BACKEND` is
 accepted only as a DuckDuckGo-Lite alias and anything else is ignored), and the
 test suite. No Google/Bing/Brave/Tavily/SearXNG or any other provider is reachable.
-Only `SEARCH_RESULTS` (count) is configurable.
+Only `SEARCH_RESULTS` (count) and `SEARCH_WORKERS` (how many searches or page
+fetches run at once on worker threads) are configurable. The pages the agent
+reads after a search download in parallel while the model reads the one
+before, so a dead link that takes the whole `TOOL_TIMEOUT` to fail no longer
+holds up the pages behind it. `SEARCH_WORKERS=1` runs every batch one call at a
+time.
+
+### Answer check in Auto mode
+
+In Auto mode the app keeps working on a question after it has answered it. Once
+the answer has been on screen for `AUTO_REFINE_DELAY_S` seconds (default 60), a
+round runs: the server writes up to three search queries from the question, runs
+them at once, and downloads the best `AUTO_REFINE_SOURCES` result pages (default
+3) at once. The model then reads each page in a pass of its own, holding only the
+question and an excerpt capped at `AUTO_FETCH_CHAR_CAP` (sized to the machine),
+and notes what it says, the way the agent reads several sources: one prompt with
+every page in it is the prefill that runs an 8GB Mac out of GPU memory. Given its
+own answer next to those notes, the model either confirms the answer or writes a
+better one, which streams in under the original and replaces it in the stored
+conversation, so the next turn builds on it. A reply the model server cut off
+(no finish from the server), one that ran out of reply budget, and one that
+repeats the check's own instructions are discarded rather than stored. Then the
+page waits another interval and runs the next round, for as long as it stays
+open.
+
+Every round searches with queries no earlier round sent and reads only pages no
+earlier round fetched, and numbers its sources after the ones the answer already
+cites, so `[2]` means the same page in every version of the answer. A round that
+changes nothing doubles the wait before the next one, up to sixteen intervals; a
+round that improves the answer resets it. When there is nothing left to read the
+rounds keep their long spacing, in case new pages appear. `AUTO_REFINE_MAX_ROUNDS`
+caps the rounds per answer (default 0, no cap), and the server refuses a round
+sooner than half an interval after the last one whatever the page asks. Finished
+rounds collapse into one line each under the answer; the original answer stays in
+the message's meta and opens from "Answer before the web check" when the
+conversation is reopened.
+
+The rounds run only while the page is open: sending a message, starting a new
+chat, opening another conversation, switching out of Auto, pressing Stop or
+closing the page ends them, and each round waits for its turn at the generation
+queue like any other request. Only the question informs what goes to the search
+engine, and only when it reads as a public subject; the answer and the excerpts
+stay on this machine. Questions about your own files, projects, documents or
+business, requests to write something (a plan, a strategy, an email, a post),
+turns with attachments, and turns that read the knowledge base, files, memory or
+mail are never checked: a web page has no facts to add to them, only someone
+else's copy. The searches go through the approval policy and the tool
+log like any other. When your Approvals setting asks before every action, the
+page asks once ("Keep checking this answer against the web?") and a yes covers
+that answer's rounds; the administrator's `TOOL_APPROVAL_MODE` still applies, and
+a policy that refuses the searches makes the check skip. `AUTO_REFINE=0` switches
+it off for everyone (Settings > Tools > Web).
 
 ---
 

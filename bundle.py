@@ -118,6 +118,9 @@ ORDER = [
     # `deploy.py eval` and the EVAL_ON_PROMOTE gate (reads agent, tools,
     # toolparse, taskstate, codecheck, dashboards' fingerprints, api_tokens).
     "eval_suites", "evals",
+    # Auto mode's answer check against the web (reads streams, admission,
+    # textutil, websearch); api registers its route.
+    "refine",
     # ---- extension modules: feature modules in dependency order, above this line ---- #
     "api",
     "diagnostics", "selftest", "cli",
